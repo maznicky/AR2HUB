@@ -1089,17 +1089,28 @@ _G.AIMBOT = _G.AIMBOT or {}
 local AB = _G.AIMBOT
 AB.Enabled  = false
 AB.Key      = AB.Key      or "e"
+AB.PredOn   = AB.PredOn   == true   -- master switch for velocity lead
 AB.PredMs   = AB.PredMs   or 0
-AB.FalloffM = AB.FalloffM or 15
+AB.DropStud = AB.DropStud or 0      -- raises/lowers the aim point, in studs
 AB.FovPx    = AB.FovPx    or 150
 AB.ShowFov  = (AB.ShowFov ~= false)
 AB.DistM    = AB.DistM    or 300
 AB.Smooth   = AB.Smooth   or 3
 AB.Sens     = AB.Sens     or 1.0
+AB.Sticky   = AB.Sticky   == true   -- hold one target for as long as the key is down
+AB.Mode     = AB.Mode     or "Crosshair"   -- "Crosshair" | "Distance"
 AB.MinStep  = AB.MinStep  or 1      -- 1 verified 100% effective with pointer accel OFF
+                                    -- (no UI: only needs changing if pointer
+                                    --  acceleration is ever turned back on)
 AB.Part     = AB.Part     or "Head"
 AB.Zombies  = AB.Zombies  == true   -- TEMPORARY test targets
 AB.Locked   = nil
+
+-- Close-range guard for velocity lead, no longer a UI knob. A fixed lead time
+-- is geometrically correct at any range, but up close the angular error it
+-- produces is huge and targets change direction constantly, so linear
+-- extrapolation stops being valid. Inside this range the lead fades to zero.
+local FALLOFF_M = 15
 
 local RAD_PER_COUNT = 0.002443
 local MAX_STEP      = 250           -- counts/tick, the real anti-teleport guard
@@ -1166,9 +1177,11 @@ local function abPart(model)
         or model:FindFirstChild("Head")
 end
 
-local function abAlive(model)
-    local hum = model:FindFirstChildOfClass("Humanoid")
-    if not hum then return true end   -- zombies have none; dead ones move to Corpses
+-- Health is read from the Humanoid reference held in the target cache, so there
+-- is no per-frame FindFirstChildOfClass. Zombies have no Humanoid at all; dead
+-- ones are moved to workspace.Corpses, so presence in Zombies means alive.
+local function humAlive(hum)
+    if not hum then return true end
     local ok, hp = pcall(function() return hum.Health end)
     if ok and type(hp) == "number" then return hp > 0 end
     return true
@@ -1259,7 +1272,7 @@ local function abBuildStep(now)
 end
 
 task.spawn(function()
-    local lockPart, lockName, lockKey = nil, nil, nil
+    local lockPart, lockName, lockKey, lockHum = nil, nil, nil, nil
     local lastSelect, lastTick = 0, tick()
 
     while _G.AR2HUB_GEN == GEN do
@@ -1302,16 +1315,20 @@ task.spawn(function()
             local curYaw   = math.atan2(look.X, look.Z)
             local curPitch = math.asin(math.clamp(look.Y, -1, 1))
             local maxStuds  = AB.DistM * ABDIV
-            local fallStuds = AB.FalloffM * ABDIV
+            local fallStuds = FALLOFF_M * ABDIV
             local tau  = math.max(0.005, AB.Smooth * 0.016)   -- seconds
             local gain = 1 - math.exp(-dt / tau)
 
-            -- ---------- SELECTION: 10 Hz, or at once if we hold no lock ----------
-            if not lockPart or (now - lastSelect) >= SELECT_EVERY then
+            -- ---------- SELECTION ----------
+            -- Sticky holds the first target for as long as the key is down, so
+            -- once we have a valid lock we skip re-selection entirely.
+            local resel = (not lockPart) or
+                          ((not AB.Sticky) and (now - lastSelect) >= SELECT_EVERY)
+            if resel then
                 lastSelect = now
                 local prevKey = lockKey
                 local bestScore
-                lockPart, lockName, lockKey = nil, nil, nil
+                lockPart, lockName, lockKey, lockHum = nil, nil, nil, nil
 
                 -- Iterate the CACHE and read Position only. Resolving parts is
                 -- what used to cost 118 ms per pass; this costs ~5.5 ms.
@@ -1320,25 +1337,30 @@ task.spawn(function()
                     local okp, tpos = pcall(function() return t.part.Position end)
                     if not okp or not tpos then
                         t.dead = true                 -- part went away; next rebuild drops it
-                    else
-                        local alive = true
-                        if t.hum then
-                            local okh, hp = pcall(function() return t.hum.Health end)
-                            if okh and type(hp) == "number" then alive = hp > 0 end
-                        end
-                        if alive then
-                            local d = tpos - cp
-                            local mag = d.Magnitude
-                            if mag > 0 and mag <= maxStuds then
-                                local u = d * (1 / mag)
-                                local ang = math.acos(math.clamp(look:Dot(u), -1, 1))
-                                local gate = (t.key == prevKey) and stickyAng or gateAng
-                                if ang <= gate then
-                                    local score = (t.key == prevKey) and ang * 0.5 or ang
-                                    if not bestScore or score < bestScore then
-                                        bestScore = score
-                                        lockPart, lockName, lockKey = t.part, t.name, t.key
-                                    end
+                    elseif humAlive(t.hum) then
+                        local d = tpos - cp
+                        local mag = d.Magnitude
+                        if mag > 0 and mag <= maxStuds then
+                            local u = d * (1 / mag)
+                            local ang = math.acos(math.clamp(look:Dot(u), -1, 1))
+                            local gate = (t.key == prevKey) and stickyAng or gateAng
+                            if ang <= gate then
+                                -- Crosshair: smallest angle off centre.
+                                -- Distance: nearest in studs. Both gated by the
+                                -- FOV circle, so Distance only ever picks from
+                                -- what is already inside the ring.
+                                local score
+                                if AB.Mode == "Distance" then
+                                    score = mag
+                                    if t.key == prevKey then score = score * 0.85 end
+                                else
+                                    score = ang
+                                    if t.key == prevKey then score = score * 0.5 end
+                                end
+                                if not bestScore or score < bestScore then
+                                    bestScore = score
+                                    lockPart, lockName, lockKey, lockHum =
+                                        t.part, t.name, t.key, t.hum
                                 end
                             end
                         end
@@ -1349,29 +1371,42 @@ task.spawn(function()
             -- ---------- TRACKING: every tick, one Position read ----------
             if lockPart then
                 local okp, tpos = pcall(function() return lockPart.Position end)
-                if not okp or not tpos then
-                    lockPart, lockName, lockKey = nil, nil, nil
+                if (not okp) or (not tpos) or (not humAlive(lockHum)) then
+                    lockPart, lockName, lockKey, lockHum = nil, nil, nil, nil
                     AB.Locked, AB.Status = nil, "target gone"
                 else
                     local raw = (tpos - cp).Magnitude
-                    -- lead = latency compensation, plus the controller's own lag.
-                    -- A proportional controller structurally trails a moving
-                    -- target; aiming one time-constant ahead cancels that.
-                    local lead = AB.PredMs / 1000
-                    if fallStuds > 0 and raw < fallStuds then
-                        lead = lead * (raw / fallStuds)
+                    -- The controller's own lag (tau) is always led for, since a
+                    -- proportional controller structurally trails a moving
+                    -- target. PredMs on top of that is latency compensation and
+                    -- is opt-in, faded out at close range by FALLOFF_M.
+                    local lead = tau
+                    if AB.PredOn and AB.PredMs > 0 then
+                        local p = AB.PredMs / 1000
+                        if fallStuds > 0 and raw < fallStuds then
+                            p = p * (raw / fallStuds)
+                        end
+                        lead = lead + p
                     end
-                    local aimPos = tpos + velOf(lockKey, tpos, now) * (lead + tau)
+                    local aimPos = tpos + velOf(lockKey, tpos, now) * lead
+                    -- Drop Prediction: lifts or lowers the aim point off the
+                    -- targeted part to sit where the round actually lands.
+                    if AB.DropStud ~= 0 then
+                        aimPos = aimPos + Vector3.new(0, AB.DropStud, 0)
+                    end
                     local d = aimPos - cp
                     local mag = d.Magnitude
                     if mag <= 0 or raw > maxStuds then
-                        lockPart, lockName, lockKey = nil, nil, nil
+                        lockPart, lockName, lockKey, lockHum = nil, nil, nil, nil
                         AB.Locked, AB.Status = nil, "out of range"
                     else
                         local u = d * (1 / mag)
                         local ang = math.acos(math.clamp(look:Dot(u), -1, 1))
-                        if ang > stickyAng then
-                            lockPart, lockName, lockKey = nil, nil, nil
+                        -- Sticky ignores the FOV circle once locked; it only lets
+                        -- go on death, range, or the absolute engage limit.
+                        local dropAt = AB.Sticky and MAX_ENGAGE or stickyAng
+                        if ang > dropAt then
+                            lockPart, lockName, lockKey, lockHum = nil, nil, nil, nil
                             AB.Locked, AB.Status = nil, "lost lock"
                         else
                             local dYaw = wrapPi(math.atan2(u.X, u.Z) - curYaw)
@@ -1393,7 +1428,8 @@ task.spawn(function()
                 AB.Locked, AB.Status = nil, "nothing in circle"
             end
         else
-            lockPart, lockName, lockKey = nil, nil, nil
+            -- key released: drop the lock, which is what ends a Sticky hold
+            lockPart, lockName, lockKey, lockHum = nil, nil, nil, nil
             AB.Locked, AB.Status = nil, nil
             accX, accY = 0, 0
         end
@@ -1406,25 +1442,23 @@ end)
 local aimSec = combattab:Section("Aimbot", "Full")
 aimSec:Toggle("Enable Aimbot", false, function(v) AB.Enabled = v end)
 aimKeyHandle = aimSec:Keybind("Aim Key (hold)", "e", function(k) AB.Key = k end)
-aimSec:Dropdown("Aim Type", "Mouse", {"Mouse"}, false, function() end,
-    "Camera.CFrame writes are silently discarded by Matcha; mouse is the only method that lands.")
 aimSec:Dropdown("Hit Part", "Head", {"Head", "Torso"}, false, function(v) AB.Part = v end)
+aimSec:Dropdown("Target", "Crosshair", {"Crosshair", "Distance"}, false,
+    function(v) AB.Mode = v end,
+    "Crosshair: whatever sits nearest the middle. Distance: nearest enemy, still only from inside the FOV circle.")
+aimSec:Toggle("Sticky Target", false, function(v) AB.Sticky = v end,
+    "Holds one target until you release the aim key, instead of switching to whatever is closest.")
 aimSec:Slider("FOV", 150, 5, 10, 600, " px", function(v) AB.FovPx = v end)
 aimSec:Toggle("Show FOV Circle", true, function(v) AB.ShowFov = v end)
 aimSec:Slider("Distance", 300, 5, 10, 1000, " m", function(v) AB.DistM = v end)
-aimSec:Slider("Smoothness", 3, 0.5, 1, 20, "", function(v) AB.Smooth = v end)
+aimSec:Slider("Smoothness", 3, 0.5, 1, 15, "", function(v) AB.Smooth = v end)
 aimSec:Slider("Sensitivity", 1.0, 0.05, 0.1, 3, "x", function(v) AB.Sens = v end)
-aimSec:Slider("Min Step", 1, 1, 1, 12, " counts", function(v) AB.MinStep = v end)
-aimSec:Slider("Prediction", 0, 5, 0, 300, " ms", function(v) AB.PredMs = v end)
-aimSec:Slider("Prediction Falloff", 15, 1, 0, 60, " m", function(v) AB.FalloffM = v end)
+aimSec:Toggle("Prediction", false, function(v) AB.PredOn = v end,
+    "Leads a moving target by its velocity. Only needed for network latency; these guns are hitscan.")
+aimSec:Slider("Prediction Amount", 0, 5, 0, 300, " ms", function(v) AB.PredMs = v end)
+aimSec:Slider("Drop Prediction", 0, 0.25, -8, 8, " studs", function(v) AB.DropStud = v end,
+    "Raises (+) or lowers (-) the aim point off the target part to compensate for bullet drop.")
 aimSec:Toggle("Target Zombies (testing only)", false, function(v) AB.Zombies = v end)
-local aimStat = aimSec:Label("idle")
-task.spawn(function()
-    while _G.AR2HUB_GEN == GEN do
-        pcall(function() aimStat:SetText(AB.Status or (AB.Enabled and "armed" or "off")) end)
-        task.wait(0.15)
-    end
-end)
 
 -- ---------------- panel: boxes created and destroyed with players ----------------
 -- playertab._tab.sections is the array the lib's layout pass iterates.
