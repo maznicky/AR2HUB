@@ -1018,32 +1018,37 @@ local function prepare()
 end
 
 -- zero a key group, or restore it
+-- Direct memory_write, NOT applygc. Measured: applygc caused ~100ms scheduler
+-- stalls every few seconds (loop throughput collapsing 680/s -> 10/s), which
+-- crippled the aimbot. Writing the cached addresses costs 1.6ms for 488 and
+-- the values never drift back, so nothing needs re-applying.
 local function apply(keys, on, label)
     if not CB.Prepared then setStatus("press Prepare first"); return end
-    local t0 = tick()
-    if on then
-        for _, k in ipairs(keys) do pcall(function() applygc(CB.Cache, k, 0) end) end
-        setStatus(string.format("%s ON (%.0fms)", label, (tick() - t0) * 1000))
-    else
-        -- only write back where the live value is still readable and sane
-        local restored, skipped = 0, 0
-        local want = {}
-        for _, k in ipairs(keys) do want[k] = true end
-        for _, e in ipairs(CB.Cache) do
-            if e.addr and want[tostring(e.key)] and tostring(e.type) == "number" then
+    local want = {}
+    for _, k in ipairs(keys) do want[k] = true end
+    local t0, written, skipped = tick(), 0, 0
+    for _, e in ipairs(CB.Cache) do
+        if e.addr and want[tostring(e.key)] and tostring(e.type) == "number" then
+            if on then
+                local ok = pcall(function() memory_write("double", e.addr, 0) end)
+                if ok then written = written + 1 else skipped = skipped + 1 end
+            else
+                -- guarded restore: only write back where the live value still reads
                 local orig = CB.Originals[e.addr]
                 local okr, live = pcall(function() return memory_read("double", e.addr) end)
                 if orig and okr and type(live) == "number" then
                     pcall(function() memory_write("double", e.addr, orig) end)
-                    restored = restored + 1
+                    written = written + 1
                 else
                     skipped = skipped + 1
                 end
             end
         end
-        setStatus(string.format("%s OFF - %d restored, %d skipped (%.0fms)",
-            label, restored, skipped, (tick() - t0) * 1000))
-        print(string.format("[combat] %s restored %d, skipped %d", label, restored, skipped))
+    end
+    setStatus(string.format("%s %s - %d written, %d skipped (%.1fms)",
+        label, on and "ON" or "OFF", written, skipped, (tick() - t0) * 1000))
+    print(string.format("[combat] %s %s: %d written, %d skipped",
+        label, on and "ON" or "OFF", written, skipped))
     end
 end
 
