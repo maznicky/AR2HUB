@@ -1,0 +1,1121 @@
+-- ==================== AR2 Hub - Event ESP ====================
+-- 16 events grouped by faction. Per-event readout: Amount + nearest site's roster.
+-- States: Unlooted (green) / Unknown (gray). Looted sites are WIPED, not shown.
+-- Distances match Matcha's ESP (studs / 2.75, rounded). Config is in metres.
+-- Site Probe: F8, plus an automatic sweep every 60s.
+-- Everything starts DISABLED; nothing scans until toggled on.
+
+local Lib = loadstring(game:HttpGet("https://raw.githubusercontent.com/neaxusxgod-png/INS-ui/main/uilib.min.lua"))() or INSui
+
+-- ---------------- portability shims ----------------
+local function getCamera()
+    return workspace.CurrentCamera or workspace:FindFirstChildOfClass("Camera")
+end
+local function camPos()
+    local cam = getCamera()
+    if not cam then return nil end
+    local ok, p = pcall(function() return cam.CFrame.Position end)
+    if ok and typeof(p) == "Vector3" then return p end
+    local ok2, p2 = pcall(function() return cam.Position end)
+    if ok2 and typeof(p2) == "Vector3" then return p2 end
+    return nil
+end
+local function toScreen(v3)
+    if WorldToScreen then return WorldToScreen(v3) end
+    local cam = getCamera()
+    if not cam then return Vector2.new(0, 0), false end
+    local p, vis = cam:WorldToViewportPoint(v3)
+    return Vector2.new(p.X, p.Y), (vis and p.Z > 0)
+end
+local function toast(title, msg, dur)
+    if Lib and Lib.Notify then
+        local ok = pcall(function() Lib:Notify(title .. ": " .. msg, dur or 5) end)
+        if ok then return end
+    end
+    if notify then
+        local ok = pcall(function() notify(title, msg, dur or 5) end)
+        if ok then return end
+    end
+    print("[" .. title .. "] " .. msg)
+end
+
+-- ---------------- input watchdog ----------------
+-- Matcha's Players handle goes stale after time in-server; INS-ui then cannot
+-- read the mouse and would trap your input. This always hands input back.
+_G.UI_WATCHDOG = true
+task.spawn(function()
+    local wasAlive = nil
+    while _G.UI_WATCHDOG do
+        local ok, lp = pcall(function() return game:GetService("Players").LocalPlayer end)
+        local alive = (ok and lp ~= nil)
+        if wasAlive ~= nil and alive ~= wasAlive then
+            if alive then
+                toast("UI", "Players handle restored", 5)
+            else
+                if setrobloxinput then pcall(function() setrobloxinput(true) end) end
+                toast("UI", "handle went stale - input released, reinject for the menu", 8)
+            end
+        end
+        wasAlive = alive
+        task.wait(2)
+    end
+end)
+
+-- ---------------- engine ----------------
+_G.ESP_GEN = (_G.ESP_GEN or 0) + 1
+_G.ESP_RUNNING = true   -- must be true BEFORE spawning, or the scanner exits instantly
+
+local C = Color3.fromRGB
+local E = {
+    -- distance: Matcha shows studs / 2.75, rounded to nearest
+    DistanceDivisor = 2.75,
+    DistanceUnit    = "m",
+
+    -- all distance tunables in METRES; converted to studs below
+    ClusterM        = 145,    -- points closer than this are one site
+    SiteMatchM      = 180,    -- re-identify a known site within this
+    LootTrustM      = 435,    -- inside this, absence of NPCs means looted
+    MaxDistM        = 7300,   -- render cap
+
+    NpcInterval     = 2,
+    ElementInterval = 10,
+    ChunkSize       = 250,
+    PoolSize        = 48,
+    GraceSeconds    = 45,
+    ConfirmScans    = 3,
+    RenotifyCooldown= 120,
+    SiteTTL         = 900,
+    LootedSuppress  = 300,    -- how long a wiped site stays suppressed
+    ListLimit       = 6,
+    StartTime       = tick(),
+    Registry = {}, Enabled = {}, Primed = {}, Wiped = {},
+    StructPts = {}, NpcPts = {}, NpcNames = {}, SharedPts = {}, Targets = {},
+
+    -- NPCs that appear at several events: assigned ONLY by nearest structure,
+    -- discarded if no known structure claims them
+    SharedNpcs = { {"operator", "crash site"} },
+
+    Order = {"SovietATV","SovietCamp","SovietTruck","PrisonBus","RogueHeliCrash","HeliCrash",
+             "CasinoHeli","TransportPlane","OperatorCrash","MilitaryConvoy","PoliceBarricade",
+             "BankTruck","FBI","PartyBus","Funeral","PirateTreasure"},
+
+    Groups = {
+        {name = "Military", side = "Left",  cats = {"HeliCrash","RogueHeliCrash","TransportPlane","OperatorCrash","MilitaryConvoy"}},
+        {name = "Soviet",   side = "Left",  cats = {"SovietATV","SovietCamp","SovietTruck"}},
+        {name = "Law",      side = "Right", cats = {"PoliceBarricade","FBI"}},
+        {name = "Civilian", side = "Right", cats = {"PrisonBus","BankTruck","PartyBus","Funeral","CasinoHeli"}},
+        {name = "Other",    side = "Right", cats = {"PirateTreasure"}},
+    },
+
+    Categories = {
+        -- fully verified in-world (structure + NPCs seen on site)
+        SovietATV       = {label="Soviet ATV",
+                           structures={"atvcrashsite","renegade"}, npcs={"renegade"}},
+        SovietCamp      = {label="Soviet Camp",
+                           structures={"campsoviet"}, npcAll={"soviet","camp"}},
+        SovietTruck     = {label="Soviet Truck",
+                           structures={"militiahauler"}, npcAll={"militia","event"}},
+        PrisonBus       = {label="Prison Bus",
+                           structures={"crashprisonbus","prisonbus"}, npcs={"unique bus","prison break"}},
+        RogueHeliCrash  = {label="Rogue Heli Crash",
+                           structures={"seahawkcrashsiterogue","crashsiterogue"}, npcAll={"rogue","crash site"}},
+        HeliCrash       = {label="Heli Crash",
+                           structures={"seahawkcrashsite"}, npcAll={"heli pilot","crash site"}},
+        CasinoHeli      = {label="Casino Heli",
+                           structures={"jetrangergembroker","gembroker"}, npcs={"gem broker"}},
+        OperatorCrash   = {label="Operator Crash",
+                           structures={"specialforcescrash"}, npcs={"m4a1"}},
+        MilitaryConvoy  = {label="Military Convoy",
+                           structures={"militaryconvoy"}, npcs={"unique convoy"}},
+        PoliceBarricade = {label="Police Barricade",
+                           structures={"policeblockade"}, npcAll={"police","event"}},
+        BankTruck       = {label="Bank Truck",
+                           structures={"banktruckrobbery"}, npcs={"bank truck"}},
+        -- NPC verified, structure keyword unknown
+        TransportPlane  = {label="Transport Plane",
+                           npcs={"transport pilot","flight technician","plane crash site"}},
+        FBI             = {label="FBI",
+                           structures={"investigatorsedan"}, npcs={"investigator sedan"}},
+        PartyBus        = {label="Party Bus",
+                           structures={"partytrailer"}, npcs={"party trailer"}},
+        Funeral         = {label="Funeral",
+                           structures={"funeral","hearse"}, npcs={"funeral"}},
+        -- NPC only: PirateTreasure01 is reused for random world chests
+        PirateTreasure  = {label="Pirate Treasure",
+                           npcs={"pirate"}},
+    },
+}
+
+-- metres -> studs, once at load
+E.Cluster        = E.ClusterM   * E.DistanceDivisor
+E.SiteMatch      = E.SiteMatchM * E.DistanceDivisor
+E.LootTrustRange = E.LootTrustM * E.DistanceDivisor
+E.MaxDistance    = E.MaxDistM   * E.DistanceDivisor
+
+-- ---------------- visual style ----------------
+local STYLE = {
+    unlooted = C( 80, 230, 120),   -- green: alive, worth going
+    unknown  = C(165, 170, 180),   -- gray: no information
+    looted   = C(235,  80,  80),   -- red: rarely seen, sites are wiped
+    name     = C(245, 246, 250),   -- white label
+    NameSize = 13,
+    SubSize  = 12,
+    Ring     = 5,
+    Core     = 2,
+}
+_G.EventESP = E
+
+function E:Set(name, on)
+    if not self.Categories[name] then return end
+    self.Enabled[name] = on and true or false
+    if not on then
+        self.Registry[name]  = nil
+        self.Primed[name]    = nil
+        self.NpcPts[name]    = nil
+        self.NpcNames[name]  = nil
+        self.Wiped[name]     = nil
+        -- StructPts kept: disabled structures still arbitrate NPC ownership
+    end
+end
+function E:Stop() _G.ESP_RUNNING = false end
+function E:Forget(name)
+    if name then self.Registry[name] = nil; self.Wiped[name] = nil
+    else self.Registry = {}; self.Wiped = {} end
+end
+
+local PART = {Part=true, MeshPart=true, UnionOperation=true, WedgePart=true, TrussPart=true, CornerWedgePart=true}
+local function anchor(o, d)
+    d = d or 3
+    if PART[o.ClassName] then
+        local p = o.Position
+        if typeof(p) == "Vector3" then return o end
+    end
+    if d <= 0 then return nil end
+    for _, c in ipairs(o:GetChildren()) do
+        local a = anchor(c, d - 1)
+        if a then return a end
+    end
+    return nil
+end
+local function npcMatch(ln, def)
+    if def.npcAll then
+        for _, w in ipairs(def.npcAll) do
+            if not string.find(ln, w, 1, true) then return false end
+        end
+        return true
+    end
+    if def.npcs then
+        for _, w in ipairs(def.npcs) do
+            if string.find(ln, w, 1, true) then return true end
+        end
+    end
+    return false
+end
+local function sharedMatch(ln)
+    for _, pat in ipairs(E.SharedNpcs) do
+        local all = true
+        for _, w in ipairs(pat) do
+            if not string.find(ln, w, 1, true) then all = false; break end
+        end
+        if all then return true end
+    end
+    return false
+end
+local function structMatch(ln, def)
+    if not def.structures then return false end
+    for _, w in ipairs(def.structures) do
+        if string.find(ln, w, 1, true) then return true end
+    end
+    return false
+end
+-- full names kept: only the event tag is stripped, weapon suffix preserved
+local function tidyName(n)
+    n = string.gsub(n, "^Unique ", "")
+    n = string.gsub(n, " Crash Site$", "")
+    n = string.gsub(n, " Event$", "")
+    return n
+end
+local function collapse(names)
+    local counts, order = {}, {}
+    for _, n in ipairs(names or {}) do
+        if not counts[n] then counts[n] = 0; order[#order + 1] = n end
+        counts[n] += 1
+    end
+    table.sort(order, function(a, b)
+        if counts[a] ~= counts[b] then return counts[a] > counts[b] end
+        return a < b
+    end)
+    return order, counts
+end
+local function metres(studs)
+    return math.floor(studs / E.DistanceDivisor + 0.5)
+end
+
+local function rebuildSites()
+    local now = tick()
+    local pastGrace = (now - E.StartTime) > E.GraceSeconds
+    local cpos = camPos()
+
+    -- index EVERY structure, enabled or not, so ownership is always decided
+    -- correctly even when the owning event is toggled off
+    local structIndex = {}
+    for cat, pts in pairs(E.StructPts) do
+        for _, p in ipairs(pts) do structIndex[#structIndex + 1] = {pos = p, cat = cat} end
+    end
+
+    -- category-matched NPCs: reassigned to the structure they stand at
+    local npcByCat = {}
+    E.NpcNames = {}
+    for cat, entries in pairs(E.NpcPts) do
+        if E.Enabled[cat] then
+            for _, entry in ipairs(entries) do
+                local best, bestD = cat, E.Cluster
+                for _, s in ipairs(structIndex) do
+                    local d = (s.pos - entry.pos).Magnitude
+                    if d < bestD then best, bestD = s.cat, d end
+                end
+                if E.Enabled[best] then      -- owned by a disabled event -> discard
+                    npcByCat[best] = npcByCat[best] or {}
+                    table.insert(npcByCat[best], {pos = entry.pos, name = entry.name})
+                    E.NpcNames[best] = E.NpcNames[best] or {}
+                    table.insert(E.NpcNames[best], entry.name)
+                end
+            end
+        end
+    end
+
+    -- shared NPCs belong to whichever structure they stand at, or nobody
+    for _, entry in ipairs(E.SharedPts or {}) do
+        local best, bestD = nil, E.Cluster
+        for _, s in ipairs(structIndex) do
+            local d = (s.pos - entry.pos).Magnitude
+            if d < bestD then best, bestD = s.cat, d end
+        end
+        if best and E.Enabled[best] then
+            npcByCat[best] = npcByCat[best] or {}
+            table.insert(npcByCat[best], {pos = entry.pos, name = entry.name})
+            E.NpcNames[best] = E.NpcNames[best] or {}
+            table.insert(E.NpcNames[best], entry.name)
+        end
+    end
+
+    local out = {}
+    for _, cat in ipairs(E.Order) do
+        local def = E.Categories[cat]
+        if E.Enabled[cat] then
+            local hasStruct = def.structures ~= nil
+
+            local pts = {}
+            for _, p in ipairs(E.StructPts[cat] or {}) do
+                pts[#pts + 1] = {pos = p, s = true}
+            end
+            for _, en in ipairs(npcByCat[cat] or {}) do
+                pts[#pts + 1] = {pos = en.pos, s = false, name = en.name}
+            end
+
+            -- cluster into sites, collecting each site's roster
+            local used, sites = {}, {}
+            for i = 1, #pts do
+                if not used[i] then
+                    used[i] = true
+                    local spos, npcN, names = pts[i].pos, 0, {}
+                    if not pts[i].s then npcN = 1; names[1] = pts[i].name end
+                    for j = i + 1, #pts do
+                        if not used[j] and (pts[j].pos - pts[i].pos).Magnitude < E.Cluster then
+                            used[j] = true
+                            if pts[j].s then
+                                spos = pts[j].pos
+                            else
+                                npcN += 1
+                                names[#names + 1] = pts[j].name
+                            end
+                        end
+                    end
+                    if pts[i].s then spos = pts[i].pos end
+                    sites[#sites + 1] = {pos = spos, npcN = npcN, names = names}
+                end
+            end
+
+            local reg = E.Registry[cat] or {}
+            E.Registry[cat] = reg
+            local seen = {}
+
+            for _, s in ipairs(sites) do
+                local key, rec
+                for k, t in pairs(reg) do
+                    if (t.pos - s.pos).Magnitude < E.SiteMatch then key = k; rec = t; break end
+                end
+                key = key or string.format("%d,%d", math.floor(s.pos.X), math.floor(s.pos.Z))
+
+                -- a site we already wiped stays gone until its NPCs come back
+                if s.npcN == 0 and not rec then
+                    local sup, blocked = E.Wiped[cat], false
+                    if sup then
+                        for _, w in ipairs(sup) do
+                            if (now - w.t) < E.LootedSuppress
+                               and (w.pos - s.pos).Magnitude < E.SiteMatch then
+                                blocked = true; break
+                            end
+                        end
+                    end
+                    if blocked then continue end
+                end
+
+                local dist = cpos and (s.pos - cpos).Magnitude or math.huge
+                local raw
+                if s.npcN > 0 then
+                    raw = "unlooted"                    -- presence is proof
+                elseif dist <= E.LootTrustRange then
+                    raw = "looted"                      -- close enough to trust absence
+                elseif rec and rec.everUnlooted then
+                    raw = "unlooted"                    -- sticky: proven alive
+                else
+                    raw = "unknown"                     -- never seen populated
+                end
+
+                if not rec then
+                    rec = {pos = s.pos, state = raw, streak = 0, lastAlert = 0,
+                           unlootedStreak = 0, announced = false, lastSeen = now,
+                           names = {}, everUnlooted = (raw == "unlooted")}
+                    reg[key] = rec
+                end
+                rec.pos, rec.lastSeen = s.pos, now
+                if s.npcN > 0 then
+                    rec.names = s.names
+                    rec.everUnlooted = true        -- proven populated
+                elseif raw == "looted" then
+                    rec.names = {}
+                    rec.everUnlooted = false
+                end
+                seen[key] = true
+
+                if raw == "unlooted" then rec.unlootedStreak = (rec.unlootedStreak or 0) + 1
+                else rec.unlootedStreak = 0 end
+
+                if raw == "unknown" then
+                    rec.state = "unknown"; rec.streak = 0
+                elseif raw ~= rec.state then
+                    rec.streak += 1
+                    if rec.streak >= E.ConfirmScans then
+                        local wasLooted = (rec.state == "looted")
+                        rec.state = raw; rec.streak = 0
+                        if raw == "unlooted" and wasLooted and rec.announced
+                           and pastGrace and (now - rec.lastAlert) > E.RenotifyCooldown then
+                            toast(def.label, "has respawned", 6)
+                            rec.lastAlert = now
+                        end
+                    end
+                else
+                    rec.streak = 0
+                end
+
+                -- a new site announces only after holding unlooted for ConfirmScans
+                if not rec.announced and rec.unlootedStreak >= E.ConfirmScans then
+                    if pastGrace and E.Primed[cat] then
+                        toast(def.label, "has spawned", 6)
+                        rec.lastAlert = now
+                    end
+                    rec.announced = true
+                end
+
+                -- LOOTED = WIPED: drop the site and suppress re-registration
+                if rec.state == "looted" then
+                    reg[key] = nil
+                    E.Wiped[cat] = E.Wiped[cat] or {}
+                    table.insert(E.Wiped[cat], {pos = rec.pos, t = now})
+                end
+            end
+
+            for key, rec in pairs(reg) do
+                if not seen[key] then
+                    local dist = cpos and (rec.pos - cpos).Magnitude or math.huge
+                    if (now - rec.lastSeen) > E.SiteTTL then
+                        reg[key] = nil                        -- stale memory
+                    elseif dist <= E.LootTrustRange then
+                        reg[key] = nil                        -- gone while we watched
+                        if not hasStruct then
+                            E.Wiped[cat] = E.Wiped[cat] or {}
+                            table.insert(E.Wiped[cat], {pos = rec.pos, t = now})
+                        end
+                    else
+                        rec.state = rec.everUnlooted and "unlooted" or "unknown"
+                    end
+                end
+            end
+
+            for _, rec in pairs(reg) do
+                out[#out + 1] = {cat = cat, pos = rec.pos,
+                                 name = def.label, state = rec.state}
+            end
+            E.Primed[cat] = true
+        end
+    end
+
+    -- expire suppression entries
+    for cat, sup in pairs(E.Wiped) do
+        for i = #sup, 1, -1 do
+            if (now - sup[i].t) > E.LootedSuppress then table.remove(sup, i) end
+        end
+    end
+
+    E.Targets = out
+end
+
+-- ---------------- SCANNER (never blocks drawing) ----------------
+task.spawn(function()
+    local myGen = _G.ESP_GEN
+    local lastEl = 0
+    while _G.ESP_RUNNING and _G.ESP_GEN == myGen do
+        local zom = workspace:FindFirstChild("Zombies")
+        if zom then
+            local fresh, shared = {}, {}
+            for _, z in ipairs(zom:GetChildren()) do
+                local nm = z.Name
+                local ln = string.lower(nm)
+                local claimed = false
+                for _, cat in ipairs(E.Order) do
+                    if E.Enabled[cat] and npcMatch(ln, E.Categories[cat]) then
+                        local a = anchor(z)
+                        if a then
+                            fresh[cat] = fresh[cat] or {}
+                            table.insert(fresh[cat], { pos = a.Position, name = tidyName(nm) })
+                        end
+                        claimed = true
+                        break
+                    end
+                end
+                if not claimed and sharedMatch(ln) then
+                    local a = anchor(z)
+                    if a then
+                        shared[#shared + 1] = { pos = a.Position, name = tidyName(nm) }
+                    end
+                end
+            end
+            E.NpcPts, E.SharedPts = fresh, shared
+        end
+
+        if tick() - lastEl > E.ElementInterval then
+            lastEl = tick()
+            local el = workspace:FindFirstChild("Map") and workspace.Map:FindFirstChild("Elements")
+            if el then
+                local kids = el:GetChildren()
+                local fresh = {}
+                for i, c in ipairs(kids) do
+                    local ln = string.lower(c.Name)
+                    for _, cat in ipairs(E.Order) do
+                        if structMatch(ln, E.Categories[cat]) then    -- no Enabled gate
+                            local a = anchor(c)
+                            if a then
+                                fresh[cat] = fresh[cat] or {}
+                                table.insert(fresh[cat], a.Position)
+                            end
+                            break
+                        end
+                    end
+                    if i % E.ChunkSize == 0 then task.wait() end
+                end
+                E.StructPts = fresh
+            end
+        end
+
+        rebuildSites()
+        task.wait(E.NpcInterval)
+    end
+end)
+
+-- ---------------- RENDERER (pure drawing) ----------------
+-- Colour is assigned every frame; Font and Transparency are left at defaults,
+-- since setting those is what turned the text black.
+task.spawn(function()
+    local myGen = _G.ESP_GEN
+    local pool = {}
+    for i = 1, E.PoolSize do
+        local ring = Drawing.new("Circle")
+        ring.Thickness = 1; ring.Filled = false; ring.NumSides = 18
+        ring.Radius = STYLE.Ring; ring.Visible = false
+        local core = Drawing.new("Circle")
+        core.Filled = true; core.NumSides = 12
+        core.Radius = STYLE.Core; core.Visible = false
+        local name = Drawing.new("Text")
+        name.Size = STYLE.NameSize; name.Center = true; name.Outline = true
+        name.Visible = false
+        local sub = Drawing.new("Text")
+        sub.Size = STYLE.SubSize; sub.Center = true; sub.Outline = true
+        sub.Visible = false
+        pool[i] = {ring = ring, core = core, name = name, sub = sub}
+    end
+
+    local function hide(e)
+        e.ring.Visible = false; e.core.Visible = false
+        e.name.Visible = false; e.sub.Visible = false
+    end
+
+    while _G.ESP_RUNNING and _G.ESP_GEN == myGen do
+        if iskeypressed and iskeypressed(0x76) then   -- F7 panic
+            if setrobloxinput then pcall(function() setrobloxinput(true) end) end
+            _G.ESP_RUNNING = false
+        end
+        local cpos = camPos()
+        local list, n = E.Targets, 0
+        for i = 1, #list do
+            if n >= E.PoolSize then break end
+            local t = list[i]
+            if cpos and E.Enabled[t.cat] then
+                local dist = (t.pos - cpos).Magnitude
+                if dist <= E.MaxDistance then
+                    local pt, vis = toScreen(t.pos + Vector3.new(0, 2, 0))
+                    if vis then
+                        n += 1
+                        local e = pool[n]
+                        local col = STYLE[t.state] or STYLE.name
+
+                        e.ring.Position = pt
+                        e.ring.Color = col
+                        e.ring.Visible = true
+
+                        e.core.Position = pt
+                        e.core.Color = col
+                        e.core.Visible = true
+
+                        e.name.Text = t.name
+                        e.name.Position = Vector2.new(pt.X, pt.Y - 30)
+                        e.name.Color = STYLE.name
+                        e.name.Visible = true
+
+                        local sub = metres(dist) .. E.DistanceUnit
+                        if t.state == "unknown" then sub = sub .. "  ?" end
+                        e.sub.Text = sub
+                        e.sub.Position = Vector2.new(pt.X, pt.Y - 16)
+                        e.sub.Color = col
+                        e.sub.Visible = true
+                    end
+                end
+            end
+        end
+        _G.ESP_COUNT = n
+        for i = n + 1, E.PoolSize do hide(pool[i]) end
+        task.wait()
+    end
+
+    for i = 1, E.PoolSize do
+        pool[i].ring:Remove(); pool[i].core:Remove()
+        pool[i].name:Remove(); pool[i].sub:Remove()
+    end
+end)
+
+-- ---------------- UI ----------------
+local win = Lib:CreateWindow({ title = "AR2 Hub", size = Vector2.new(700, 640) })
+
+Lib:Category("Visuals")
+local vis = win:Tab("Visuals", "monitor")
+
+local eventtab  = vis:Sub("Events", "World")
+local playertab = vis:Sub("Players", "Users")    -- placeholder, not implemented
+local zombietab = vis:Sub("Zombies", "Skull")    -- placeholder, not implemented
+
+local readouts = {}   -- cat -> { amount = handle, list = handle }
+
+for _, g in ipairs(E.Groups) do
+    local sec = eventtab:Section(g.name, g.side)
+    for _, cat in ipairs(g.cats) do
+        local def = E.Categories[cat]
+        local amountLbl, listLbl          -- declared first so the callback closes over them
+        sec:Toggle(def.label, false, function(on)
+            _G.EventESP:Set(cat, on)
+            if not on then
+                pcall(function() amountLbl:SetText("  Amount: 0") end)
+                pcall(function() listLbl:SetText("  Zombies: none") end)
+            end
+        end)
+        amountLbl = sec:Label("  Amount: 0")
+        listLbl   = sec:Label("  Zombies: none")
+        readouts[cat] = { amount = amountLbl, list = listLbl }
+    end
+end
+
+zombietab:Section("Zombie ESP", "Left")
+zombietab:Section("Options", "Right")
+
+-- one wrapping label per event: the lib re-flows text on width
+task.spawn(function()
+    while _G.ESP_RUNNING do
+        for cat, r in pairs(readouts) do
+            if E.Enabled[cat] then
+                local amount, nearest, bestD = 0, nil, math.huge
+                local cp = camPos()
+                for _, rec in pairs(E.Registry[cat] or {}) do
+                    amount += 1
+                    local d = cp and (rec.pos - cp).Magnitude or math.huge
+                    if d < bestD then bestD, nearest = d, rec end
+                end
+                local suffix = (amount > 0 and bestD < math.huge)
+                    and string.format("  (nearest %d%s)", metres(bestD), E.DistanceUnit) or ""
+                pcall(function() r.amount:SetText("  Amount: " .. amount .. suffix) end)
+
+                local order, counts = collapse(nearest and nearest.names or {})
+                local parts = {}
+                for i = 1, math.min(#order, E.ListLimit) do
+                    local nm = order[i]
+                    parts[#parts + 1] = counts[nm] > 1 and (nm .. " x" .. counts[nm]) or nm
+                end
+                if #order > E.ListLimit then
+                    parts[#parts + 1] = "+" .. (#order - E.ListLimit) .. " more"
+                end
+                local txt = #parts > 0 and ("  Zombies: " .. table.concat(parts, " | "))
+                                        or "  Zombies: none"
+                pcall(function() r.list:SetText(txt) end)
+            else
+                pcall(function() r.amount:SetText("  Amount: 0") end)
+                pcall(function() r.list:SetText("  Zombies: none") end)
+            end
+        end
+        task.wait(1)
+    end
+end)
+
+-- ---------------- SITE PROBE ----------------
+-- Flies the CAMERA to uncertain sites to force NPCs to stream in, then snaps
+-- back. Your character never moves - but the world around it unloads while the
+-- camera is away, so prefer triggering this from safe cover.
+_G.SiteProbe = {
+    Key          = 0x77,   -- F8, manual sweep
+    Dwell        = 2.5,    -- seconds parked at each site
+    Height       = 45,     -- studs above the site
+    MaxSites     = 4,      -- sites per sweep
+    OnlyUncertain= true,
+    AutoInterval = 60,     -- seconds between automatic sweeps (0 = manual only)
+    RequireIdle  = false,  -- true = only sweep while your character is stationary
+    IdleSeconds  = 3,
+    Running      = true,
+}
+local SP = _G.SiteProbe
+
+local function myCharRoot()
+    local cam = getCamera()
+    if not cam then return nil end
+    local cpos = cam.Position
+    local best, bestD = nil, math.huge
+    for _, c in ipairs(workspace.Characters:GetChildren()) do
+        local a = anchor(c)
+        if a then
+            local d = (a.Position - cpos).Magnitude
+            if d < bestD then best, bestD = a, d end
+        end
+    end
+    return best
+end
+
+local function resolveSite(cat, rec)
+    local def = E.Categories[cat]
+    local names, count = {}, 0
+    for _, z in ipairs(workspace.Zombies:GetChildren()) do
+        local ln = string.lower(z.Name)
+        if npcMatch(ln, def) or sharedMatch(ln) then
+            local a = anchor(z)
+            if a and (a.Position - rec.pos).Magnitude < E.Cluster then
+                count += 1
+                names[#names + 1] = tidyName(z.Name)
+            end
+        end
+    end
+    if count > 0 then
+        rec.names, rec.state, rec.everUnlooted = names, "unlooted", true
+    else
+        rec.names, rec.state, rec.everUnlooted = {}, "looted", false
+    end
+    rec.lastSeen = tick()
+    return count
+end
+
+function _G.ProbeSites()
+    local cam = getCamera()
+    if not cam then return end
+    local saved = cam.CFrame
+    local root = myCharRoot()
+    local beforePos = root and root.Position
+
+    local jobs = {}
+    for cat, reg in pairs(E.Registry) do
+        if E.Enabled[cat] then
+            for _, rec in pairs(reg) do
+                if (not SP.OnlyUncertain) or rec.state == "unknown" or rec.everUnlooted then
+                    jobs[#jobs + 1] = {cat = cat, rec = rec,
+                                       d = (rec.pos - saved.Position).Magnitude}
+                end
+            end
+        end
+    end
+    table.sort(jobs, function(a, b) return a.d < b.d end)
+    if #jobs == 0 then return end
+
+    for i = 1, math.min(#jobs, SP.MaxSites) do
+        local j = jobs[i]
+        local eye = j.rec.pos + Vector3.new(0, SP.Height, 0)
+        cam.CFrame = CFrame.lookAt(eye, j.rec.pos)
+        task.wait(SP.Dwell)
+        local n = resolveSite(j.cat, j.rec)
+        print(string.format("[probe] %-18s %s (%d npc)",
+            E.Categories[j.cat].label, j.rec.state, n))
+    end
+
+    cam.CFrame = saved
+    local afterPos = root and root.Position
+    if beforePos and afterPos then
+        local drift = (afterPos - beforePos).Magnitude
+        if drift > 15 then
+            print(string.format("[probe] character moved %.0f studs during sweep", drift))
+        end
+    end
+end
+
+task.spawn(function()   -- manual trigger
+    local held = false
+    while SP.Running do
+        local down = iskeypressed and iskeypressed(SP.Key)
+        if down and not held then _G.ProbeSites() end
+        held = down
+        task.wait(0.1)
+    end
+end)
+
+task.spawn(function()   -- automatic sweep
+    local lastAuto, lastPos, stillSince = tick(), nil, tick()
+    while SP.Running do
+        local root = myCharRoot()
+        local p = root and root.Position
+        if p and lastPos and (p - lastPos).Magnitude > 3 then stillSince = tick() end
+        lastPos = p
+        if SP.AutoInterval > 0 and (tick() - lastAuto) > SP.AutoInterval then
+            local idleOk = (not SP.RequireIdle) or ((tick() - stillSince) > SP.IdleSeconds)
+            if idleOk then
+                lastAuto = tick()
+                _G.ProbeSites()
+            end
+        end
+        task.wait(1)
+    end
+end)
+
+-- ==================== Player Visuals ====================
+_G.PlayerVis = {
+    Refresh = 1,
+    Running = true,
+    Cache   = {},     -- userId -> {primary=, secondary=, melee=}
+    Rows    = {},     -- ordered: one entry per live player box
+
+    -- Slot is decided by name; the game does not tell us. Match on the CORE
+    -- word: "mac-10" also catches "Mac-10Mod1". Exact lists are for short names
+    -- that would appear inside other words ("aug" is a substring of "gauge").
+    Melee = {
+        "knife","axe","hatchet","shiv","katana","saber","dagger","longsword",
+        "baton","crowbar","shovel","keyboard",
+    },
+    PrimaryExact = { "aug", "fal", "g3", "m9x", "m14", "m21", "m60" },
+    Primary = {
+        -- bolt / lever / marksman
+        "mini-14","model 94","m1903","springfield","model 788","mosin-nagant",
+        "msg-90","psg-1","dragunov","vintorez","vintores","l96a1","m40a1",
+        -- shotguns
+        "auto-5","coach gun","maverick 88","spas-12",
+        -- smg / carbine
+        "thompson","m4a1","mat-49","mp5","mp 40","mp40","ump45","pp-19","bizon",
+        "carbine","model 44","m44","sks","xm177","aks-74u","patriot","ac-556",
+        -- rifles
+        "ak-47","akm","famas","l85a1","m16","ak-74","as val","garand","svt-40",
+        -- lmg
+        "m1918","m1919","m249","rpk","pkm",
+    },
+    SecondaryExact = { "m9" },
+    Secondary = {
+        -- revolvers / pistols
+        "model 29","python","snubnose","xmds-1a","desert eagle","g17","hi-power",
+        "m1911","makarov","model 459","p38","p220","socom","m93r",
+        -- machine pistols / pdw
+        "mac-10","skorpion","tec-9","mp5k","uzi","ao-46",
+        -- sawn-off / compact
+        "lupara","obrez","ots-14","groza",
+        -- cross-class modifications: only work if the modifier word is in ItemName
+        "trapper","stunted",
+    },
+}
+local PV = _G.PlayerVis
+local Players = game:GetService("Players")
+
+local PV_PART = {Part=true, MeshPart=true, UnionOperation=true, WedgePart=true, TrussPart=true, CornerWedgePart=true}
+local function pvAnchor(o, d)
+    d = d or 3
+    if PV_PART[o.ClassName] then
+        local p = o.Position
+        if typeof(p) == "Vector3" then return o end
+    end
+    if d <= 0 then return nil end
+    for _, c in ipairs(o:GetChildren()) do
+        local a = pvAnchor(c, d - 1)
+        if a then return a end
+    end
+    return nil
+end
+local function pvCamPos()
+    local cam = workspace.CurrentCamera or workspace:FindFirstChildOfClass("Camera")
+    if not cam then return nil end
+    local ok, p = pcall(function() return cam.CFrame.Position end)
+    if ok and typeof(p) == "Vector3" then return p end
+    local ok2, p2 = pcall(function() return cam.Position end)
+    if ok2 and typeof(p2) == "Vector3" then return p2 end
+    return nil
+end
+
+-- melee first (its words appear in no gun name), then exact names, then
+-- substrings. secondary always beats primary so a short primary token cannot
+-- steal a pistol. verified against all 16 melee and both wiki gun lists.
+local function classify(item)
+    local ln = string.lower(item or "")
+    if ln == "" then return nil end
+    for _, w in ipairs(PV.Melee or {}) do
+        if string.find(ln, w, 1, true) then return "melee" end
+    end
+    for _, w in ipairs(PV.SecondaryExact or {}) do if ln == w then return "secondary" end end
+    for _, w in ipairs(PV.PrimaryExact or {})   do if ln == w then return "primary"   end end
+    for _, w in ipairs(PV.Secondary or {}) do
+        if string.find(ln, w, 1, true) then return "secondary" end
+    end
+    for _, w in ipairs(PV.Primary or {}) do
+        if string.find(ln, w, 1, true) then return "primary" end
+    end
+    return nil          -- food, tools, consumables: ignored, never wipe a slot
+end
+
+-- Matcha cannot decode some Roblox strings and hands back 6 bytes of POINTER
+-- instead. memory_read dereferences it, taking weapon coverage to ~100%.
+-- Requires "Allow Unsafe LuaU" enabled in Matcha.
+local function resolveJson(ei)
+    local raw = tostring(ei.Value or "")
+    if raw == "" or raw == "[]" then return nil end
+    if string.find(raw, "ItemName", 1, true) then return raw end
+    if #raw >= 4 and #raw <= 8 then
+        local addr = 0
+        for i = #raw, 1, -1 do addr = addr * 256 + string.byte(raw, i) end
+        local ok, s = pcall(function() return memory_read("string", addr) end)
+        if ok and type(s) == "string" and string.find(s, "ItemName", 1, true) then
+            return s
+        end
+    end
+    return nil
+end
+
+local function readEquipped(char)
+    local anim = char and char:FindFirstChild("Animator")
+    local ei = anim and anim:FindFirstChild("EquippedItem")
+    if not ei then return nil, nil end
+    local json = resolveJson(ei)
+    if not json then return nil, nil end
+    local item = string.match(json, '"ItemName"%s*:%s*"([^"]*)"') or ""
+    local block = string.match(json, '"Attachments"%s*:%s*(%b{})') or ""
+    local list = {}
+    for v in string.gmatch(block, '"[%w_]+"%s*:%s*"([^"]*)"') do
+        if v ~= "" then list[#list + 1] = v end
+    end
+    return item, (#list > 0 and table.concat(list, ", ") or "none")
+end
+
+-- ==================== Combat tab ====================
+-- Recoil/spread live in Lua tables. Locating them costs a full heap scan
+-- (~30s, freezes the game). The third-party script pays that on EVERY toggle -
+-- that is the freeze/crash. We scan ONCE, cache, then apply in ~0ms.
+_G.COMBAT = {
+    Prepared  = false,
+    Scanning  = false,
+    Cache     = nil,      -- getgc result, reused all session
+    Originals = {},       -- addr -> captured value
+    SpreadKeys = {
+        "SpreadBase","SpreadAddFPSHip","SpreadAddFPSZoom",
+        "SpreadAddTPSHip","SpreadAddTPSZoom",
+    },
+    RecoilKeys = {
+        "KickUpForce","KickUpSpeed","KickUpBounce","KickUpCameraInfluence","KickUpGunInfluence",
+        "RaiseForce","RaiseSpeed","RaiseBounce","RaiseInfluence",
+        "ShiftForce","ShiftSpeed","ShiftBounce","ShiftCameraInfluence","ShiftGunInfluence",
+        "SlideForce","SlideSpeed","SlideBounce","SlideInfluence",
+        "ShiftRoll","RollRightBias","RollLeftBias",
+    },
+}
+local CB = _G.COMBAT
+
+local combattab = vis:Sub("Combat", "Crosshair")
+local prepSec = combattab:Section("Setup", "Full")
+local prepLbl = prepSec:Label("Status: not prepared")
+local optSec  = combattab:Section("Options", "Full")
+
+local function setStatus(s) pcall(function() prepLbl:SetText("Status: " .. s) end) end
+
+local function allKeys()
+    local t = {}
+    for _, k in ipairs(CB.SpreadKeys) do t[#t + 1] = k end
+    for _, k in ipairs(CB.RecoilKeys) do t[#t + 1] = k end
+    return t
+end
+
+-- one scan for all 26 keys, ~30s, once per session
+local function prepare()
+    if CB.Scanning then return end
+    CB.Scanning = true
+    setStatus("scanning... game freezes ~30s, ONCE per session")
+    task.wait(0.1)
+    task.spawn(function()
+        local t0 = tick()
+        local ok, cache = pcall(function() return getgc(allKeys()) end)
+        local secs = tick() - t0
+        if not ok or type(cache) ~= "table" or #cache == 0 then
+            CB.Scanning = false
+            setStatus(string.format("scan failed after %.1fs", secs))
+            return
+        end
+        CB.Originals = {}
+        local n = 0
+        for _, e in ipairs(cache) do
+            if e.addr and tostring(e.type) == "number" then
+                CB.Originals[e.addr] = tonumber(e.value) or 0
+                n = n + 1
+            end
+        end
+        CB.Cache, CB.Prepared, CB.Scanning = cache, true, false
+        setStatus(string.format("ready - %d values cached in %.0fs", n, secs))
+        print(string.format("[combat] prepared: %d entries in %.1fs", n, secs))
+    end)
+end
+
+-- zero a key group, or restore it
+local function apply(keys, on, label)
+    if not CB.Prepared then setStatus("press Prepare first"); return end
+    local t0 = tick()
+    if on then
+        for _, k in ipairs(keys) do pcall(function() applygc(CB.Cache, k, 0) end) end
+        setStatus(string.format("%s ON (%.0fms)", label, (tick() - t0) * 1000))
+    else
+        -- only write back where the live value is still readable and sane
+        local restored, skipped = 0, 0
+        local want = {}
+        for _, k in ipairs(keys) do want[k] = true end
+        for _, e in ipairs(CB.Cache) do
+            if e.addr and want[tostring(e.key)] and tostring(e.type) == "number" then
+                local orig = CB.Originals[e.addr]
+                local okr, live = pcall(function() return memory_read("double", e.addr) end)
+                if orig and okr and type(live) == "number" then
+                    pcall(function() memory_write("double", e.addr, orig) end)
+                    restored = restored + 1
+                else
+                    skipped = skipped + 1
+                end
+            end
+        end
+        setStatus(string.format("%s OFF - %d restored, %d skipped (%.0fms)",
+            label, restored, skipped, (tick() - t0) * 1000))
+        print(string.format("[combat] %s restored %d, skipped %d", label, restored, skipped))
+    end
+end
+
+prepSec:Button("Prepare (one-time scan)", function() prepare() end)
+prepSec:Button("Refresh cache", function()
+    if CB.Cache then
+        local t0 = tick()
+        pcall(function() refreshgc(CB.Cache) end)
+        setStatus(string.format("cache refreshed (%.0fms)", (tick() - t0) * 1000))
+    end
+end)
+
+optSec:Toggle("No Spread", false, function(on) apply(CB.SpreadKeys, on, "No Spread") end)
+optSec:Toggle("No Recoil", false, function(on) apply(CB.RecoilKeys, on, "No Recoil") end)
+optSec:Label("Prepare once per session, with both toggles OFF.")
+optSec:Label("Refresh cache after respawn or weapon swap.")
+
+-- ---------------- panel: boxes created and destroyed with players ----------------
+-- playertab._tab.sections is the array the lib's layout pass iterates.
+-- Splicing an entry out of it removes the box; appending adds one at runtime.
+local pvSections = playertab._tab and playertab._tab.sections
+
+local function makeBox(userId)
+    local box = playertab:Section("-", "Full")
+    return {
+        userId = userId,
+        box    = box,
+        pri    = box:Label("Primary: -"),
+        sec    = box:Label("Secondary: -"),
+        mel    = box:Label("Melee: -"),
+    }
+end
+
+local function destroyBox(row)
+    if not (pvSections and row and row.box) then return end
+    local target = rawget(row.box, "_section")
+    for i = #pvSections, 1, -1 do
+        if pvSections[i] == target then table.remove(pvSections, i) end
+    end
+end
+
+task.spawn(function()
+    while PV.Running do
+        local cpos = pvCamPos()
+        local lp = Players.LocalPlayer
+        local lpId = lp and lp.UserId
+
+        local present = {}
+        for _, p in ipairs(Players:GetPlayers()) do
+            if p.UserId ~= lpId then
+                local ok, char = pcall(function() return p.Character end)
+                local a = (ok and char) and pvAnchor(char) or nil
+                if a then
+                    local item, att = readEquipped(char)
+                    if item and item ~= "" then
+                        local slot = classify(item)
+                        if slot then
+                            local c = PV.Cache[p.UserId] or {}
+                            c[slot] = {name = item, att = att}
+                            PV.Cache[p.UserId] = c
+                        end
+                    end
+                    present[p.UserId] = {
+                        name = p.Name,
+                        d = cpos and (a.Position - cpos).Magnitude / 2.75 or nil,
+                    }
+                end
+            end
+        end
+
+        -- leavers: destroy their box
+        for i = #PV.Rows, 1, -1 do
+            local row = PV.Rows[i]
+            if not present[row.userId] then
+                pcall(destroyBox, row)
+                PV.Cache[row.userId] = nil
+                table.remove(PV.Rows, i)
+            end
+        end
+
+        -- joiners: append a box at the bottom
+        local have = {}
+        for _, row in ipairs(PV.Rows) do have[row.userId] = true end
+        for id in pairs(present) do
+            if not have[id] then
+                local ok, row = pcall(makeBox, id)
+                if ok and row then PV.Rows[#PV.Rows + 1] = row end
+            end
+        end
+
+        -- refresh contents
+        for _, row in ipairs(PV.Rows) do
+            local info = present[row.userId]
+            if info then
+                local c = PV.Cache[row.userId] or {}
+                local pri = c.primary and (c.primary.name .. "  |  " .. c.primary.att) or "-"
+                local sec = c.secondary and (c.secondary.name .. "  |  " .. c.secondary.att) or "-"
+                local mel = c.melee and c.melee.name or "-"
+                local dist = info.d and string.format("  |  %dm", math.floor(info.d + 0.5)) or ""
+                pcall(function() row.box:SetName(info.name .. dist) end)
+                pcall(function() row.pri:SetText("Primary: " .. pri) end)
+                pcall(function() row.sec:SetText("Secondary: " .. sec) end)
+                pcall(function() row.mel:SetText("Melee: " .. mel) end)
+            end
+        end
+        task.wait(PV.Refresh)
+    end
+end)
