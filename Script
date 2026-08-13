@@ -1062,12 +1062,11 @@ optSec:Label("Prepare once per session, with both toggles OFF.")
 optSec:Label("Refresh cache after respawn or weapon swap.")
 
 -- ==================== Aimbot (Combat tab) ====================
--- Angles in WORLD space: mouse X rotates the camera about the world vertical
--- axis, so camera-space yaw is off by 1/cos(pitch). Calibrated live at
--- 0.002443 rad/count on both axes, exactly linear. +X counts DECREASE world
--- yaw and +Y counts look DOWN, so both deltas negate.
--- atan2 stays defined behind the camera, so a flanking target can never mirror
--- and yank the view around - that was the close-combat "teleport".
+-- Angles in WORLD space: mouse X rotates about the world vertical axis, so
+-- camera-space yaw is off by 1/cos(pitch). Calibrated live at 0.002443
+-- rad/count, exactly linear. +X counts DECREASE yaw, +Y counts look DOWN.
+-- FOV is a pixel radius, converted to an angle via the focal length, so the
+-- gate matches the drawn circle exactly and still rejects targets behind you.
 -- mousemoverel only takes effect while the Roblox window has focus.
 _G.AIMBOT = _G.AIMBOT or {}
 local AB = _G.AIMBOT
@@ -1075,17 +1074,18 @@ AB.Enabled  = false
 AB.Key      = AB.Key      or "e"
 AB.PredMs   = AB.PredMs   or 0
 AB.FalloffM = AB.FalloffM or 15
-AB.FovDeg   = AB.FovDeg   or 8
+AB.FovPx    = AB.FovPx    or 150
+AB.ShowFov  = (AB.ShowFov ~= false)
 AB.DistM    = AB.DistM    or 300
 AB.Smooth   = AB.Smooth   or 3
 AB.Sens     = AB.Sens     or 1.0
 AB.Part     = AB.Part     or "Head"
-AB.Zombies  = AB.Zombies  == true      -- TEMPORARY: test targets
+AB.Zombies  = AB.Zombies  == true      -- TEMPORARY test targets
 AB.Locked   = nil
 
 local RAD_PER_COUNT = 0.002443
-local MAX_STEP      = 250              -- counts/tick, the real anti-teleport guard
-local MAX_ENGAGE    = math.rad(120)    -- was 60, which silently capped the FOV slider
+local MAX_STEP      = 250
+local MAX_ENGAGE    = math.rad(120)
 local ABDIV         = 2.75
 
 local aimKeyHandle
@@ -1111,8 +1111,8 @@ local function keyHeld()
     return false
 end
 
--- Velocity MUST come from position history: Velocity and AssemblyLinearVelocity
--- both read exactly zero in Matcha (verified against a moving player).
+-- Velocity from position history: Velocity and AssemblyLinearVelocity both read
+-- exactly zero in Matcha (verified against a moving player).
 local abHist = {}
 local function velOf(key, pos, now)
     local h = abHist[key]
@@ -1148,7 +1148,7 @@ end
 
 local function abAlive(model)
     local hum = model:FindFirstChildOfClass("Humanoid")
-    if not hum then return true end          -- zombies have none; dead ones move to Corpses
+    if not hum then return true end      -- zombies have none; dead ones move to Corpses
     local ok, hp = pcall(function() return hum.Health end)
     if ok and type(hp) == "number" then return hp > 0 end
     return true
@@ -1158,99 +1158,118 @@ local accX, accY = 0, 0
 local function moveMouse(dxc, dyc)
     if not mousemoverel then return end
     accX, accY = accX + dxc, accY + dyc
-    local sx = math.modf(accX); accX = accX - sx   -- keep the fraction, or small
-    local sy = math.modf(accY); accY = accY - sy   -- deltas never move at all
+    local sx = math.modf(accX); accX = accX - sx
+    local sy = math.modf(accY); accY = accY - sy
     if sx ~= 0 or sy ~= 0 then
         pcall(function() mousemoverel(sx, sy) end)
     end
 end
 
+-- the FOV circle
+local fovRing = Drawing.new("Circle")
+fovRing.Filled = false
+fovRing.Thickness = 1
+fovRing.NumSides = 64
+fovRing.Visible = false
+
 task.spawn(function()
     while _G.AR2HUB_GEN == GEN do
-        if AB.Enabled and keyHeld() then
-            local cam = workspace.CurrentCamera
-            local ok, cf = cam and pcall(function() return cam.CFrame end)
-            if ok and cf then
-                local cp, look = cf.Position, cf.LookVector
-                local curYaw   = math.atan2(look.X, look.Z)
-                local curPitch = math.asin(math.clamp(look.Y, -1, 1))
-                local now       = tick()
-                local maxStuds  = AB.DistM * ABDIV
-                local fovRad    = math.rad(AB.FovDeg)
-                local fallStuds = AB.FalloffM * ABDIV
+        local cam = workspace.CurrentCamera
+        local okcf, cf = cam and pcall(function() return cam.CFrame end)
+        local vs = cam and cam.ViewportSize
 
-                local bestKey, bestName, bestScore, bestDY, bestDP, bestAng
+        -- focal length, recomputed every tick because ADS changes FieldOfView
+        local gateAng, stickyAng = 0, 0
+        if cam and vs then
+            local fov = cam.FieldOfView or 70
+            local f = (vs.Y / 2) / math.tan(math.rad(fov) / 2)
+            gateAng   = math.atan(AB.FovPx / f)
+            stickyAng = math.atan((AB.FovPx * 1.5) / f)
+            if gateAng   > MAX_ENGAGE then gateAng   = MAX_ENGAGE end
+            if stickyAng > MAX_ENGAGE then stickyAng = MAX_ENGAGE end
+        end
 
-                local function consider(key, name, model)
-                    local part = abPart(model)
-                    if not part or not abAlive(model) then return end
-                    local okp, tpos = pcall(function() return part.Position end)
-                    if not okp or not tpos then return end
-                    local raw = (tpos - cp).Magnitude
-                    if raw <= 0 or raw > maxStuds then return end
-                    -- constant lead time, faded out up close where linear
-                    -- extrapolation stops being valid
-                    local lead = AB.PredMs / 1000
-                    if fallStuds > 0 and raw < fallStuds then
-                        lead = lead * (raw / fallStuds)
-                    end
-                    local aimPos = tpos
-                    if lead > 0 then aimPos = tpos + velOf(key, tpos, now) * lead end
-                    local d = aimPos - cp
-                    local mag = d.Magnitude
-                    if mag <= 0 then return end
-                    local u = d * (1 / mag)
-                    local ang = math.acos(math.clamp(look:Dot(u), -1, 1))
-                    local gate = (AB.Locked == key) and fovRad * 1.5 or fovRad
-                    if gate > MAX_ENGAGE then gate = MAX_ENGAGE end
-                    if ang > gate then return end
-                    local score = (AB.Locked == key) and ang * 0.5 or ang
-                    if not bestScore or score < bestScore then
-                        bestKey, bestName, bestScore, bestAng = key, name, score, ang
-                        bestDY = wrapPi(math.atan2(u.X, u.Z) - curYaw)
-                        bestDP = math.asin(math.clamp(u.Y, -1, 1)) - curPitch
+        if AB.Enabled and AB.ShowFov and vs then
+            fovRing.Position = Vector2.new(vs.X / 2, vs.Y / 2)
+            fovRing.Radius = AB.FovPx
+            fovRing.Color = AB.Locked and Color3.fromRGB(235, 80, 80)
+                                       or Color3.fromRGB(165, 170, 180)
+            fovRing.Visible = true
+        else
+            fovRing.Visible = false
+        end
+
+        if AB.Enabled and keyHeld() and okcf and cf then
+            local cp, look = cf.Position, cf.LookVector
+            local curYaw   = math.atan2(look.X, look.Z)
+            local curPitch = math.asin(math.clamp(look.Y, -1, 1))
+            local now       = tick()
+            local maxStuds  = AB.DistM * ABDIV
+            local fallStuds = AB.FalloffM * ABDIV
+
+            local bestKey, bestName, bestScore, bestDY, bestDP, bestAng
+
+            local function consider(key, name, model)
+                local part = abPart(model)
+                if not part or not abAlive(model) then return end
+                local okp, tpos = pcall(function() return part.Position end)
+                if not okp or not tpos then return end
+                local raw = (tpos - cp).Magnitude
+                if raw <= 0 or raw > maxStuds then return end
+                local lead = AB.PredMs / 1000
+                if fallStuds > 0 and raw < fallStuds then
+                    lead = lead * (raw / fallStuds)
+                end
+                local aimPos = tpos
+                if lead > 0 then aimPos = tpos + velOf(key, tpos, now) * lead end
+                local d = aimPos - cp
+                local mag = d.Magnitude
+                if mag <= 0 then return end
+                local u = d * (1 / mag)
+                local ang = math.acos(math.clamp(look:Dot(u), -1, 1))
+                local gate = (AB.Locked == key) and stickyAng or gateAng
+                if ang > gate then return end
+                local score = (AB.Locked == key) and ang * 0.5 or ang
+                if not bestScore or score < bestScore then
+                    bestKey, bestName, bestScore, bestAng = key, name, score, ang
+                    bestDY = wrapPi(math.atan2(u.X, u.Z) - curYaw)
+                    bestDP = math.asin(math.clamp(u.Y, -1, 1)) - curPitch
+                end
+            end
+
+            local lp = abPlayers.LocalPlayer
+            local lpId = lp and lp.UserId
+            for _, pl in ipairs(abPlayers:GetPlayers()) do
+                if pl.UserId ~= lpId then
+                    local okc, char = pcall(function() return pl.Character end)
+                    if okc and char then consider("p" .. pl.UserId, pl.Name, char) end
+                end
+            end
+            if AB.Zombies then
+                local zf = workspace:FindFirstChild("Zombies")
+                if zf then
+                    for i, m in ipairs(zf:GetChildren()) do
+                        consider("z" .. i .. m.Name, m.Name, m)
                     end
                 end
+            end
 
-                local lp = abPlayers.LocalPlayer
-                local lpId = lp and lp.UserId
-                for _, pl in ipairs(abPlayers:GetPlayers()) do
-                    if pl.UserId ~= lpId then
-                        local okc, char = pcall(function() return pl.Character end)
-                        if okc and char then
-                            consider("p" .. pl.UserId, pl.Name, char)
-                        end
-                    end
+            if bestKey then
+                AB.Locked = bestKey
+                local smooth = math.max(1, AB.Smooth)
+                local dxc = (-bestDY / RAD_PER_COUNT) * AB.Sens / smooth
+                local dyc = (-bestDP / RAD_PER_COUNT) * AB.Sens / smooth
+                if dxc >  MAX_STEP then dxc =  MAX_STEP end
+                if dxc < -MAX_STEP then dxc = -MAX_STEP end
+                if dyc >  MAX_STEP then dyc =  MAX_STEP end
+                if dyc < -MAX_STEP then dyc = -MAX_STEP end
+                if math.abs(bestDY) > 0.0004 or math.abs(bestDP) > 0.0004 then
+                    moveMouse(dxc, dyc)
                 end
-
-                -- TEMPORARY test targets. Keyed by index+name because Matcha's
-                -- instance identity is not stable enough to key on.
-                if AB.Zombies then
-                    local zf = workspace:FindFirstChild("Zombies")
-                    if zf then
-                        for i, m in ipairs(zf:GetChildren()) do
-                            consider("z" .. i .. m.Name, m.Name, m)
-                        end
-                    end
-                end
-
-                if bestKey then
-                    AB.Locked = bestKey
-                    local smooth = math.max(1, AB.Smooth)
-                    local dxc = (-bestDY / RAD_PER_COUNT) * AB.Sens / smooth
-                    local dyc = (-bestDP / RAD_PER_COUNT) * AB.Sens / smooth
-                    if dxc >  MAX_STEP then dxc =  MAX_STEP end
-                    if dxc < -MAX_STEP then dxc = -MAX_STEP end
-                    if dyc >  MAX_STEP then dyc =  MAX_STEP end
-                    if dyc < -MAX_STEP then dyc = -MAX_STEP end
-                    if math.abs(bestDY) > 0.0004 or math.abs(bestDP) > 0.0004 then
-                        moveMouse(dxc, dyc)
-                    end
-                    AB.Status = string.format("%s  %.1f deg",
-                        string.sub(bestName, 1, 22), math.deg(bestAng))
-                else
-                    AB.Locked, AB.Status = nil, "no target in FOV"
-                end
+                AB.Status = string.format("%s  %.0fpx",
+                    string.sub(bestName, 1, 22), math.tan(bestAng) * ((vs.Y/2) / math.tan(math.rad(cam.FieldOfView)/2)))
+            else
+                AB.Locked, AB.Status = nil, "nothing in circle"
             end
         else
             AB.Locked, AB.Status = nil, nil
@@ -1258,6 +1277,7 @@ task.spawn(function()
         end
         task.wait()
     end
+    pcall(function() fovRing:Remove() end)
 end)
 
 -- ---- UI ----
@@ -1267,7 +1287,8 @@ aimKeyHandle = aimSec:Keybind("Aim Key (hold)", "e", function(k) AB.Key = k end)
 aimSec:Dropdown("Aim Type", "Mouse", {"Mouse"}, false, function() end,
     "Camera.CFrame writes are silently discarded by Matcha; mouse is the only method that lands.")
 aimSec:Dropdown("Hit Part", "Head", {"Head", "Torso"}, false, function(v) AB.Part = v end)
-aimSec:Slider("FOV", 8, 0.5, 1, 90, " deg", function(v) AB.FovDeg = v end)
+aimSec:Slider("FOV", 150, 5, 10, 600, " px", function(v) AB.FovPx = v end)
+aimSec:Toggle("Show FOV Circle", true, function(v) AB.ShowFov = v end)
 aimSec:Slider("Distance", 300, 5, 10, 1000, " m", function(v) AB.DistM = v end)
 aimSec:Slider("Smoothness", 3, 0.5, 1, 20, "", function(v) AB.Smooth = v end)
 aimSec:Slider("Sensitivity", 1.0, 0.05, 0.1, 3, "x", function(v) AB.Sens = v end)
