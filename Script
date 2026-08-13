@@ -1282,27 +1282,6 @@ task.spawn(function()
     end
 end)
 
--- ---- UI ----
-local aimSec = combattab:Section("Aimbot", "Full")
-aimSec:Toggle("Enable Aimbot", false, function(v) AB.Enabled = v end)
-aimKeyHandle = aimSec:Keybind("Aim Key (hold)", "e", function(k) AB.Key = k end)
-aimSec:Dropdown("Aim Type", "Mouse", {"Mouse"}, false, function() end,
-    "Camera.CFrame writes are silently discarded by Matcha; mouse is the only method that lands.")
-aimSec:Dropdown("Hit Part", "Head", {"Head", "Torso"}, false, function(v) AB.Part = v end)
-aimSec:Slider("FOV", 8, 0.5, 1, 90, " deg", function(v) AB.FovDeg = v end)
-aimSec:Slider("Distance", 300, 5, 10, 1000, " m", function(v) AB.DistM = v end)
-aimSec:Slider("Smoothness", 3, 0.5, 1, 20, "", function(v) AB.Smooth = v end)
-aimSec:Slider("Sensitivity", 1.0, 0.05, 0.1, 3, "x", function(v) AB.Sens = v end)
-aimSec:Slider("Prediction", 0, 5, 0, 300, " ms", function(v) AB.PredMs = v end)
-aimSec:Slider("Prediction Falloff", 15, 1, 0, 60, " m", function(v) AB.FalloffM = v end)
-local aimStat = aimSec:Label("idle")
-task.spawn(function()
-    while _G.AR2HUB_GEN == GEN do
-        pcall(function() aimStat:SetText(AB.Status or (AB.Enabled and "armed" or "off")) end)
-        task.wait(0.15)
-    end
-end)
-
 -- ---------------- panel: boxes created and destroyed with players ----------------
 -- playertab._tab.sections is the array the lib's layout pass iterates.
 -- Splicing an entry out of it removes the box; appending adds one at runtime.
