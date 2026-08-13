@@ -1621,6 +1621,147 @@ task.spawn(function()
     end
 end)
 
+
+-- ==================== Vehicle ESP (Visuals > Vehicles) ====================
+-- Vehicles replicate map-wide, same as zombies and players, so nothing streams
+-- out and the list is complete. Every vehicle has a PrimaryPart, so the anchor
+-- is a property read (0.05 ms) and no FindFirstChild is ever needed - measured
+-- 1.84 ms for a full 39-vehicle cache rebuild and 1.78 ms for a render pass.
+_G.VEHESP = _G.VEHESP or {}
+local VE = _G.VEHESP
+VE.Enabled = false
+VE.MaxM    = VE.MaxM or 1000
+VE.Types   = VE.Types or {}     -- name -> false to hide that type
+VE.Cache   = {}                 -- { {part=, name=} }
+
+local VEH_POOL  = 64
+local VEH_COL   = C(120, 190, 255)
+local VEH_BUILD = 1.0           -- cache rebuild interval, seconds
+
+-- Grouped the way the event ESP is, because a flat list of 29 is unreadable.
+local VEH_GROUPS = {
+    { name = "Civilian", side = "Left", list = {
+        "Caprice", "Mustang", "Corvette", "Sedan", "Station Wagon",
+        "Chevy Suburban", "Pickup Truck", "Quad", "Tractor",
+    }},
+    { name = "Utility", side = "Right", list = {
+        "Delivery Van", "Cargo Van", "StepVan", "Box Truck", "Semi Truck",
+        "Utility Truck",
+    }},
+    { name = "Law & Rescue", side = "Left", list = {
+        "Police Car", "Police CUV", "Ambulance", "Armored Truck",
+    }},
+    { name = "Military", side = "Right", list = {
+        "Humvee", "Military Pickup", "Barracks Truck NoCover",
+    }},
+    { name = "Boats", side = "Left", list = {
+        "Aluminum Boat", "Rubber Dinghy", "Speed Boat", "Patrol Boat",
+        "Swing Keel Boat", "Fishing Boat", "Lifeboat",
+    }},
+}
+
+local vehtab  = vis:Sub("Vehicles", "compass")
+local vehSec  = vehtab:Section("Vehicle ESP", "Full")
+vehSec:Toggle("Vehicle ESP", false, function(v) VE.Enabled = v end)
+vehSec:Slider("Distance", 1000, 50, 0, 10000, " m", function(v) VE.MaxM = v end,
+    "Hide vehicles further away than this. Vehicles replicate map-wide, so raising it really does show the whole map.")
+
+for _, g in ipairs(VEH_GROUPS) do
+    local sec = vehtab:Section(g.name, g.side)
+    for _, nm in ipairs(g.list) do
+        if VE.Types[nm] == nil then VE.Types[nm] = true end
+        sec:Toggle(nm, VE.Types[nm] ~= false, function(v) VE.Types[nm] = v end)
+    end
+end
+-- Anything spawned that is not in the seeded lists gets a toggle at runtime, so
+-- a vehicle type I have not seen can never be silently invisible.
+local vehOther = vehtab:Section("Other", "Right")
+local vehOtherSeen = false
+
+local function vehRebuild(discovered)
+    local vf = workspace:FindFirstChild("Vehicles")
+    local out = {}
+    if vf then
+        for _, v in ipairs(vf:GetChildren()) do
+            local nm = v.Name
+            if VE.Types[nm] == nil then
+                VE.Types[nm] = true
+                discovered[#discovered + 1] = nm
+            end
+            local ok, pp = pcall(function() return v.PrimaryPart end)
+            if ok and pp then out[#out + 1] = { part = pp, name = nm } end
+        end
+    end
+    VE.Cache = out
+end
+
+task.spawn(function()
+    local pool = {}
+    for i = 1, VEH_POOL do
+        local dot = Drawing.new("Circle")
+        dot.Filled = true; dot.NumSides = 10; dot.Radius = 3; dot.Visible = false
+        local txt = Drawing.new("Text")
+        txt.Size = 13; txt.Center = true; txt.Outline = true; txt.Visible = false
+        pool[i] = { dot = dot, txt = txt }
+    end
+    local function hide(e) e.dot.Visible = false; e.txt.Visible = false end
+
+    local lastBuild = 0
+    while _G.AR2HUB_GEN == GEN do
+        local n = 0
+        if VE.Enabled then
+            local now = tick()
+            if (now - lastBuild) >= VEH_BUILD then
+                lastBuild = now
+                local discovered = {}
+                vehRebuild(discovered)
+                for _, nm in ipairs(discovered) do
+                    if not vehOtherSeen then vehOtherSeen = true end
+                    pcall(function()
+                        vehOther:Toggle(nm, true, function(v) VE.Types[nm] = v end)
+                    end)
+                    print("[vehicle esp] new type discovered: " .. nm)
+                end
+            end
+
+            local cp = camPos()
+            if cp then
+                local maxStuds = VE.MaxM * E.DistanceDivisor
+                local list = VE.Cache
+                for i = 1, #list do
+                    if n >= VEH_POOL then break end
+                    local e = list[i]
+                    if VE.Types[e.name] ~= false then
+                        local ok, pos = pcall(function() return e.part.Position end)
+                        if ok and pos then
+                            local d = (pos - cp).Magnitude
+                            if d <= maxStuds then
+                                local pt, visible = toScreen(pos + Vector3.new(0, 3, 0))
+                                if visible then
+                                    n = n + 1
+                                    local o = pool[n]
+                                    o.dot.Position = pt
+                                    o.dot.Color = VEH_COL
+                                    o.dot.Visible = true
+                                    o.txt.Text = e.name .. "  " .. metres(d) .. E.DistanceUnit
+                                    o.txt.Position = Vector2.new(pt.X, pt.Y - 15)
+                                    o.txt.Color = VEH_COL
+                                    o.txt.Visible = true
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+        for i = n + 1, VEH_POOL do hide(pool[i]) end
+        task.wait(0.05)
+    end
+    for i = 1, VEH_POOL do
+        pcall(function() pool[i].dot:Remove() end)
+        pcall(function() pool[i].txt:Remove() end)
+    end
+end)
 -- ==================== Settings tab ====================
 -- INS-ui ships its own Settings tab. Enabling it gives Theme, Appearance,
 -- Interface (which already contains the "Menu key" bind that opens/closes this
