@@ -860,7 +860,16 @@ _G.PlayerVis = {
     },
 }
 local PV = _G.PlayerVis
-local Players = game:GetService("Players")
+-- Matcha's Players handle is nil when it goes stale, and it can already be nil
+-- at load time. Capturing the service into a local bakes that nil in for the
+-- whole session, which is what made line ~1535 throw "attempt to index nil with
+-- 'LocalPlayer'". Resolve it fresh at each use and skip the tick when absent -
+-- the watchdog at the top of this file reports when it comes back.
+local function svcPlayers()
+    local ok, p = pcall(function() return game:GetService("Players") end)
+    if ok and p then return p end
+    return nil
+end
 
 local PV_PART = {Part=true, MeshPart=true, UnionOperation=true, WedgePart=true, TrussPart=true, CornerWedgePart=true}
 local function pvAnchor(o, d)
@@ -1136,7 +1145,7 @@ local SELECT_EVERY  = 0.10
 local TICK          = 1/1000
 
 local aimKeyHandle
-local abPlayers = game:GetService("Players")
+-- no captured Players handle here either: svcPlayers() resolves it per use
 
 local VK = { m1=0x01, m2=0x02, shift=0x10, ctrl=0x11, alt=0x12, space=0x20,
              tab=0x09, capslock=0x14 }
@@ -1244,13 +1253,16 @@ local function abBuildStep(now)
         if (now - abBuiltAt) < REBUILD_EVERY and abPartMode == AB.Part then return end
         abPartMode = AB.Part
         local q = {}
-        local lp = abPlayers.LocalPlayer
-        local lpId = lp and lp.UserId
-        for _, pl in ipairs(abPlayers:GetPlayers()) do
-            if pl.UserId ~= lpId then
-                local okc, char = pcall(function() return pl.Character end)
-                if okc and char then
-                    q[#q + 1] = { key = "p" .. pl.UserId, name = pl.Name, model = char, player = true }
+        local P = svcPlayers()
+        if P then
+            local lp = P.LocalPlayer
+            local lpId = lp and lp.UserId
+            for _, pl in ipairs(P:GetPlayers()) do
+                if pl.UserId ~= lpId then
+                    local okc, char = pcall(function() return pl.Character end)
+                    if okc and char then
+                        q[#q + 1] = { key = "p" .. pl.UserId, name = pl.Name, model = char, player = true }
+                    end
                 end
             end
         end
@@ -1532,6 +1544,11 @@ end
 task.spawn(function()
     while PV.Running and _G.AR2HUB_GEN == GEN do
         local cpos = pvCamPos()
+        local Players = svcPlayers()
+        if not Players then
+            task.wait(1)          -- handle is stale; wait for it rather than throw
+            continue
+        end
         local lp = Players.LocalPlayer
         local lpId = lp and lp.UserId
 
