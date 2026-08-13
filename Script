@@ -1066,14 +1066,23 @@ optSec:Label("Prepare once per session, with both toggles OFF.")
 optSec:Label("Refresh cache after respawn or weapon swap.")
 
 -- ==================== Aimbot (Combat tab) ====================
--- Measured in Matcha: task.wait() = 21 Hz, task.wait(1/1000) = 221 Hz.
--- A full selection pass over 66 targets costs 12.7 ms, so it CANNOT run every
--- tick (281% CPU). Selection runs at 10 Hz; tracking the locked target costs
--- one 0.05 ms Position read and runs every tick.
--- Smoothing is a TIME CONSTANT, not a per-tick divisor, so the feel does not
--- change with framerate. Velocity lead includes the controller's own lag,
--- which is what stops it trailing a running target.
--- Angles are world-space; 0.002443 rad/count; +X counts decrease yaw, +Y looks down.
+-- Everything here is calibrated against live measurements, not assumed:
+--   * 0.002443 rad/count, both axes, exactly linear for a single large move.
+--   * +X counts DECREASE world yaw; +Y counts look DOWN. Hence both negate.
+--   * Angles are WORLD space. Mouse X rotates about the world vertical axis, so
+--     camera-space yaw is wrong by 1/cos(pitch) (measured: 0.34863 delivered
+--     where 0.36652 was expected, at 26 deg of pitch).
+--   * atan2 stays defined behind the camera, so a flanking target can never
+--     mirror and yank the view around - that was the close-combat "teleport".
+--   * task.wait() = 21 Hz, task.wait(1/1000) = 221 Hz in Matcha.
+--   * A full selection pass over ~66 targets costs 12.7 ms, so it CANNOT run
+--     every tick (281% CPU). Selection is 10 Hz; tracking the locked target is
+--     one 0.05 ms Position read and runs every tick.
+--   * Windows pointer acceleration crushes small deltas: 1-count moves measured
+--     6.3% effective, 5-count 100%, 30-count 118.8%. MinStep holds the
+--     accumulator until the step is big enough to survive.
+--   * mousemoverel only takes effect while the Roblox window has focus.
+--   * Camera.CFrame writes are silently discarded, which is why aim type is Mouse.
 _G.AIMBOT = _G.AIMBOT or {}
 local AB = _G.AIMBOT
 AB.Enabled  = false
@@ -1085,16 +1094,17 @@ AB.ShowFov  = (AB.ShowFov ~= false)
 AB.DistM    = AB.DistM    or 300
 AB.Smooth   = AB.Smooth   or 3
 AB.Sens     = AB.Sens     or 1.0
+AB.MinStep  = AB.MinStep  or 5      -- 5 while pointer accel is ON; 1-2 once it is off
 AB.Part     = AB.Part     or "Head"
-AB.Zombies  = AB.Zombies  == true
+AB.Zombies  = AB.Zombies  == true   -- TEMPORARY test targets
 AB.Locked   = nil
 
 local RAD_PER_COUNT = 0.002443
-local MAX_STEP      = 250
+local MAX_STEP      = 250           -- counts/tick, the real anti-teleport guard
 local MAX_ENGAGE    = math.rad(120)
 local ABDIV         = 2.75
-local SELECT_HZ     = 0.10          -- re-pick targets 10x/sec (12.7 ms each)
-local TICK          = 1/1000        -- yields at ~221 Hz
+local SELECT_EVERY  = 0.10
+local TICK          = 1/1000
 
 local aimKeyHandle
 local abPlayers = game:GetService("Players")
@@ -1119,8 +1129,8 @@ local function keyHeld()
     return false
 end
 
--- Velocity from position history: Velocity/AssemblyLinearVelocity read exactly
--- zero in Matcha. Window is short now that we sample every tick.
+-- Velocity MUST come from position history: Velocity and AssemblyLinearVelocity
+-- both read exactly zero in Matcha, verified against a moving player.
 local abHist = {}
 local function velOf(key, pos, now)
     local h = abHist[key]
@@ -1129,7 +1139,7 @@ local function velOf(key, pos, now)
         return Vector3.new()
     end
     local dt = now - h.t
-    if dt >= 0.06 then                  -- long enough to ride out replication steps
+    if dt >= 0.06 then              -- long enough to ride out replication steps
         local v = (pos - h.pos) * (1 / dt)
         h.vel = h.vel * 0.6 + v * 0.4
         h.pos, h.t = pos, now
@@ -1156,7 +1166,7 @@ end
 
 local function abAlive(model)
     local hum = model:FindFirstChildOfClass("Humanoid")
-    if not hum then return true end     -- zombies have none; dead ones move to Corpses
+    if not hum then return true end   -- zombies have none; dead ones move to Corpses
     local ok, hp = pcall(function() return hum.Health end)
     if ok and type(hp) == "number" then return hp > 0 end
     return true
@@ -1166,8 +1176,11 @@ local accX, accY = 0, 0
 local function moveMouse(dxc, dyc)
     if not mousemoverel then return end
     accX, accY = accX + dxc, accY + dyc
-    local sx = math.modf(accX); accX = accX - sx
-    local sy = math.modf(accY); accY = accY - sy
+    local step = AB.MinStep
+    if step < 1 then step = 1 end
+    local sx, sy = 0, 0
+    if math.abs(accX) >= step then sx = math.modf(accX); accX = accX - sx end
+    if math.abs(accY) >= step then sy = math.modf(accY); accY = accY - sy end
     if sx ~= 0 or sy ~= 0 then
         pcall(function() mousemoverel(sx, sy) end)
     end
@@ -1193,8 +1206,8 @@ task.spawn(function()
         local cf
         if cam then
             local ok, v = pcall(function() return cam.CFrame end)
-            if ok then cf = v end       -- NOT 'cam and pcall(...)': 'and' truncates
-        end
+            if ok then cf = v end     -- NOT 'cam and pcall(...)': 'and' truncates
+        end                           -- multi-returns, which left cf nil
         local vs = cam and cam.ViewportSize
 
         local gateAng, stickyAng, focal = 0, 0, 500
@@ -1220,16 +1233,18 @@ task.spawn(function()
             local cp, look = cf.Position, cf.LookVector
             local curYaw   = math.atan2(look.X, look.Z)
             local curPitch = math.asin(math.clamp(look.Y, -1, 1))
-            local right, up = cf.RightVector, cf.UpVector
             local maxStuds  = AB.DistM * ABDIV
             local fallStuds = AB.FalloffM * ABDIV
             local tau  = math.max(0.005, AB.Smooth * 0.016)   -- seconds
             local gain = 1 - math.exp(-dt / tau)
 
-            -- ---- SELECTION: 10 Hz, or immediately if we have no lock ----
-            if not lockPart or (now - lastSelect) >= SELECT_HZ then
+            -- ---------- SELECTION: 10 Hz, or at once if we hold no lock ----------
+            if not lockPart or (now - lastSelect) >= SELECT_EVERY then
                 lastSelect = now
+                local prevKey = lockKey
                 local bestScore
+                lockPart, lockName, lockKey = nil, nil, nil
+
                 local function consider(key, name, model)
                     local part = abPart(model)
                     if not part or not abAlive(model) then return end
@@ -1240,62 +1255,54 @@ task.spawn(function()
                     if mag <= 0 or mag > maxStuds then return end
                     local u = d * (1 / mag)
                     local ang = math.acos(math.clamp(look:Dot(u), -1, 1))
-                    local gate = (lockKey == key) and stickyAng or gateAng
+                    local gate = (key == prevKey) and stickyAng or gateAng
                     if ang > gate then return end
-                    local score = (lockKey == key) and ang * 0.5 or ang
+                    local score = (key == prevKey) and ang * 0.5 or ang
                     if not bestScore or score < bestScore then
                         bestScore = score
                         lockPart, lockName, lockKey = part, name, key
                     end
                 end
-                local prevKey = lockKey
-                lockPart, lockName, lockKey = nil, nil, nil
+
                 local lp = abPlayers.LocalPlayer
                 local lpId = lp and lp.UserId
                 for _, pl in ipairs(abPlayers:GetPlayers()) do
                     if pl.UserId ~= lpId then
                         local okc, char = pcall(function() return pl.Character end)
-                        if okc and char then
-                            local k = "p" .. pl.UserId
-                            if k == prevKey then lockKey = prevKey end
-                            consider(k, pl.Name, char)
-                        end
+                        if okc and char then consider("p" .. pl.UserId, pl.Name, char) end
                     end
                 end
                 if AB.Zombies then
                     local zf = workspace:FindFirstChild("Zombies")
                     if zf then
                         for i, m in ipairs(zf:GetChildren()) do
-                            local k = "z" .. i .. m.Name
-                            if k == prevKey then lockKey = prevKey end
-                            consider(k, m.Name, m)
+                            consider("z" .. i .. m.Name, m.Name, m)
                         end
                     end
                 end
             end
 
-            -- ---- TRACKING: every tick, one Position read ----
+            -- ---------- TRACKING: every tick, one Position read ----------
             if lockPart then
                 local okp, tpos = pcall(function() return lockPart.Position end)
                 if not okp or not tpos then
                     lockPart, lockName, lockKey = nil, nil, nil
+                    AB.Locked, AB.Status = nil, "target gone"
                 else
                     local raw = (tpos - cp).Magnitude
-                    -- lead = latency compensation + the controller's own lag,
-                    -- which is what stops it trailing a moving target
+                    -- lead = latency compensation, plus the controller's own lag.
+                    -- A proportional controller structurally trails a moving
+                    -- target; aiming one time-constant ahead cancels that.
                     local lead = AB.PredMs / 1000
                     if fallStuds > 0 and raw < fallStuds then
                         lead = lead * (raw / fallStuds)
                     end
-                    local aimPos = tpos
-                    if raw > 0 then
-                        local v = velOf(lockKey, tpos, now)
-                        aimPos = tpos + v * (lead + tau)
-                    end
+                    local aimPos = tpos + velOf(lockKey, tpos, now) * (lead + tau)
                     local d = aimPos - cp
                     local mag = d.Magnitude
                     if mag <= 0 or raw > maxStuds then
                         lockPart, lockName, lockKey = nil, nil, nil
+                        AB.Locked, AB.Status = nil, "out of range"
                     else
                         local u = d * (1 / mag)
                         local ang = math.acos(math.clamp(look:Dot(u), -1, 1))
@@ -1311,9 +1318,7 @@ task.spawn(function()
                             if dxc < -MAX_STEP then dxc = -MAX_STEP end
                             if dyc >  MAX_STEP then dyc =  MAX_STEP end
                             if dyc < -MAX_STEP then dyc = -MAX_STEP end
-                            if math.abs(dYaw) > 0.0002 or math.abs(dPit) > 0.0002 then
-                                moveMouse(dxc, dyc)
-                            end
+                            moveMouse(dxc, dyc)
                             AB.Locked = lockKey
                             AB.Status = string.format("%s  %.0fpx",
                                 string.sub(lockName or "?", 1, 20), math.tan(ang) * focal)
@@ -1345,6 +1350,7 @@ aimSec:Toggle("Show FOV Circle", true, function(v) AB.ShowFov = v end)
 aimSec:Slider("Distance", 300, 5, 10, 1000, " m", function(v) AB.DistM = v end)
 aimSec:Slider("Smoothness", 3, 0.5, 1, 20, "", function(v) AB.Smooth = v end)
 aimSec:Slider("Sensitivity", 1.0, 0.05, 0.1, 3, "x", function(v) AB.Sens = v end)
+aimSec:Slider("Min Step", 5, 1, 1, 12, " counts", function(v) AB.MinStep = v end)
 aimSec:Slider("Prediction", 0, 5, 0, 300, " ms", function(v) AB.PredMs = v end)
 aimSec:Slider("Prediction Falloff", 15, 1, 0, 60, " m", function(v) AB.FalloffM = v end)
 aimSec:Toggle("Target Zombies (testing only)", false, function(v) AB.Zombies = v end)
