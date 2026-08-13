@@ -1629,8 +1629,9 @@ end)
 -- 1.84 ms for a full 39-vehicle cache rebuild and 1.78 ms for a render pass.
 _G.VEHESP = _G.VEHESP or {}
 local VE = _G.VEHESP
-VE.Enabled = false
-VE.MaxM    = VE.MaxM or 1000
+VE.Enabled   = false
+VE.MaxM      = VE.MaxM or 1000
+VE.ShowParts = VE.ShowParts == true
 VE.Types   = VE.Types or {}     -- name -> false to hide that type
 VE.Cache   = {}                 -- { {part=, name=} }
 
@@ -1659,10 +1660,10 @@ local VEH_GROUPS = {
         "Utility Truck",
     }},
     { name = "Law & Rescue", side = "Left", list = {
-        "Police Car", "Police CUV", "Ambulance", "Armored Truck",
+        "Police Car", "Police CUV", "Ambulance", "Firetruck", "Armored Truck",
     }},
     { name = "Military", side = "Right", list = {
-        "Humvee", "Military Pickup", "Barracks Truck NoCover",
+        "Humvee", "Jeep", "Military Pickup", "Barracks Truck NoCover",
     }},
     { name = "Boats", side = "Left", list = {
         "Aluminum Boat", "Rubber Dinghy", "Speed Boat", "Patrol Boat",
@@ -1675,6 +1676,8 @@ local vehSec  = vehtab:Section("Vehicle ESP", "Full")
 vehSec:Toggle("Vehicle ESP", false, function(v) VE.Enabled = v end)
 vehSec:Slider("Distance", 1000, 50, 0, 10000, " m", function(v) VE.MaxM = v end,
     "Hide vehicles further away than this. Vehicles replicate map-wide, so raising it really does show the whole map.")
+vehSec:Toggle("Show Parts On ESP", false, function(v) VE.ShowParts = v end,
+    "Adds a compact third line per vehicle: E=engine B=body T=fuel tank F=fuel G=glass. Off by default because it is a lot of text with many vehicles on screen.")
 
 for _, g in ipairs(VEH_GROUPS) do
     local sec = vehtab:Section(g.name, g.side)
@@ -1722,7 +1725,18 @@ end
 -- every wheel, so y is already the 0-1 ratio we want. Resolving the hitboxes
 -- costs 0.72 ms per vehicle and each GetAttribute costs 0.12 ms, so both the
 -- lookup and the reads are done a couple of vehicles per tick, never in bulk.
-local function vehResolveWheels(e)
+-- Component parts live under Interaction and use the same Health attribute,
+-- except Glass which uses Fixed/Total. The set is consistent fleet-wide: Body
+-- and FuelTank on all 42, Engine and Refuel on 41, Glass on 37 (boats and
+-- quads have no glass). Refs are resolved once, in the same staggered pass.
+local VEH_COMPS = {
+    { key = "body",   part = "Repair Body" },
+    { key = "engine", part = "Repair Engine" },
+    { key = "tank",   part = "Repair FuelTank" },
+    { key = "fuel",   part = "Refuel" },
+}
+
+local function vehResolve(e)
     local list = {}
     local w = e.model and e.model:FindFirstChild("Wheels")
     if w then
@@ -1733,6 +1747,22 @@ local function vehResolveWheels(e)
         e.count = #w:GetChildren()
     end
     e.wheels = list          -- empty table still counts as resolved
+
+    -- one GetChildren pass, matching by name, instead of 5 FindFirstChild calls
+    local refs = {}
+    local it = e.model and e.model:FindFirstChild("Interaction")
+    if it then
+        for _, c in ipairs(it:GetChildren()) do
+            local nm = c.Name
+            if nm == "Repair Body" then refs.body = c
+            elseif nm == "Repair Engine" then refs.engine = c
+            elseif nm == "Repair FuelTank" then refs.tank = c
+            elseif nm == "Refuel" then refs.fuel = c
+            elseif nm == "Repair Glass" then refs.glass = c end
+        end
+    end
+    e.refs = refs
+    e.parts = e.parts or {}
 end
 
 -- Averaged over the wheels that actually report, NOT over the wheel count.
@@ -1752,6 +1782,26 @@ local function vehReadCondition(e)
     end
     e.read = read
     e.frac = (read > 0) and (sum / read) or nil   -- nil = unknown, drawn gray
+
+    -- component parts, same cadence. Wheels alone drive the COLOUR, because
+    -- wheel condition is what governs whether the thing is drivable; these are
+    -- reported for information only.
+    local refs, parts = e.refs, e.parts
+    if refs and parts then
+        for _, c in ipairs(VEH_COMPS) do
+            local ref = refs[c.key]
+            if ref then
+                local ok, h = pcall(function() return ref:GetAttribute("Health") end)
+                parts[c.key] = (ok and type(h) == "table" and type(h.y) == "number") and h.y or nil
+            end
+        end
+        if refs.glass then
+            local okf, fx = pcall(function() return refs.glass:GetAttribute("Fixed") end)
+            local okt, tt = pcall(function() return refs.glass:GetAttribute("Total") end)
+            parts.glassFixed = (okf and type(fx) == "number") and fx or nil
+            parts.glassTotal = (okt and type(tt) == "number") and tt or nil
+        end
+    end
 end
 
 local function vehColour(e)
@@ -1781,11 +1831,15 @@ task.spawn(function()
         local sub = Drawing.new("Text")
         sub.Size = STYLE.SubSize; sub.Center = true; sub.Outline = true
         sub.Visible = false
-        pool[i] = { ring = ring, core = core, name = name, sub = sub }
+        local parts = Drawing.new("Text")
+        parts.Size = STYLE.SubSize; parts.Center = true; parts.Outline = true
+        parts.Visible = false
+        pool[i] = { ring = ring, core = core, name = name, sub = sub, parts = parts }
     end
     local function hide(o)
         o.ring.Visible = false; o.core.Visible = false
         o.name.Visible = false; o.sub.Visible = false
+        o.parts.Visible = false
     end
 
     local lastBuild, cursor = 0, 1
@@ -1816,9 +1870,9 @@ task.spawn(function()
                 local e = list[cursor]
                 cursor = cursor + 1
                 done = done + 1
-                if e and not e.boat then
+                if e then
                     if not e.wheels then
-                        vehResolveWheels(e)
+                        vehResolve(e)
                     elseif (now - e.at) >= VEH_HEALTH then
                         e.at = now
                         vehReadCondition(e)
@@ -1874,6 +1928,30 @@ task.spawn(function()
                                     o.sub.Position = Vector2.new(pt.X, pt.Y - 16)
                                     o.sub.Color = col
                                     o.sub.Visible = true
+
+                                    -- optional third line: component condition,
+                                    -- compact so 40 vehicles on screen stay legible
+                                    if VE.ShowParts and e.parts then
+                                        local p = e.parts
+                                        local bits = {}
+                                        if p.engine then bits[#bits+1] = string.format("E%d", math.floor(p.engine*100+0.5)) end
+                                        if p.body   then bits[#bits+1] = string.format("B%d", math.floor(p.body*100+0.5)) end
+                                        if p.tank   then bits[#bits+1] = string.format("T%d", math.floor(p.tank*100+0.5)) end
+                                        if p.fuel   then bits[#bits+1] = string.format("F%d", math.floor(p.fuel*100+0.5)) end
+                                        if p.glassFixed and p.glassTotal and p.glassFixed < p.glassTotal then
+                                            bits[#bits+1] = string.format("G%d/%d", p.glassFixed, p.glassTotal)
+                                        end
+                                        if #bits > 0 then
+                                            o.parts.Text = table.concat(bits, " ")
+                                            o.parts.Position = Vector2.new(pt.X, pt.Y + 8)
+                                            o.parts.Color = STYLE.unknown
+                                            o.parts.Visible = true
+                                        else
+                                            o.parts.Visible = false
+                                        end
+                                    else
+                                        o.parts.Visible = false
+                                    end
                                 end
                             end
                         end
@@ -1889,6 +1967,76 @@ task.spawn(function()
         pcall(function() pool[i].core:Remove() end)
         pcall(function() pool[i].name:Remove() end)
         pcall(function() pool[i].sub:Remove() end)
+        pcall(function() pool[i].parts:Remove() end)
+    end
+end)
+
+-- ---------------- nearest vehicle readout ----------------
+-- Full component breakdown for one vehicle only, so the numbers are available
+-- without putting five figures over every vehicle on screen. Reading 5
+-- attributes for a single vehicle costs ~0.6 ms, so this reads live rather than
+-- relying on the staggered cache.
+local nearSec  = vehtab:Section("Nearest Vehicle", "Right")
+local nearName = nearSec:Label("-")
+local nearRows = {
+    wheels = nearSec:Label("Wheels:    -"),
+    engine = nearSec:Label("Engine:    -"),
+    body   = nearSec:Label("Body:      -"),
+    tank   = nearSec:Label("Fuel tank: -"),
+    fuel   = nearSec:Label("Fuel:      -"),
+    glass  = nearSec:Label("Glass:     -"),
+}
+
+local function pctText(f)
+    if type(f) ~= "number" then return "-" end
+    return string.format("%d%%", math.floor(f * 100 + 0.5))
+end
+
+task.spawn(function()
+    while _G.AR2HUB_GEN == GEN do
+        if VE.Enabled then
+            local cp = camPos()
+            local best, bd
+            if cp then
+                for _, e in ipairs(VE.Cache) do
+                    if VE.Types[e.name] ~= false then
+                        local ok, pos = pcall(function() return e.part.Position end)
+                        if ok and pos then
+                            local d = (pos - cp).Magnitude
+                            if not bd or d < bd then best, bd = e, d end
+                        end
+                    end
+                end
+            end
+            if best then
+                if not best.wheels then vehResolve(best) end
+                vehReadCondition(best)
+                local p = best.parts or {}
+                pcall(function()
+                    nearName:SetText(string.format("%s  -  %d%s", best.name,
+                        metres(bd), E.DistanceUnit))
+                    local wt = pctText(best.frac)
+                    if best.frac and best.read and best.count > 0 and best.read < best.count then
+                        wt = wt .. string.format("  (%d/%d wheels)", best.read, best.count)
+                    end
+                    nearRows.wheels:SetText("Wheels:    " .. (best.boat and "n/a (boat)" or wt))
+                    nearRows.engine:SetText("Engine:    " .. pctText(p.engine))
+                    nearRows.body:SetText("Body:      " .. pctText(p.body))
+                    nearRows.tank:SetText("Fuel tank: " .. pctText(p.tank))
+                    nearRows.fuel:SetText("Fuel:      " .. pctText(p.fuel))
+                    if p.glassFixed and p.glassTotal then
+                        nearRows.glass:SetText(string.format("Glass:     %d/%d%s",
+                            p.glassFixed, p.glassTotal,
+                            (p.glassFixed >= p.glassTotal) and "  repaired" or "  broken"))
+                    else
+                        nearRows.glass:SetText("Glass:     n/a")
+                    end
+                end)
+            else
+                pcall(function() nearName:SetText("nothing in range") end)
+            end
+        end
+        task.wait(0.5)
     end
 end)
 -- ==================== Settings tab ====================
