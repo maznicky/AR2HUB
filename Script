@@ -1175,7 +1175,11 @@ fovRing.Visible = false
 task.spawn(function()
     while _G.AR2HUB_GEN == GEN do
         local cam = workspace.CurrentCamera
-        local okcf, cf = cam and pcall(function() return cam.CFrame end)
+        local cf
+        if cam then
+            local ok, v = pcall(function() return cam.CFrame end)
+            if ok then cf = v end       -- NOT 'cam and pcall(...)': an 'and'
+        end                             -- truncates multi-returns, so cf was nil
         local vs = cam and cam.ViewportSize
 
         -- focal length, recomputed every tick because ADS changes FieldOfView
@@ -1199,7 +1203,7 @@ task.spawn(function()
             fovRing.Visible = false
         end
 
-        if AB.Enabled and keyHeld() and okcf and cf then
+        if AB.Enabled and keyHeld() and cf then
             local cp, look = cf.Position, cf.LookVector
             local curYaw   = math.atan2(look.X, look.Z)
             local curPitch = math.asin(math.clamp(look.Y, -1, 1))
