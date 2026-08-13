@@ -1670,18 +1670,35 @@ local VEH_GROUPS = {
     }},
 }
 
+-- Handles for every per-type toggle, so Toggle All can drive the widgets
+-- themselves rather than just the backing table. The lib's :Set() fires the
+-- toggle's callback, which is what keeps VE.Types in sync.
+local vehToggles = {}
+
 local vehtab  = vis:Sub("Vehicles", "compass")
 local vehSec  = vehtab:Section("Vehicle ESP", "Full")
 vehSec:Toggle("Vehicle ESP", false, function(v) VE.Enabled = v end)
 vehSec:Slider("Distance", 1000, 50, 0, 10000, " m", function(v) VE.MaxM = v end,
     "Hide vehicles further away than this. Vehicles replicate map-wide, so raising it really does show the whole map.")
 vehSec:Label("Toggle a type below to list its vehicles and part condition.")
+vehSec:Button("Toggle All Types", function()
+    local anyOn = false
+    for _, on in pairs(VE.Types) do
+        if on then anyOn = true break end
+    end
+    local target = not anyOn          -- anything on -> clear all; nothing on -> select all
+    for _, h in ipairs(vehToggles) do
+        pcall(function() h:Set(target) end)
+    end
+end, "Selects every vehicle type, or clears them all if any are currently on.")
+local vehCount = vehSec:Label("0 types selected")
 
 for _, g in ipairs(VEH_GROUPS) do
     local sec = vehtab:Section(g.name, g.side)
     for _, nm in ipairs(g.list) do
         if VE.Types[nm] == nil then VE.Types[nm] = false end
-        sec:Toggle(nm, VE.Types[nm] == true, function(v) VE.Types[nm] = v end)
+        vehToggles[#vehToggles + 1] =
+            sec:Toggle(nm, VE.Types[nm] == true, function(v) VE.Types[nm] = v end)
     end
 end
 -- Anything spawned that is not in the seeded lists gets a toggle at runtime, so
@@ -1876,7 +1893,8 @@ task.spawn(function()
                 for _, nm in ipairs(discovered) do
                     vehOtherSeen = true
                     pcall(function()
-                        vehOther:Toggle(nm, false, function(v) VE.Types[nm] = v end)
+                        vehToggles[#vehToggles + 1] =
+                            vehOther:Toggle(nm, false, function(v) VE.Types[nm] = v end)
                     end)
                     print("[vehicle esp] new type discovered: " .. nm)
                 end
@@ -1992,10 +2010,14 @@ task.spawn(function()
         if VE.Enabled then
             local cp = camPos()
             local shortlist = {}
-            local anyType = false
+            local anyType, onCount, allCount = false, 0, 0
             for _, on in pairs(VE.Types) do
-                if on then anyType = true break end
+                allCount = allCount + 1
+                if on then anyType = true; onCount = onCount + 1 end
             end
+            pcall(function()
+                vehCount:SetText(string.format("%d of %d types selected", onCount, allCount))
+            end)
             if cp and anyType then
                 local maxStuds = VE.MaxM * E.DistanceDivisor
                 for _, e in ipairs(VE.Cache) do
