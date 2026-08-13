@@ -1017,7 +1017,6 @@ local function prepare()
     end)
 end
 
--- zero a key group, or restore it
 -- Direct memory_write, NOT applygc. Measured: applygc caused ~100ms scheduler
 -- stalls every few seconds (loop throughput collapsing 680/s -> 10/s), which
 -- crippled the aimbot. Writing the cached addresses costs 1.6ms for 488 and
