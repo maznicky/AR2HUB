@@ -5,6 +5,26 @@
 -- Site Probe: F8, plus an automatic sweep every 60s.
 -- Everything starts DISABLED; nothing scans until toggled on.
 
+-- ---------------- re-run guard ----------------
+-- Loading this script a second time (which a loadstring URL makes easy) would
+-- otherwise stack a second copy of every task.spawn loop and a second UI window
+-- on top of the first. Bumping the generation makes every loop from the previous
+-- load exit on its next tick; the renderer removes its own Drawings as it goes.
+_G.AR2HUB_GEN = (_G.AR2HUB_GEN or 0) + 1
+local GEN = _G.AR2HUB_GEN
+if GEN > 1 then
+    print(string.format("[AR2 Hub] reload #%d - retiring previous instance", GEN))
+    if _G.AR2HUB_WIN then
+        for _, m in ipairs({"Destroy", "Unload", "Close", "Remove"}) do
+            pcall(function() _G.AR2HUB_WIN[m](_G.AR2HUB_WIN) end)
+        end
+        _G.AR2HUB_WIN = nil
+    end
+    -- never leave input trapped if the old window vanished mid-drag
+    if setrobloxinput then pcall(function() setrobloxinput(true) end) end
+    task.wait(0.2)   -- let the retiring loops notice before we respawn them
+end
+
 local Lib = loadstring(game:HttpGet("https://raw.githubusercontent.com/neaxusxgod-png/INS-ui/main/uilib.min.lua"))() or INSui
 
 -- ---------------- portability shims ----------------
@@ -45,7 +65,7 @@ end
 _G.UI_WATCHDOG = true
 task.spawn(function()
     local wasAlive = nil
-    while _G.UI_WATCHDOG do
+    while _G.UI_WATCHDOG and _G.AR2HUB_GEN == GEN do
         local ok, lp = pcall(function() return game:GetService("Players").LocalPlayer end)
         local alive = (ok and lp ~= nil)
         if wasAlive ~= nil and alive ~= wasAlive then
@@ -605,6 +625,7 @@ end)
 
 -- ---------------- UI ----------------
 local win = Lib:CreateWindow({ title = "AR2 Hub", size = Vector2.new(700, 640) })
+_G.AR2HUB_WIN = win   -- so the next load can retire this window
 
 Lib:Category("Visuals")
 local vis = win:Tab("Visuals", "monitor")
@@ -638,7 +659,7 @@ zombietab:Section("Options", "Right")
 
 -- one wrapping label per event: the lib re-flows text on width
 task.spawn(function()
-    while _G.ESP_RUNNING do
+    while _G.ESP_RUNNING and _G.AR2HUB_GEN == GEN do
         for cat, r in pairs(readouts) do
             if E.Enabled[cat] then
                 local amount, nearest, bestD = 0, nil, math.huge
@@ -770,7 +791,7 @@ end
 
 task.spawn(function()   -- manual trigger
     local held = false
-    while SP.Running do
+    while SP.Running and _G.AR2HUB_GEN == GEN do
         local down = iskeypressed and iskeypressed(SP.Key)
         if down and not held then _G.ProbeSites() end
         held = down
@@ -780,7 +801,7 @@ end)
 
 task.spawn(function()   -- automatic sweep
     local lastAuto, lastPos, stillSince = tick(), nil, tick()
-    while SP.Running do
+    while SP.Running and _G.AR2HUB_GEN == GEN do
         local root = myCharRoot()
         local p = root and root.Position
         if p and lastPos and (p - lastPos).Magnitude > 3 then stillSince = tick() end
@@ -922,6 +943,7 @@ end
 -- Recoil/spread live in Lua tables. Locating them costs a full heap scan
 -- (~30s, freezes the game). The third-party script pays that on EVERY toggle -
 -- that is the freeze/crash. We scan ONCE, cache, then apply in ~0ms.
+local __oldCombat = _G.COMBAT   -- carried across reloads, see below
 _G.COMBAT = {
     Prepared  = false,
     Scanning  = false,
@@ -939,6 +961,17 @@ _G.COMBAT = {
         "ShiftRoll","RollRightBias","RollLeftBias",
     },
 }
+-- Keep the getgc cache from the previous load. The key lists above are taken
+-- fresh (so edits to them apply), but re-scanning the heap costs a ~30s freeze,
+-- and the addresses stay valid for the whole session - they do not move on
+-- respawn or weapon swap.
+if __oldCombat and __oldCombat.Prepared and __oldCombat.Cache then
+    _G.COMBAT.Cache     = __oldCombat.Cache
+    _G.COMBAT.Originals = __oldCombat.Originals or {}
+    _G.COMBAT.Prepared  = true
+    print("[AR2 Hub] reusing prepared combat cache - no rescan needed")
+end
+__oldCombat = nil
 local CB = _G.COMBAT
 
 local combattab = vis:Sub("Combat", "Crosshair")
@@ -1053,7 +1086,7 @@ local function destroyBox(row)
 end
 
 task.spawn(function()
-    while PV.Running do
+    while PV.Running and _G.AR2HUB_GEN == GEN do
         local cpos = pvCamPos()
         local lp = Players.LocalPlayer
         local lpId = lp and lp.UserId
