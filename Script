@@ -1634,9 +1634,19 @@ VE.MaxM    = VE.MaxM or 1000
 VE.Types   = VE.Types or {}     -- name -> false to hide that type
 VE.Cache   = {}                 -- { {part=, name=} }
 
-local VEH_POOL  = 64
-local VEH_COL   = C(120, 190, 255)
-local VEH_BUILD = 1.0           -- cache rebuild interval, seconds
+local VEH_POOL   = 64
+local VEH_ORANGE = C(245, 170,  70)   -- the middle band; red/green reuse STYLE
+local VEH_BUILD  = 1.0                -- cache rebuild interval, seconds
+local VEH_HEALTH = 0.75               -- how stale a condition reading may get
+local VEH_PERTICK = 2                 -- vehicles resolved/refreshed per tick
+
+-- Boats are always green: they have a Wheels model like everything else, but no
+-- wheels to lose, so the condition reading is meaningless for them.
+local VEH_BOATS = {
+    ["Aluminum Boat"] = true, ["Rubber Dinghy"] = true, ["Speed Boat"] = true,
+    ["Patrol Boat"] = true, ["Swing Keel Boat"] = true, ["Fishing Boat"] = true,
+    ["Lifeboat"] = true,
+}
 
 -- Grouped the way the event ESP is, because a flat list of 29 is unreadable.
 local VEH_GROUPS = {
@@ -1689,24 +1699,96 @@ local function vehRebuild(discovered)
                 discovered[#discovered + 1] = nm
             end
             local ok, pp = pcall(function() return v.PrimaryPart end)
-            if ok and pp then out[#out + 1] = { part = pp, name = nm } end
+            if ok and pp then
+                out[#out + 1] = {
+                    part  = pp,
+                    name  = nm,
+                    model = v,
+                    boat  = VEH_BOATS[nm] == true,
+                    wheels = nil,      -- resolved lazily, 0.72 ms per vehicle
+                    count  = 0,        -- wheel models present
+                    read   = 0,        -- wheels whose Health actually replicated
+                    frac   = nil,      -- 0..1 condition, nil until first read
+                    at     = 0,
+                }
+            end
         end
     end
     VE.Cache = out
 end
 
+-- Wheel condition. Each wheel's Hitbox carries a Health attribute that reads as
+-- a Vector2-like {x = current, y = fraction}; x/y came out a consistent 350 on
+-- every wheel, so y is already the 0-1 ratio we want. Resolving the hitboxes
+-- costs 0.72 ms per vehicle and each GetAttribute costs 0.12 ms, so both the
+-- lookup and the reads are done a couple of vehicles per tick, never in bulk.
+local function vehResolveWheels(e)
+    local list = {}
+    local w = e.model and e.model:FindFirstChild("Wheels")
+    if w then
+        for _, wheel in ipairs(w:GetChildren()) do
+            local hb = wheel:FindFirstChild("Hitbox")
+            if hb then list[#list + 1] = hb end
+        end
+        e.count = #w:GetChildren()
+    end
+    e.wheels = list          -- empty table still counts as resolved
+end
+
+-- Averaged over the wheels that actually report, NOT over the wheel count.
+-- Measured: every vehicle with unreadable wheels was over 600 m away, none were
+-- nearby, and not one wheel anywhere reported y = 0. So a missing Health
+-- attribute is replication lag, not a destroyed wheel - counting it as 0 would
+-- have shown distant vehicles as wrecks. The label reports partial coverage.
+local function vehReadCondition(e)
+    if not e.wheels then return end
+    local sum, read = 0, 0
+    for i = 1, #e.wheels do
+        local ok, h = pcall(function() return e.wheels[i]:GetAttribute("Health") end)
+        if ok and type(h) == "table" and type(h.y) == "number" then
+            sum = sum + h.y
+            read = read + 1
+        end
+    end
+    e.read = read
+    e.frac = (read > 0) and (sum / read) or nil   -- nil = unknown, drawn gray
+end
+
+local function vehColour(e)
+    if e.boat then return STYLE.unlooted end       -- boats have no wheels to lose
+    local f = e.frac
+    if not f then return STYLE.unknown end
+    if f <= 0.33 then return STYLE.looted end      -- red
+    if f <= 0.66 then return VEH_ORANGE end
+    return STYLE.unlooted                          -- green
+end
+
 task.spawn(function()
+    -- Same shape as the event ESP: ring + core, name above, detail below.
+    -- Colour is assigned every frame; Font and Transparency are left alone,
+    -- since setting those is what turned the event text black.
     local pool = {}
     for i = 1, VEH_POOL do
-        local dot = Drawing.new("Circle")
-        dot.Filled = true; dot.NumSides = 10; dot.Radius = 3; dot.Visible = false
-        local txt = Drawing.new("Text")
-        txt.Size = 13; txt.Center = true; txt.Outline = true; txt.Visible = false
-        pool[i] = { dot = dot, txt = txt }
+        local ring = Drawing.new("Circle")
+        ring.Thickness = 1; ring.Filled = false; ring.NumSides = 18
+        ring.Radius = STYLE.Ring; ring.Visible = false
+        local core = Drawing.new("Circle")
+        core.Filled = true; core.NumSides = 12
+        core.Radius = STYLE.Core; core.Visible = false
+        local name = Drawing.new("Text")
+        name.Size = STYLE.NameSize; name.Center = true; name.Outline = true
+        name.Visible = false
+        local sub = Drawing.new("Text")
+        sub.Size = STYLE.SubSize; sub.Center = true; sub.Outline = true
+        sub.Visible = false
+        pool[i] = { ring = ring, core = core, name = name, sub = sub }
     end
-    local function hide(e) e.dot.Visible = false; e.txt.Visible = false end
+    local function hide(o)
+        o.ring.Visible = false; o.core.Visible = false
+        o.name.Visible = false; o.sub.Visible = false
+    end
 
-    local lastBuild = 0
+    local lastBuild, cursor = 0, 1
     while _G.AR2HUB_GEN == GEN do
         local n = 0
         if VE.Enabled then
@@ -1715,8 +1797,9 @@ task.spawn(function()
                 lastBuild = now
                 local discovered = {}
                 vehRebuild(discovered)
+                cursor = 1
                 for _, nm in ipairs(discovered) do
-                    if not vehOtherSeen then vehOtherSeen = true end
+                    vehOtherSeen = true
                     pcall(function()
                         vehOther:Toggle(nm, true, function(v) VE.Types[nm] = v end)
                     end)
@@ -1724,10 +1807,29 @@ task.spawn(function()
                 end
             end
 
+            local list = VE.Cache
+            -- staggered condition work: a couple of vehicles per tick, so the
+            -- 0.72 ms lookup and 0.12 ms-per-wheel reads never land together
+            local done = 0
+            while done < VEH_PERTICK and #list > 0 do
+                if cursor > #list then cursor = 1 end
+                local e = list[cursor]
+                cursor = cursor + 1
+                done = done + 1
+                if e and not e.boat then
+                    if not e.wheels then
+                        vehResolveWheels(e)
+                    elseif (now - e.at) >= VEH_HEALTH then
+                        e.at = now
+                        vehReadCondition(e)
+                    end
+                end
+                if #list <= done then break end
+            end
+
             local cp = camPos()
             if cp then
                 local maxStuds = VE.MaxM * E.DistanceDivisor
-                local list = VE.Cache
                 for i = 1, #list do
                     if n >= VEH_POOL then break end
                     local e = list[i]
@@ -1740,13 +1842,38 @@ task.spawn(function()
                                 if visible then
                                     n = n + 1
                                     local o = pool[n]
-                                    o.dot.Position = pt
-                                    o.dot.Color = VEH_COL
-                                    o.dot.Visible = true
-                                    o.txt.Text = e.name .. "  " .. metres(d) .. E.DistanceUnit
-                                    o.txt.Position = Vector2.new(pt.X, pt.Y - 15)
-                                    o.txt.Color = VEH_COL
-                                    o.txt.Visible = true
+                                    local col = vehColour(e)
+
+                                    o.ring.Position = pt
+                                    o.ring.Color = col
+                                    o.ring.Visible = true
+
+                                    o.core.Position = pt
+                                    o.core.Color = col
+                                    o.core.Visible = true
+
+                                    o.name.Text = e.name
+                                    o.name.Position = Vector2.new(pt.X, pt.Y - 30)
+                                    o.name.Color = STYLE.name
+                                    o.name.Visible = true
+
+                                    local detail = metres(d) .. E.DistanceUnit
+                                    if e.boat then
+                                        -- nothing to add: boats are always green
+                                    elseif e.frac then
+                                        detail = detail .. string.format("  %d%%", math.floor(e.frac * 100 + 0.5))
+                                        -- flag when only some wheels reported, so a
+                                        -- partial reading is never mistaken for a full one
+                                        if e.read and e.count > 0 and e.read < e.count then
+                                            detail = detail .. string.format(" (%d/%d)", e.read, e.count)
+                                        end
+                                    else
+                                        detail = detail .. "  ?"
+                                    end
+                                    o.sub.Text = detail
+                                    o.sub.Position = Vector2.new(pt.X, pt.Y - 16)
+                                    o.sub.Color = col
+                                    o.sub.Visible = true
                                 end
                             end
                         end
@@ -1758,8 +1885,10 @@ task.spawn(function()
         task.wait(0.05)
     end
     for i = 1, VEH_POOL do
-        pcall(function() pool[i].dot:Remove() end)
-        pcall(function() pool[i].txt:Remove() end)
+        pcall(function() pool[i].ring:Remove() end)
+        pcall(function() pool[i].core:Remove() end)
+        pcall(function() pool[i].name:Remove() end)
+        pcall(function() pool[i].sub:Remove() end)
     end
 end)
 -- ==================== Settings tab ====================
