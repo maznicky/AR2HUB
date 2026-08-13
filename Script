@@ -25,6 +25,31 @@ if GEN > 1 then
     task.wait(0.2)   -- let the retiring loops notice before we respawn them
 end
 
+-- INS-ui captures game:GetService("Players") ONCE, at library load, and reads
+-- the mouse only through LocalPlayer:GetMouse() - there is no UserInputService
+-- fallback and no retry. If the handle is nil at that instant the menu renders
+-- but can never be clicked, for the life of that instance. Matcha's service
+-- lookup does go nil (observed returning nil for Players, Workspace, RunService
+-- and CoreGui while Lighting and ReplicatedStorage still resolved), so wait for
+-- it before loading the library rather than loading into a dead menu.
+do
+    local waited, limit = 0, 10
+    local function handleOk()
+        local ok, lp = pcall(function() return game:GetService("Players").LocalPlayer end)
+        return ok and lp ~= nil
+    end
+    while not handleOk() and waited < limit do
+        task.wait(0.5)
+        waited = waited + 0.5
+    end
+    if not handleOk() then
+        warn("[AR2 Hub] Players handle is stale after " .. limit .. "s - the menu will")
+        warn("[AR2 Hub] render but not accept clicks. Reinject Matcha, then reload.")
+    elseif waited > 0 then
+        print(string.format("[AR2 Hub] waited %.1fs for the Players handle", waited))
+    end
+end
+
 local Lib = loadstring(game:HttpGet("https://raw.githubusercontent.com/neaxusxgod-png/INS-ui/main/uilib.min.lua"))() or INSui
 
 -- ---------------- portability shims ----------------
