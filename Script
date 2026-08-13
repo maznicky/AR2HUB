@@ -974,10 +974,14 @@ end
 __oldCombat = nil
 local CB = _G.COMBAT
 
-local combattab = vis:Sub("Combat", "Crosshair")
-local prepSec = combattab:Section("Setup", "Full")
-local prepLbl = prepSec:Label("Status: not prepared")
-local optSec  = combattab:Section("Options", "Full")
+-- Combat is its own top-level tab. Both sections are declared here so they
+-- appear in a fixed order (Aimbot first) even though the Aimbot controls are
+-- populated further down the file.
+Lib:Category("Combat")
+local combattab = win:Tab("Combat", "crosshair")
+local aimSec = combattab:Section("Aimbot", "Full")
+local gunSec = combattab:Section("Gun Mods", "Full")
+local prepLbl = gunSec:Label("Status: not prepared")
 
 local function setStatus(s) pcall(function() prepLbl:SetText("Status: " .. s) end) end
 
@@ -1051,19 +1055,25 @@ local function apply(keys, on, label)
         label, on and "ON" or "OFF", written, skipped))
 end
 
-prepSec:Button("Prepare (one-time scan)", function() prepare() end)
-prepSec:Button("Refresh cache", function()
+gunSec:Button("Prepare (one-time scan)", function() prepare() end)
+gunSec:Label("Run once per join, with both toggles OFF. Freezes ~30s.")
+gunSec:Label("The cache survives script reloads, so you only pay it once.")
+
+gunSec:Divider("Options")
+gunSec:Toggle("No Spread", false, function(on) apply(CB.SpreadKeys, on, "No Spread") end,
+    "Zeroes every spread value. Applies in ~2ms once prepared, and is reversible.")
+gunSec:Toggle("No Recoil", false, function(on) apply(CB.RecoilKeys, on, "No Recoil") end,
+    "Zeroes all 21 recoil fields: kick, raise, shift, slide and roll.")
+
+gunSec:Divider("Advanced")
+gunSec:Button("Refresh cache", function()
     if CB.Cache then
         local t0 = tick()
         pcall(function() refreshgc(CB.Cache) end)
         setStatus(string.format("cache refreshed (%.0fms)", (tick() - t0) * 1000))
     end
 end)
-
-optSec:Toggle("No Spread", false, function(on) apply(CB.SpreadKeys, on, "No Spread") end)
-optSec:Toggle("No Recoil", false, function(on) apply(CB.RecoilKeys, on, "No Recoil") end)
-optSec:Label("Prepare once per session, with both toggles OFF.")
-optSec:Label("Refresh cache after respawn or weapon swap.")
+gunSec:Label("Refresh is not normally needed - addresses stay valid all session.")
 
 -- ==================== Aimbot (Combat tab) ====================
 -- Everything here is calibrated against live measurements, not assumed:
@@ -1459,27 +1469,41 @@ task.spawn(function()
 end)
 
 -- ---- UI ----
-local aimSec = combattab:Section("Aimbot", "Full")
+-- aimSec was declared with the Combat tab so Aimbot sits above Gun Mods.
+-- Grouped: what it aims at, then how it feels, then where it leads.
 aimSec:Toggle("Enable Aimbot", false, function(v) AB.Enabled = v end)
 aimKeyHandle = aimSec:Keybind("Aim Key (hold)", "e", function(k) AB.Key = k end)
-aimSec:Dropdown("Hit Part", "Head", {"Head", "Torso"}, false, function(v) AB.Part = v end)
+
+aimSec:Divider("Target Selection")
 aimSec:Dropdown("Target", "Crosshair", {"Crosshair", "Distance"}, false,
     function(v) AB.Mode = v end,
     "Crosshair: whatever sits nearest the middle. Distance: nearest enemy, still only from inside the FOV circle.")
+aimSec:Dropdown("Hit Part", "Head", {"Head", "Torso"}, false, function(v) AB.Part = v end)
 aimSec:Toggle("Sticky Target", false, function(v) AB.Sticky = v end,
     "Holds one target until you release the aim key, instead of switching to whatever is closest.")
-aimSec:Slider("FOV", 150, 5, 10, 600, " px", function(v) AB.FovPx = v end)
-aimSec:Toggle("Show FOV Circle", true, function(v) AB.ShowFov = v end)
-aimSec:Slider("Distance", 300, 5, 10, 1000, " m", function(v) AB.DistM = v end)
-aimSec:Slider("Smoothness", 3, 0.5, 1, 15, "", function(v) AB.Smooth = v end)
-aimSec:Slider("Sensitivity", 1.0, 0.05, 0.1, 3, "x", function(v) AB.Sens = v end)
+aimSec:Slider("FOV", 150, 5, 10, 600, " px", function(v) AB.FovPx = v end,
+    "Radius of the circle a target must be inside before it can be picked up.")
+aimSec:Slider("Distance", 300, 5, 10, 1000, " m", function(v) AB.DistM = v end,
+    "Ignore anything further away than this.")
+
+aimSec:Divider("Aim Feel")
+aimSec:Slider("Smoothness", 3, 0.5, 1, 15, "", function(v) AB.Smooth = v end,
+    "Settling time, roughly 16ms per unit. Lower snaps harder, higher looks more human.")
+aimSec:Slider("Sensitivity", 1.0, 0.05, 0.1, 3, "x", function(v) AB.Sens = v end,
+    "Trim for the calibrated 0.002443 rad/count. Leave at 1.00 unless you change in-game sensitivity.")
+
+aimSec:Divider("Lead")
 aimSec:Toggle("Prediction", false, function(v) AB.PredOn = v end,
-    "Aims ahead of a moving target. Only needed for network latency; these guns are hitscan.")
+    "Aims ahead of a moving target. Only needed for network latency; these pistols are hitscan.")
 aimSec:Slider("Prediction Amount", 0, 0.25, 0, 20, " studs", function(v) AB.PredStud = v end,
     "How far ahead of a moving target to aim, along its direction of travel. Fades to zero inside 15 m.")
 aimSec:Slider("Drop Prediction", 0, 0.25, -8, 8, " studs @100m", function(v) AB.DropStud = v end,
     "Raises (+) or lowers (-) the aim point to compensate for bullet drop. Value is the lift at 100 m; it scales with the square of range, so 200 m gets 4x and 50 m gets a quarter.")
-aimSec:Toggle("Target Zombies (testing only)", false, function(v) AB.Zombies = v end)
+
+aimSec:Divider("Display & Testing")
+aimSec:Toggle("Show FOV Circle", true, function(v) AB.ShowFov = v end)
+aimSec:Toggle("Target Zombies (testing only)", false, function(v) AB.Zombies = v end,
+    "Adds zombies as targets. Turn OFF for real fights - a zombie near your crosshair will outrank a player.")
 
 -- ---------------- panel: boxes created and destroyed with players ----------------
 -- playertab._tab.sections is the array the lib's layout pass iterates.
