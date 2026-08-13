@@ -1049,7 +1049,6 @@ local function apply(keys, on, label)
         label, on and "ON" or "OFF", written, skipped, (tick() - t0) * 1000))
     print(string.format("[combat] %s %s: %d written, %d skipped",
         label, on and "ON" or "OFF", written, skipped))
-    end
 end
 
 prepSec:Button("Prepare (one-time scan)", function() prepare() end)
