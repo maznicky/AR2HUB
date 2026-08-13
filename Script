@@ -1194,6 +1194,70 @@ fovRing.Thickness = 1
 fovRing.NumSides = 64
 fovRing.Visible = false
 
+-- ---------------- target cache ----------------
+-- Matcha charges ~0.71 ms per FindFirstChild and ~0.44 ms per
+-- FindFirstChildOfClass. Resolving 98 zombie models cost 118 ms per selection
+-- pass at 10 Hz - over 100% CPU, which starved the aim loop. So part and
+-- Humanoid references are resolved ONCE into abTargets and the selection pass
+-- only reads Position (5.5 ms). The rebuild is spread a few models per tick so
+-- there is never a single long stall.
+local abTargets   = {}      -- live list: {key, name, part, hum|false}
+local abBuild     = nil     -- queue under construction
+local abBuildOut  = nil
+local abBuildIdx  = 1
+local abBuiltAt   = 0
+local abPartMode  = AB.Part
+local BUILD_PER_TICK = 2
+local REBUILD_EVERY  = 0.75
+
+local function abBuildStep(now)
+    if not abBuild then
+        if (now - abBuiltAt) < REBUILD_EVERY and abPartMode == AB.Part then return end
+        abPartMode = AB.Part
+        local q = {}
+        local lp = abPlayers.LocalPlayer
+        local lpId = lp and lp.UserId
+        for _, pl in ipairs(abPlayers:GetPlayers()) do
+            if pl.UserId ~= lpId then
+                local okc, char = pcall(function() return pl.Character end)
+                if okc and char then
+                    q[#q + 1] = { key = "p" .. pl.UserId, name = pl.Name, model = char, player = true }
+                end
+            end
+        end
+        if AB.Zombies then
+            local zf = workspace:FindFirstChild("Zombies")
+            if zf then
+                for i, m in ipairs(zf:GetChildren()) do
+                    q[#q + 1] = { key = "z" .. i .. m.Name, name = m.Name, model = m }
+                end
+            end
+        end
+        abBuild, abBuildOut, abBuildIdx = q, {}, 1
+    end
+    local done = 0
+    while abBuildIdx <= #abBuild and done < BUILD_PER_TICK do
+        local e = abBuild[abBuildIdx]
+        abBuildIdx = abBuildIdx + 1
+        done = done + 1
+        local okp, part = pcall(function() return abPart(e.model) end)
+        if okp and part then
+            local hum = false
+            if e.player then    -- zombies have no Humanoid, so do not pay for the lookup
+                local okh, h = pcall(function() return e.model:FindFirstChildOfClass("Humanoid") end)
+                if okh and h then hum = h end
+            end
+            abBuildOut[#abBuildOut + 1] =
+                { key = e.key, name = e.name, part = part, hum = hum }
+        end
+    end
+    if abBuildIdx > #abBuild then
+        abTargets = abBuildOut
+        abBuild, abBuildOut, abBuildIdx = nil, nil, 1
+        abBuiltAt = now
+    end
+end
+
 task.spawn(function()
     local lockPart, lockName, lockKey = nil, nil, nil
     local lastSelect, lastTick = 0, tick()
@@ -1231,6 +1295,8 @@ task.spawn(function()
             fovRing.Visible = false
         end
 
+        if AB.Enabled then abBuildStep(now) end
+
         if AB.Enabled and keyHeld() and cf then
             local cp, look = cf.Position, cf.LookVector
             local curYaw   = math.atan2(look.X, look.Z)
@@ -1247,38 +1313,34 @@ task.spawn(function()
                 local bestScore
                 lockPart, lockName, lockKey = nil, nil, nil
 
-                local function consider(key, name, model)
-                    local part = abPart(model)
-                    if not part or not abAlive(model) then return end
-                    local okp, tpos = pcall(function() return part.Position end)
-                    if not okp or not tpos then return end
-                    local d = tpos - cp
-                    local mag = d.Magnitude
-                    if mag <= 0 or mag > maxStuds then return end
-                    local u = d * (1 / mag)
-                    local ang = math.acos(math.clamp(look:Dot(u), -1, 1))
-                    local gate = (key == prevKey) and stickyAng or gateAng
-                    if ang > gate then return end
-                    local score = (key == prevKey) and ang * 0.5 or ang
-                    if not bestScore or score < bestScore then
-                        bestScore = score
-                        lockPart, lockName, lockKey = part, name, key
-                    end
-                end
-
-                local lp = abPlayers.LocalPlayer
-                local lpId = lp and lp.UserId
-                for _, pl in ipairs(abPlayers:GetPlayers()) do
-                    if pl.UserId ~= lpId then
-                        local okc, char = pcall(function() return pl.Character end)
-                        if okc and char then consider("p" .. pl.UserId, pl.Name, char) end
-                    end
-                end
-                if AB.Zombies then
-                    local zf = workspace:FindFirstChild("Zombies")
-                    if zf then
-                        for i, m in ipairs(zf:GetChildren()) do
-                            consider("z" .. i .. m.Name, m.Name, m)
+                -- Iterate the CACHE and read Position only. Resolving parts is
+                -- what used to cost 118 ms per pass; this costs ~5.5 ms.
+                for i = 1, #abTargets do
+                    local t = abTargets[i]
+                    local okp, tpos = pcall(function() return t.part.Position end)
+                    if not okp or not tpos then
+                        t.dead = true                 -- part went away; next rebuild drops it
+                    else
+                        local alive = true
+                        if t.hum then
+                            local okh, hp = pcall(function() return t.hum.Health end)
+                            if okh and type(hp) == "number" then alive = hp > 0 end
+                        end
+                        if alive then
+                            local d = tpos - cp
+                            local mag = d.Magnitude
+                            if mag > 0 and mag <= maxStuds then
+                                local u = d * (1 / mag)
+                                local ang = math.acos(math.clamp(look:Dot(u), -1, 1))
+                                local gate = (t.key == prevKey) and stickyAng or gateAng
+                                if ang <= gate then
+                                    local score = (t.key == prevKey) and ang * 0.5 or ang
+                                    if not bestScore or score < bestScore then
+                                        bestScore = score
+                                        lockPart, lockName, lockKey = t.part, t.name, t.key
+                                    end
+                                end
+                            end
                         end
                     end
                 end
