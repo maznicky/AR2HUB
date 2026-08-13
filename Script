@@ -2007,17 +2007,19 @@ end
 
 task.spawn(function()
     while _G.AR2HUB_GEN == GEN do
+        -- counted regardless of the master toggle, so the label never goes stale
+        local anyType, onCount, allCount = false, 0, 0
+        for _, on in pairs(VE.Types) do
+            allCount = allCount + 1
+            if on then anyType = true; onCount = onCount + 1 end
+        end
+        pcall(function()
+            vehCount:SetText(string.format("%d of %d types selected", onCount, allCount))
+        end)
+
         if VE.Enabled then
             local cp = camPos()
             local shortlist = {}
-            local anyType, onCount, allCount = false, 0, 0
-            for _, on in pairs(VE.Types) do
-                allCount = allCount + 1
-                if on then anyType = true; onCount = onCount + 1 end
-            end
-            pcall(function()
-                vehCount:SetText(string.format("%d of %d types selected", onCount, allCount))
-            end)
             if cp and anyType then
                 local maxStuds = VE.MaxM * E.DistanceDivisor
                 for _, e in ipairs(VE.Cache) do
