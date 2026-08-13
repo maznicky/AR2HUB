@@ -1631,9 +1631,8 @@ _G.VEHESP = _G.VEHESP or {}
 local VE = _G.VEHESP
 VE.Enabled   = false
 VE.MaxM      = VE.MaxM or 1000
-VE.ShowParts = VE.ShowParts == true
-VE.Types   = VE.Types or {}     -- name -> false to hide that type
-VE.Cache   = {}                 -- { {part=, name=} }
+VE.Types     = VE.Types or {}   -- name -> true to show that type; default off
+VE.Cache     = VE.Cache or {}   -- reused across rebuilds, keyed by vehicle Id
 
 local VEH_POOL   = 64
 local VEH_ORANGE = C(245, 170,  70)   -- the middle band; red/green reuse STYLE
@@ -1676,14 +1675,13 @@ local vehSec  = vehtab:Section("Vehicle ESP", "Full")
 vehSec:Toggle("Vehicle ESP", false, function(v) VE.Enabled = v end)
 vehSec:Slider("Distance", 1000, 50, 0, 10000, " m", function(v) VE.MaxM = v end,
     "Hide vehicles further away than this. Vehicles replicate map-wide, so raising it really does show the whole map.")
-vehSec:Toggle("Show Parts On ESP", false, function(v) VE.ShowParts = v end,
-    "Adds a compact third line per vehicle: E=engine B=body T=fuel tank F=fuel G=glass. Off by default because it is a lot of text with many vehicles on screen.")
+vehSec:Label("Toggle a type below to list its vehicles and part condition.")
 
 for _, g in ipairs(VEH_GROUPS) do
     local sec = vehtab:Section(g.name, g.side)
     for _, nm in ipairs(g.list) do
-        if VE.Types[nm] == nil then VE.Types[nm] = true end
-        sec:Toggle(nm, VE.Types[nm] ~= false, function(v) VE.Types[nm] = v end)
+        if VE.Types[nm] == nil then VE.Types[nm] = false end
+        sec:Toggle(nm, VE.Types[nm] == true, function(v) VE.Types[nm] = v end)
     end
 end
 -- Anything spawned that is not in the seeded lists gets a toggle at runtime, so
@@ -1691,29 +1689,56 @@ end
 local vehOther = vehtab:Section("Other", "Right")
 local vehOtherSeen = false
 
+-- Entries are REUSED across rebuilds, keyed by the vehicle's Id attribute (a
+-- stable GUID: 40 vehicles, no duplicates, unchanged across rebuild intervals).
+-- Building fresh entries every second was what made readings flicker between a
+-- percentage and "?" - the resolved wheels and cached condition were thrown away
+-- each rebuild and had to be rediscovered by the staggered pass.
 local function vehRebuild(discovered)
     local vf = workspace:FindFirstChild("Vehicles")
     local out = {}
+    local prev, prevByName = {}, {}
+    for _, e in ipairs(VE.Cache) do
+        if e.id then
+            prev[e.id] = e
+        else                            -- a few vehicles carry no Id
+            prevByName[e.name] = prevByName[e.name] or {}
+            table.insert(prevByName[e.name], e)
+        end
+    end
     if vf then
         for _, v in ipairs(vf:GetChildren()) do
             local nm = v.Name
             if VE.Types[nm] == nil then
-                VE.Types[nm] = true
+                VE.Types[nm] = false    -- new types start off, like everything else
                 discovered[#discovered + 1] = nm
             end
             local ok, pp = pcall(function() return v.PrimaryPart end)
             if ok and pp then
-                out[#out + 1] = {
-                    part  = pp,
-                    name  = nm,
-                    model = v,
-                    boat  = VEH_BOATS[nm] == true,
-                    wheels = nil,      -- resolved lazily, 0.72 ms per vehicle
-                    count  = 0,        -- wheel models present
-                    read   = 0,        -- wheels whose Health actually replicated
-                    frac   = nil,      -- 0..1 condition, nil until first read
-                    at     = 0,
-                }
+                local oki, id = pcall(function() return v:GetAttribute("Id") end)
+                id = (oki and type(id) == "string" and id ~= "") and id or nil
+                local e = id and prev[id]
+                if not e and not id and prevByName[nm] and #prevByName[nm] > 0 then
+                    e = table.remove(prevByName[nm])
+                end
+                if e then
+                    e.part, e.model, e.name = pp, v, nm   -- refresh refs, keep readings
+                    out[#out + 1] = e
+                else
+                    out[#out + 1] = {
+                        id    = id,
+                        part  = pp,
+                        name  = nm,
+                        model = v,
+                        boat  = VEH_BOATS[nm] == true,
+                        wheels = nil,      -- resolved lazily, 0.72 ms per vehicle
+                        count  = 0,        -- wheel models present
+                        read   = 0,        -- wheels whose Health actually replicated
+                        frac   = nil,      -- 0..1 condition, nil until first read
+                        parts  = {},
+                        at     = 0,
+                    }
+                end
             end
         end
     end
@@ -1831,15 +1856,11 @@ task.spawn(function()
         local sub = Drawing.new("Text")
         sub.Size = STYLE.SubSize; sub.Center = true; sub.Outline = true
         sub.Visible = false
-        local parts = Drawing.new("Text")
-        parts.Size = STYLE.SubSize; parts.Center = true; parts.Outline = true
-        parts.Visible = false
-        pool[i] = { ring = ring, core = core, name = name, sub = sub, parts = parts }
+        pool[i] = { ring = ring, core = core, name = name, sub = sub }
     end
     local function hide(o)
         o.ring.Visible = false; o.core.Visible = false
         o.name.Visible = false; o.sub.Visible = false
-        o.parts.Visible = false
     end
 
     local lastBuild, cursor = 0, 1
@@ -1855,7 +1876,7 @@ task.spawn(function()
                 for _, nm in ipairs(discovered) do
                     vehOtherSeen = true
                     pcall(function()
-                        vehOther:Toggle(nm, true, function(v) VE.Types[nm] = v end)
+                        vehOther:Toggle(nm, false, function(v) VE.Types[nm] = v end)
                     end)
                     print("[vehicle esp] new type discovered: " .. nm)
                 end
@@ -1887,7 +1908,7 @@ task.spawn(function()
                 for i = 1, #list do
                     if n >= VEH_POOL then break end
                     local e = list[i]
-                    if VE.Types[e.name] ~= false then
+                    if VE.Types[e.name] == true then
                         local ok, pos = pcall(function() return e.part.Position end)
                         if ok and pos then
                             local d = (pos - cp).Magnitude
@@ -1929,29 +1950,8 @@ task.spawn(function()
                                     o.sub.Color = col
                                     o.sub.Visible = true
 
-                                    -- optional third line: component condition,
-                                    -- compact so 40 vehicles on screen stay legible
-                                    if VE.ShowParts and e.parts then
-                                        local p = e.parts
-                                        local bits = {}
-                                        if p.engine then bits[#bits+1] = string.format("E%d", math.floor(p.engine*100+0.5)) end
-                                        if p.body   then bits[#bits+1] = string.format("B%d", math.floor(p.body*100+0.5)) end
-                                        if p.tank   then bits[#bits+1] = string.format("T%d", math.floor(p.tank*100+0.5)) end
-                                        if p.fuel   then bits[#bits+1] = string.format("F%d", math.floor(p.fuel*100+0.5)) end
-                                        if p.glassFixed and p.glassTotal and p.glassFixed < p.glassTotal then
-                                            bits[#bits+1] = string.format("G%d/%d", p.glassFixed, p.glassTotal)
-                                        end
-                                        if #bits > 0 then
-                                            o.parts.Text = table.concat(bits, " ")
-                                            o.parts.Position = Vector2.new(pt.X, pt.Y + 8)
-                                            o.parts.Color = STYLE.unknown
-                                            o.parts.Visible = true
-                                        else
-                                            o.parts.Visible = false
-                                        end
-                                    else
-                                        o.parts.Visible = false
-                                    end
+                                    -- component detail is reported in the UI list,
+                                    -- deliberately not stacked over every vehicle
                                 end
                             end
                         end
@@ -1967,25 +1967,20 @@ task.spawn(function()
         pcall(function() pool[i].core:Remove() end)
         pcall(function() pool[i].name:Remove() end)
         pcall(function() pool[i].sub:Remove() end)
-        pcall(function() pool[i].parts:Remove() end)
     end
 end)
 
--- ---------------- nearest vehicle readout ----------------
--- Full component breakdown for one vehicle only, so the numbers are available
--- without putting five figures over every vehicle on screen. Reading 5
--- attributes for a single vehicle costs ~0.6 ms, so this reads live rather than
--- relying on the staggered cache.
-local nearSec  = vehtab:Section("Nearest Vehicle", "Right")
-local nearName = nearSec:Label("-")
-local nearRows = {
-    wheels = nearSec:Label("Wheels:    -"),
-    engine = nearSec:Label("Engine:    -"),
-    body   = nearSec:Label("Body:      -"),
-    tank   = nearSec:Label("Fuel tank: -"),
-    fuel   = nearSec:Label("Fuel:      -"),
-    glass  = nearSec:Label("Glass:     -"),
-}
+-- ---------------- detail list ----------------
+-- One row per in-range vehicle of a type you have toggled on, nearest first.
+-- Rows are pre-created and blanked when unused, because the lib collapses runs
+-- of whitespace so columns cannot be aligned with padding anyway.
+local VEH_ROWS = 10
+local detSec  = vehtab:Section("Details", "Right")
+local detHead = detSec:Label("no types selected")
+local detRows = {}
+for i = 1, VEH_ROWS do
+    detRows[i] = { top = detSec:Label(""), bot = detSec:Label("") }
+end
 
 local function pctText(f)
     if type(f) ~= "number" then return "-" end
@@ -1996,44 +1991,69 @@ task.spawn(function()
     while _G.AR2HUB_GEN == GEN do
         if VE.Enabled then
             local cp = camPos()
-            local best, bd
-            if cp then
+            local shortlist = {}
+            local anyType = false
+            for _, on in pairs(VE.Types) do
+                if on then anyType = true break end
+            end
+            if cp and anyType then
+                local maxStuds = VE.MaxM * E.DistanceDivisor
                 for _, e in ipairs(VE.Cache) do
-                    if VE.Types[e.name] ~= false then
+                    if VE.Types[e.name] == true then
                         local ok, pos = pcall(function() return e.part.Position end)
                         if ok and pos then
                             local d = (pos - cp).Magnitude
-                            if not bd or d < bd then best, bd = e, d end
+                            if d <= maxStuds then
+                                shortlist[#shortlist + 1] = { e = e, d = d }
+                            end
                         end
                     end
                 end
+                table.sort(shortlist, function(a, b) return a.d < b.d end)
             end
-            if best then
-                if not best.wheels then vehResolve(best) end
-                vehReadCondition(best)
-                local p = best.parts or {}
-                pcall(function()
-                    nearName:SetText(string.format("%s  -  %d%s", best.name,
-                        metres(bd), E.DistanceUnit))
-                    local wt = pctText(best.frac)
-                    if best.frac and best.read and best.count > 0 and best.read < best.count then
-                        wt = wt .. string.format("  (%d/%d wheels)", best.read, best.count)
+
+            local shown = math.min(#shortlist, VEH_ROWS)
+            pcall(function()
+                if not anyType then
+                    detHead:SetText("no types selected")
+                elseif #shortlist == 0 then
+                    detHead:SetText("none in range")
+                else
+                    detHead:SetText(string.format("%d in range%s", #shortlist,
+                        (#shortlist > VEH_ROWS) and (", showing nearest " .. VEH_ROWS) or ""))
+                end
+            end)
+
+            -- read live for the handful actually on screen: 5 attributes each,
+            -- ~0.6 ms per vehicle, so 10 rows costs ~6 ms twice a second
+            for i = 1, VEH_ROWS do
+                local row = detRows[i]
+                local item = (i <= shown) and shortlist[i] or nil
+                if not item then
+                    pcall(function() row.top:SetText("") row.bot:SetText("") end)
+                else
+                    local e = item.e
+                    if not e.wheels then vehResolve(e) end
+                    vehReadCondition(e)
+                    local p = e.parts or {}
+                    local wheels = e.boat and "boat" or pctText(e.frac)
+                    if (not e.boat) and e.frac and e.count > 0 and e.read < e.count then
+                        wheels = wheels .. string.format(" (%d/%d)", e.read, e.count)
                     end
-                    nearRows.wheels:SetText("Wheels:    " .. (best.boat and "n/a (boat)" or wt))
-                    nearRows.engine:SetText("Engine:    " .. pctText(p.engine))
-                    nearRows.body:SetText("Body:      " .. pctText(p.body))
-                    nearRows.tank:SetText("Fuel tank: " .. pctText(p.tank))
-                    nearRows.fuel:SetText("Fuel:      " .. pctText(p.fuel))
+                    local bits = {}
+                    bits[#bits + 1] = "eng " .. pctText(p.engine)
+                    bits[#bits + 1] = "body " .. pctText(p.body)
+                    bits[#bits + 1] = "tank " .. pctText(p.tank)
+                    bits[#bits + 1] = "fuel " .. pctText(p.fuel)
                     if p.glassFixed and p.glassTotal then
-                        nearRows.glass:SetText(string.format("Glass:     %d/%d%s",
-                            p.glassFixed, p.glassTotal,
-                            (p.glassFixed >= p.glassTotal) and "  repaired" or "  broken"))
-                    else
-                        nearRows.glass:SetText("Glass:     n/a")
+                        bits[#bits + 1] = string.format("glass %d/%d", p.glassFixed, p.glassTotal)
                     end
-                end)
-            else
-                pcall(function() nearName:SetText("nothing in range") end)
+                    pcall(function()
+                        row.top:SetText(string.format("%s - %d%s - wheels %s",
+                            e.name, metres(item.d), E.DistanceUnit, wheels))
+                        row.bot:SetText(table.concat(bits, "  "))
+                    end)
+                end
             end
         end
         task.wait(0.5)
