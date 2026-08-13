@@ -983,14 +983,27 @@ end
 __oldCombat = nil
 local CB = _G.COMBAT
 
--- Combat is its own top-level tab. Both sections are declared here so they
--- appear in a fixed order (Aimbot first) even though the Aimbot controls are
--- populated further down the file.
+-- Combat is its own top-level tab with two subs, the same shape as
+-- Visuals > Events / Players / Zombies. Both subs and all their sections are
+-- declared here so ordering is fixed, even though the Aimbot controls get
+-- populated several hundred lines further down.
 Lib:Category("Combat")
 local combattab = win:Tab("Combat", "crosshair")
-local aimSec = combattab:Section("Aimbot", "Full")
-local gunSec = combattab:Section("Gun Mods", "Full")
-local prepLbl = gunSec:Label("Status: not prepared")
+local aimsub = combattab:Sub("Aimbot", "crosshair")
+local gunsub = combattab:Sub("Gun Mods", "sliders")
+
+-- Aimbot sub
+local aimSec  = aimsub:Section("Aimbot", "Full")
+local tgtSec  = aimsub:Section("Target Selection", "Left")
+local feelSec = aimsub:Section("Aim Feel", "Right")
+local leadSec = aimsub:Section("Lead", "Left")
+local dispSec = aimsub:Section("Display & Testing", "Right")
+
+-- Gun Mods sub
+local prepSec = gunsub:Section("Setup", "Full")
+local prepLbl = prepSec:Label("Status: not prepared")
+local optSec  = gunsub:Section("Options", "Left")
+local advSec  = gunsub:Section("Advanced", "Right")
 
 local function setStatus(s) pcall(function() prepLbl:SetText("Status: " .. s) end) end
 
@@ -1064,25 +1077,24 @@ local function apply(keys, on, label)
         label, on and "ON" or "OFF", written, skipped))
 end
 
-gunSec:Button("Prepare (one-time scan)", function() prepare() end)
-gunSec:Label("Run once per join, with both toggles OFF. Freezes ~30s.")
-gunSec:Label("The cache survives script reloads, so you only pay it once.")
+prepSec:Button("Prepare (one-time scan)", function() prepare() end)
+prepSec:Label("Run once per join, with both toggles OFF. Freezes ~30s.")
+prepSec:Label("The cache survives script reloads, so you only pay it once.")
 
-gunSec:Divider("Options")
-gunSec:Toggle("No Spread", false, function(on) apply(CB.SpreadKeys, on, "No Spread") end,
+optSec:Toggle("No Spread", false, function(on) apply(CB.SpreadKeys, on, "No Spread") end,
     "Zeroes every spread value. Applies in ~2ms once prepared, and is reversible.")
-gunSec:Toggle("No Recoil", false, function(on) apply(CB.RecoilKeys, on, "No Recoil") end,
+optSec:Toggle("No Recoil", false, function(on) apply(CB.RecoilKeys, on, "No Recoil") end,
     "Zeroes all 21 recoil fields: kick, raise, shift, slide and roll.")
 
-gunSec:Divider("Advanced")
-gunSec:Button("Refresh cache", function()
+advSec:Button("Refresh cache", function()
     if CB.Cache then
         local t0 = tick()
         pcall(function() refreshgc(CB.Cache) end)
         setStatus(string.format("cache refreshed (%.0fms)", (tick() - t0) * 1000))
     end
 end)
-gunSec:Label("Refresh is not normally needed - addresses stay valid all session.")
+advSec:Label("Not normally needed - addresses stay valid all session.")
+advSec:Label("Same applygc family that caused ~100ms stalls, so avoid it.")
 
 -- ==================== Aimbot (Combat tab) ====================
 -- Everything here is calibrated against live measurements, not assumed:
@@ -1481,40 +1493,35 @@ task.spawn(function()
 end)
 
 -- ---- UI ----
--- aimSec was declared with the Combat tab so Aimbot sits above Gun Mods.
--- Grouped: what it aims at, then how it feels, then where it leads.
+-- Sections were declared with the Combat tab; they are populated here.
 aimSec:Toggle("Enable Aimbot", false, function(v) AB.Enabled = v end)
 aimKeyHandle = aimSec:Keybind("Aim Key (hold)", "e", function(k) AB.Key = k end)
 
-aimSec:Divider("Target Selection")
-aimSec:Dropdown("Target", "Crosshair", {"Crosshair", "Distance"}, false,
+tgtSec:Dropdown("Target", "Crosshair", {"Crosshair", "Distance"}, false,
     function(v) AB.Mode = v end,
     "Crosshair: whatever sits nearest the middle. Distance: nearest enemy, still only from inside the FOV circle.")
-aimSec:Dropdown("Hit Part", "Head", {"Head", "Torso"}, false, function(v) AB.Part = v end)
-aimSec:Toggle("Sticky Target", false, function(v) AB.Sticky = v end,
+tgtSec:Dropdown("Hit Part", "Head", {"Head", "Torso"}, false, function(v) AB.Part = v end)
+tgtSec:Toggle("Sticky Target", false, function(v) AB.Sticky = v end,
     "Holds one target until you release the aim key, instead of switching to whatever is closest.")
-aimSec:Slider("FOV", 150, 5, 10, 600, " px", function(v) AB.FovPx = v end,
+tgtSec:Slider("FOV", 150, 5, 10, 600, " px", function(v) AB.FovPx = v end,
     "Radius of the circle a target must be inside before it can be picked up.")
-aimSec:Slider("Distance", 300, 5, 10, 1000, " m", function(v) AB.DistM = v end,
+tgtSec:Slider("Distance", 300, 5, 10, 1000, " m", function(v) AB.DistM = v end,
     "Ignore anything further away than this.")
 
-aimSec:Divider("Aim Feel")
-aimSec:Slider("Smoothness", 3, 0.5, 1, 15, "", function(v) AB.Smooth = v end,
+feelSec:Slider("Smoothness", 3, 0.5, 1, 15, "", function(v) AB.Smooth = v end,
     "Settling time, roughly 16ms per unit. Lower snaps harder, higher looks more human.")
-aimSec:Slider("Sensitivity", 1.0, 0.05, 0.1, 3, "x", function(v) AB.Sens = v end,
+feelSec:Slider("Sensitivity", 1.0, 0.05, 0.1, 3, "x", function(v) AB.Sens = v end,
     "Trim for the calibrated 0.002443 rad/count. Leave at 1.00 unless you change in-game sensitivity.")
 
-aimSec:Divider("Lead")
-aimSec:Toggle("Prediction", false, function(v) AB.PredOn = v end,
+leadSec:Toggle("Prediction", false, function(v) AB.PredOn = v end,
     "Aims ahead of a moving target. Only needed for network latency; these pistols are hitscan.")
-aimSec:Slider("Prediction Amount", 0, 0.25, 0, 20, " studs", function(v) AB.PredStud = v end,
+leadSec:Slider("Prediction Amount", 0, 0.25, 0, 20, " studs", function(v) AB.PredStud = v end,
     "How far ahead of a moving target to aim, along its direction of travel. Fades to zero inside 15 m.")
-aimSec:Slider("Drop Prediction", 0, 0.25, -8, 8, " studs @100m", function(v) AB.DropStud = v end,
+leadSec:Slider("Drop Prediction", 0, 0.25, -8, 8, " studs @100m", function(v) AB.DropStud = v end,
     "Raises (+) or lowers (-) the aim point to compensate for bullet drop. Value is the lift at 100 m; it scales with the square of range, so 200 m gets 4x and 50 m gets a quarter.")
 
-aimSec:Divider("Display & Testing")
-aimSec:Toggle("Show FOV Circle", true, function(v) AB.ShowFov = v end)
-aimSec:Toggle("Target Zombies (testing only)", false, function(v) AB.Zombies = v end,
+dispSec:Toggle("Show FOV Circle", true, function(v) AB.ShowFov = v end)
+dispSec:Toggle("Target Zombies (testing only)", false, function(v) AB.Zombies = v end,
     "Adds zombies as targets. Turn OFF for real fights - a zombie near your crosshair will outrank a player.")
 
 -- ---------------- panel: boxes created and destroyed with players ----------------
@@ -1611,5 +1618,89 @@ task.spawn(function()
             end
         end
         task.wait(PV.Refresh)
+    end
+end)
+
+-- ==================== Settings tab ====================
+-- INS-ui ships its own Settings tab. Enabling it gives Theme, Appearance,
+-- Interface (which already contains the "Menu key" bind that opens/closes this
+-- menu, default P), Configs (save/load named presets) and System - so none of
+-- that needs reimplementing here. Added last so it sits after the other tabs.
+-- NOTE: AddSettingsTab/SettingsSection live on the object CreateWindow returns
+-- (the lib's internal `o2`), NOT on the module table. `Lib` is the module and
+-- returns nil for both, so these must be called on `win`.
+win:AddSettingsTab("cog")
+
+-- Script-level settings the library cannot know about.
+local setSec = win:SettingsSection("AR2 Hub", "Left")
+local setInfo = setSec:Label("status: -")
+
+-- Panic: stop everything that draws or moves the mouse, and hand input back.
+-- Same effect as the F7 hotkey, reachable when a hotkey is not.
+local function hubPanic()
+    _G.ESP_RUNNING = false
+    if _G.AIMBOT then
+        _G.AIMBOT.Enabled = false
+        _G.AIMBOT.Locked  = nil
+    end
+    if setrobloxinput then pcall(function() setrobloxinput(true) end) end
+    pcall(function() Lib:Notify("panic: ESP and aimbot off, input released", 4) end)
+end
+
+-- Full unload: bumping the generation retires every loop in this script, and
+-- each one removes its own Drawings on the way out (ESP pool, FOV ring).
+local function hubUnload()
+    _G.AR2HUB_GEN  = (_G.AR2HUB_GEN or 0) + 1
+    _G.ESP_RUNNING = false
+    _G.UI_WATCHDOG = false
+    if _G.AIMBOT    then _G.AIMBOT.Enabled = false end
+    if _G.PlayerVis then _G.PlayerVis.Running = false end
+    if _G.SiteProbe then _G.SiteProbe.Running = false end
+    if setrobloxinput then pcall(function() setrobloxinput(true) end) end
+    task.wait(0.2)                      -- let the loops notice and clean up
+    pcall(function() Lib:Destroy() end)
+end
+
+setSec:Button("Panic - stop ESP + aimbot", function() hubPanic() end,
+    "Also bound to F7. Releases input, in case the menu ever traps it.")
+setSec:Button("Unload AR2 Hub", function() task.spawn(hubUnload) end,
+    "Retires every loop, removes all Drawings and closes the menu. Re-run the loadstring to come back.")
+
+setSec:Divider("Safety")
+setSec:Toggle("Input watchdog", true, function(v) _G.UI_WATCHDOG = v end,
+    "Watches for Matcha's Players handle going stale and hands input back if it does. Leave this on.")
+
+local setDiag = win:SettingsSection("Diagnostics", "Right")
+local diagLbl = setDiag:Label("-")
+setDiag:Button("Log environment report", function()
+    local P = svcPlayers()
+    print("---- AR2 Hub environment ----")
+    print("gen              : " .. tostring(_G.AR2HUB_GEN))
+    print("Players handle   : " .. (P and ("ok, " .. #P:GetPlayers() .. " players") or "STALE (nil)"))
+    print("camera           : " .. tostring(workspace.CurrentCamera ~= nil))
+    print("mousemoverel     : " .. type(mousemoverel))
+    print("iskeypressed     : " .. type(iskeypressed))
+    print("memory_write     : " .. type(memory_write))
+    print("ESP markers      : " .. tostring(_G.ESP_COUNT))
+    print("combat prepared  : " .. tostring(_G.COMBAT and _G.COMBAT.Prepared))
+    print("combat cache     : " .. tostring(_G.COMBAT and _G.COMBAT.Cache and #_G.COMBAT.Cache))
+    print("aimbot enabled   : " .. tostring(_G.AIMBOT and _G.AIMBOT.Enabled))
+    print("aimbot locked    : " .. tostring(_G.AIMBOT and _G.AIMBOT.Locked))
+    print("-----------------------------")
+    pcall(function() Lib:Notify("environment report written to the log", 3) end)
+end, "Prints the state that actually matters when something stops working.")
+
+task.spawn(function()
+    while _G.AR2HUB_GEN == GEN do
+        local P = svcPlayers()
+        pcall(function()
+            setInfo:SetText(string.format("markers %s  |  guns %s",
+                tostring(_G.ESP_COUNT or 0),
+                (_G.COMBAT and _G.COMBAT.Prepared) and "ready" or "not prepared"))
+            diagLbl:SetText(string.format("players %s  |  aim %s",
+                P and tostring(#P:GetPlayers()) or "handle stale",
+                (_G.AIMBOT and _G.AIMBOT.Enabled) and "on" or "off"))
+        end)
+        task.wait(1)
     end
 end)
