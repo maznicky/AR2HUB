@@ -1090,8 +1090,8 @@ local AB = _G.AIMBOT
 AB.Enabled  = false
 AB.Key      = AB.Key      or "e"
 AB.PredOn   = AB.PredOn   == true   -- master switch for velocity lead
-AB.PredMs   = AB.PredMs   or 0
-AB.DropStud = AB.DropStud or 0      -- raises/lowers the aim point, in studs
+AB.PredStud = AB.PredStud or 0      -- studs to aim ahead along the target's travel
+AB.DropStud = AB.DropStud or 0      -- studs of lift at DROP_REF_M, scaled by range^2
 AB.FovPx    = AB.FovPx    or 150
 AB.ShowFov  = (AB.ShowFov ~= false)
 AB.DistM    = AB.DistM    or 300
@@ -1111,6 +1111,12 @@ AB.Locked   = nil
 -- produces is huge and targets change direction constantly, so linear
 -- extrapolation stops being valid. Inside this range the lead fades to zero.
 local FALLOFF_M = 15
+
+-- Reference range for Drop Prediction. The slider value is the lift applied at
+-- exactly this distance; closer targets get less, further targets get more, by
+-- the square of the ratio.
+local DROP_REF_M = 100
+local DROP_REF   = DROP_REF_M * 2.75
 
 local RAD_PER_COUNT = 0.002443
 local MAX_STEP      = 250           -- counts/tick, the real anti-teleport guard
@@ -1376,23 +1382,37 @@ task.spawn(function()
                     AB.Locked, AB.Status = nil, "target gone"
                 else
                     local raw = (tpos - cp).Magnitude
+                    local vel = velOf(lockKey, tpos, now)
                     -- The controller's own lag (tau) is always led for, since a
                     -- proportional controller structurally trails a moving
-                    -- target. PredMs on top of that is latency compensation and
-                    -- is opt-in, faded out at close range by FALLOFF_M.
-                    local lead = tau
-                    if AB.PredOn and AB.PredMs > 0 then
-                        local p = AB.PredMs / 1000
-                        if fallStuds > 0 and raw < fallStuds then
-                            p = p * (raw / fallStuds)
+                    -- target. That part stays time-based; it is not a user knob.
+                    local aimPos = tpos + vel * tau
+                    -- Prediction proper is a DISTANCE: aim this many studs ahead
+                    -- of the target along its direction of travel. Faded out at
+                    -- close range by FALLOFF_M, and skipped below a walking pace
+                    -- so a stationary target does not jitter on velocity noise.
+                    if AB.PredOn and AB.PredStud > 0 then
+                        local sp = vel.Magnitude
+                        if sp > 2 then
+                            local lead = AB.PredStud
+                            if fallStuds > 0 and raw < fallStuds then
+                                lead = lead * (raw / fallStuds)
+                            end
+                            aimPos = aimPos + vel * (lead / sp)
                         end
-                        lead = lead + p
                     end
-                    local aimPos = tpos + velOf(lockKey, tpos, now) * lead
                     -- Drop Prediction: lifts or lowers the aim point off the
                     -- targeted part to sit where the round actually lands.
+                    -- Scales with the SQUARE of range: drop is 0.5*g*t^2 and
+                    -- t = range/speed, so doubling the range quadruples the
+                    -- drop. The slider is therefore "studs of lift at 100 m",
+                    -- which makes one calibration hold at every range.
                     if AB.DropStud ~= 0 then
-                        aimPos = aimPos + Vector3.new(0, AB.DropStud, 0)
+                        local k = raw / DROP_REF
+                        local lift = AB.DropStud * k * k
+                        if lift >  40 then lift =  40 end   -- sanity clamp; at 1000 m
+                        if lift < -40 then lift = -40 end   -- k^2 would run away
+                        aimPos = aimPos + Vector3.new(0, lift, 0)
                     end
                     local d = aimPos - cp
                     local mag = d.Magnitude
@@ -1454,10 +1474,11 @@ aimSec:Slider("Distance", 300, 5, 10, 1000, " m", function(v) AB.DistM = v end)
 aimSec:Slider("Smoothness", 3, 0.5, 1, 15, "", function(v) AB.Smooth = v end)
 aimSec:Slider("Sensitivity", 1.0, 0.05, 0.1, 3, "x", function(v) AB.Sens = v end)
 aimSec:Toggle("Prediction", false, function(v) AB.PredOn = v end,
-    "Leads a moving target by its velocity. Only needed for network latency; these guns are hitscan.")
-aimSec:Slider("Prediction Amount", 0, 5, 0, 300, " ms", function(v) AB.PredMs = v end)
-aimSec:Slider("Drop Prediction", 0, 0.25, -8, 8, " studs", function(v) AB.DropStud = v end,
-    "Raises (+) or lowers (-) the aim point off the target part to compensate for bullet drop.")
+    "Aims ahead of a moving target. Only needed for network latency; these guns are hitscan.")
+aimSec:Slider("Prediction Amount", 0, 0.25, 0, 20, " studs", function(v) AB.PredStud = v end,
+    "How far ahead of a moving target to aim, along its direction of travel. Fades to zero inside 15 m.")
+aimSec:Slider("Drop Prediction", 0, 0.25, -8, 8, " studs @100m", function(v) AB.DropStud = v end,
+    "Raises (+) or lowers (-) the aim point to compensate for bullet drop. Value is the lift at 100 m; it scales with the square of range, so 200 m gets 4x and 50 m gets a quarter.")
 aimSec:Toggle("Target Zombies (testing only)", false, function(v) AB.Zombies = v end)
 
 -- ---------------- panel: boxes created and destroyed with players ----------------
