@@ -1330,7 +1330,8 @@ local function abBuildStep(now)
             local lp = P.LocalPlayer
             local lpId = lp and lp.UserId
             for _, pl in ipairs(P:GetPlayers()) do
-                if pl.UserId ~= lpId then
+                -- whitelisted players are skipped outright, never targeted
+                if pl.UserId ~= lpId and (_G.PLAYERMARK or {})[pl.UserId] ~= "whitelist" then
                     local okc, char = pcall(function() return pl.Character end)
                     if okc and char then
                         q[#q + 1] = { key = "p" .. pl.UserId, name = pl.Name, model = char, player = true }
@@ -1619,6 +1620,109 @@ dispSec:Toggle("Show FOV Circle", true, function(v) AB.ShowFov = v end)
 dispSec:Toggle("Target Zombies (testing only)", false, function(v) AB.Zombies = v end,
     "Adds zombies as targets. Turn OFF for real fights - a zombie near your crosshair will outrank a player.")
 
+-- ---------------- per-player marks ----------------
+-- Kept in _G so a script reload does not lose who you have marked. Declared
+-- before the priority ESP below, which closes over markOf.
+--   whitelist -> ignored by the aimbot and auto melee entirely
+--   priority  -> outlined in red by the priority ESP
+_G.PLAYERMARK = _G.PLAYERMARK or {}
+local MARKS = _G.PLAYERMARK
+local MARK_ORDER = { [""] = "whitelist", whitelist = "priority", priority = "" }
+local MARK_TAG   = { whitelist = "[W] ", priority = "[P] " }
+
+local function markOf(userId) return MARKS[userId] or "" end
+local function cycleMark(userId)
+    local nextMark = MARK_ORDER[markOf(userId)] or ""
+    MARKS[userId] = (nextMark ~= "") and nextMark or nil
+end
+
+-- ---------------- priority ESP ----------------
+-- A red box around prioritised players only. Corners come from projecting a
+-- point above the head and below the feet, so the box tracks their real height
+-- rather than assuming one.
+_G.PRIOESP = _G.PRIOESP or {}
+local PE = _G.PRIOESP
+PE.On = (PE.On ~= false)
+local PRIO_POOL = 12
+local PRIO_COL  = C(235, 80, 80)
+
+local prioSec = playertab:Section("Marked Players", "Full")
+prioSec:Toggle("Priority ESP", true, function(v) PE.On = v end,
+    "Draws a red box and name around players you have marked as prioritised.")
+local prioInfo = prioSec:Label("none marked")
+prioSec:Button("Clear All Marks", function()
+    for k in pairs(MARKS) do MARKS[k] = nil end
+end)
+
+task.spawn(function()
+    local pool = {}
+    for i = 1, PRIO_POOL do
+        local box = Drawing.new("Square")
+        box.Filled = false; box.Thickness = 1; box.Visible = false
+        local name = Drawing.new("Text")
+        name.Size = STYLE.NameSize; name.Center = true; name.Outline = true
+        name.Visible = false
+        pool[i] = { box = box, name = name }
+    end
+    while _G.AR2HUB_GEN == GEN do
+        local n, white, prio = 0, 0, 0
+        for _, m in pairs(MARKS) do
+            if m == "whitelist" then white = white + 1 elseif m == "priority" then prio = prio + 1 end
+        end
+        if PE.On then
+            local P = svcPlayers()
+            local cp = camPos()
+            if P and cp then
+                for _, pl in ipairs(P:GetPlayers()) do
+                    if n >= PRIO_POOL then break end
+                    if markOf(pl.UserId) == "priority" then
+                        local okc, ch = pcall(function() return pl.Character end)
+                        local head = (okc and ch) and ch:FindFirstChild("Head") or nil
+                        local root = (okc and ch) and ch:FindFirstChild("HumanoidRootPart") or nil
+                        if head and root then
+                            local okh, hp = pcall(function() return head.Position end)
+                            local okr, rp = pcall(function() return root.Position end)
+                            if okh and okr and hp and rp then
+                                local top, bot = toScreen(hp + Vector3.new(0, 1.5, 0)),
+                                                 toScreen(rp - Vector3.new(0, 3.2, 0))
+                                local _, vis = toScreen(hp)
+                                if vis then
+                                    n = n + 1
+                                    local o = pool[n]
+                                    local h = math.abs(bot.Y - top.Y)
+                                    local w = h * 0.45
+                                    o.box.Position = Vector2.new(top.X - w / 2, top.Y)
+                                    o.box.Size = Vector2.new(w, h)
+                                    o.box.Color = PRIO_COL
+                                    o.box.Visible = true
+                                    o.name.Text = string.format("%s  %dm", pl.Name,
+                                        metres((hp - cp).Magnitude))
+                                    o.name.Position = Vector2.new(top.X, top.Y - 15)
+                                    o.name.Color = PRIO_COL
+                                    o.name.Visible = true
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+        for i = n + 1, PRIO_POOL do
+            pool[i].box.Visible = false
+            pool[i].name.Visible = false
+        end
+        pcall(function()
+            prioInfo:SetText((white + prio == 0) and "none marked"
+                or string.format("%d whitelisted, %d prioritised", white, prio))
+        end)
+        task.wait(0.06)
+    end
+    for i = 1, PRIO_POOL do
+        pcall(function() pool[i].box:Remove() end)
+        pcall(function() pool[i].name:Remove() end)
+    end
+end)
+
 -- ---------------- panel: boxes created and destroyed with players ----------------
 -- playertab._tab.sections is the array the lib's layout pass iterates.
 -- Splicing an entry out of it removes the box; appending adds one at runtime.
@@ -1626,13 +1730,17 @@ local pvSections = playertab._tab and playertab._tab.sections
 
 local function makeBox(userId)
     local box = playertab:Section("-", "Full")
-    return {
+    local row = {
         userId = userId,
         box    = box,
         pri    = box:Label("Primary: -"),
         sec    = box:Label("Secondary: -"),
         mel    = box:Label("Melee: -"),
     }
+    row.mark = box:Label("Mark: none")
+    box:Button("Cycle Mark", function() cycleMark(userId) end,
+        "none -> whitelisted (ignored by aimbot and melee) -> prioritised (red outline) -> none")
+    return row
 end
 
 local function destroyBox(row)
@@ -1706,10 +1814,12 @@ task.spawn(function()
                 local sec = c.secondary and (c.secondary.name .. "  |  " .. c.secondary.att) or "-"
                 local mel = c.melee and c.melee.name or "-"
                 local dist = info.d and string.format("  |  %dm", math.floor(info.d + 0.5)) or ""
-                pcall(function() row.box:SetName(info.name .. dist) end)
+                local mk = markOf(row.userId)
+                pcall(function() row.box:SetName((MARK_TAG[mk] or "") .. info.name .. dist) end)
                 pcall(function() row.pri:SetText("Primary: " .. pri) end)
                 pcall(function() row.sec:SetText("Secondary: " .. sec) end)
                 pcall(function() row.mel:SetText("Melee: " .. mel) end)
+                pcall(function() row.mark:SetText("Mark: " .. ((mk ~= "") and mk or "none")) end)
             end
         end
         task.wait(PV.Refresh)
@@ -2761,7 +2871,8 @@ task.spawn(function()
                         local lpId = lp and lp.UserId
                         if P then
                             for _, pl in ipairs(P:GetPlayers()) do
-                                if pl.UserId ~= lpId then
+                                -- whitelisted players are never swung at
+                                if pl.UserId ~= lpId and (_G.PLAYERMARK or {})[pl.UserId] ~= "whitelist" then
                                     local okc2, pch = pcall(function() return pl.Character end)
                                     local r = (okc2 and pch) and pch:FindFirstChild("HumanoidRootPart") or nil
                                     if r then consider(r) end
