@@ -2498,21 +2498,28 @@ ML.Key       = ML.Key or "v"
 ML.Players   = ML.Players == true
 ML.Zombies   = (ML.Zombies ~= false)
 ML.Cooldown  = ML.Cooldown or 0.6
-ML.RangePad  = ML.RangePad or 0            -- extra studs on the CHECK only
+ML.RangePad  = ML.RangePad or 1            -- extra studs on the CHECK only
 ML.Arc       = ML.Arc or 60                -- degrees in front that counts
-ML.ExtendHb  = ML.ExtendHb == true         -- writes Hitbox.Size (see warning)
-ML.HbMul     = ML.HbMul or 1
+ML.KeepSprint = (ML.KeepSprint ~= false)   -- re-press shift after a swing
+ML.SprintDelay = 0.02                      -- measured as the value that works
+ML.Predict   = (ML.Predict ~= false)       -- swing early so the hit lands on time
+ML.Windup    = ML.Windup or 0.15           -- swing start -> damage frame, seconds
+ML.Closing   = 0                           -- studs/sec the target is closing at
 ML.Weapon    = nil
 ML.Reach     = 0
 
 local MEL_REFRESH = 0.4        -- how often to re-resolve the equipped weapon
+local MEL_LOOKAHEAD = 8        -- studs beyond reach still worth tracking, so a
+                               -- closing target is already being measured when
+                               -- the prediction needs its closing rate
 local melKeyHandle
+local melTrackPart, melTrackSurf, melTrackRate, melTrackAt = nil, 0, 0, 0
 
 local melSec  = melsub:Section("Auto Melee", "Full")
 local melInfo = melSec:Label("no melee equipped")
 local melTgt  = melsub:Section("Targets", "Left")
 local melTune = melsub:Section("Timing & Reach", "Right")
-local melRisk = melsub:Section("Hitbox (read the warning)", "Full")
+local melPred = melsub:Section("Swing Prediction", "Full")
 
 melSec:Toggle("Auto Melee", false, function(v) ML.Enabled = v end,
     "Swings automatically when something you have selected is inside the weapon's own reach and in front of you.")
@@ -2527,15 +2534,50 @@ melTgt:Slider("Swing Arc", 60, 5, 10, 180, " deg", function(v) ML.Arc = v end,
 
 melTune:Slider("Cooldown", 0.6, 0.05, 0.1, 2.0, " s", function(v) ML.Cooldown = v end,
     "Minimum gap between swings. The weapon's real cooldown is not readable, so tune this by feel; too fast just wastes clicks.")
-melTune:Slider("Range Padding", 0, 0.25, 0, 6, " studs", function(v) ML.RangePad = v end,
-    "Adds to the in-range CHECK only. It does not make the weapon reach further - it just lets it start swinging slightly early.")
+melTune:Toggle("Keep Sprint When Swinging", true, function(v) ML.KeepSprint = v end,
+    "Swinging drops you to a walk. This re-presses shift straight after the swing, exactly as you would by hand, so you keep running. Works for your own clicks as well as auto swings.")
+melTune:Slider("Sprint Re-press Delay", 0.02, 0.01, 0.01, 0.4, " s", function(v) ML.SprintDelay = v end,
+    "How long to wait after the swing before re-pressing shift. Too early and the swing cancels it again; too late and you walk for a moment.")
+melTune:Slider("Range Padding", 1, 0.25, 0, 6, " studs", function(v) ML.RangePad = v end,
+    "Adds to the in-range CHECK only, on top of the target's own body radius. It does not make the weapon reach further - it just lets it start swinging slightly early. Raise it if swings start too late.")
 
-melRisk:Label("Hitbox.Size is writable and the change sticks locally.")
-melRisk:Label("Whether the SERVER honours a bigger hitbox is unverified.")
-melRisk:Label("If hit detection is server-side this does nothing but flag you.")
-melRisk:Toggle("Extend Hitbox", false, function(v) ML.ExtendHb = v end,
-    "Multiplies the weapon's own Hitbox part. Restored to its original size when switched off or when the weapon changes.")
-melRisk:Slider("Hitbox Multiplier", 1, 0.25, 1, 5, "x", function(v) ML.HbMul = v end)
+melPred:Toggle("Predict Swing", true, function(v) ML.Predict = v end,
+    "Damage lands at the far point of the swing, not when it starts. This swings early by the windup time so the blade arrives as the target reaches you, instead of hitting where it used to be.")
+melPred:Slider("Swing Windup", 0.15, 0.01, 0, 0.6, " s", function(v) ML.Windup = v end,
+    "Time between the swing starting and the damage frame. Raise it if fast targets still slip past; lower it if it swings at thin air.")
+local melPredInfo = melPred:Label("closing: -")
+
+-- ---- keep sprint through a swing ----
+-- Swinging drops you to a walk, but pressing shift again resumes running even
+-- mid-swing, so the fix is to re-assert shift exactly as you would by hand.
+-- Nothing needs detecting: the script knows when a swing happens. Humanoid
+-- WalkSpeed and MoveDirection are both unsupported in Matcha and MoveState is
+-- not on the character, so there is no readable "am I sprinting" state anyway.
+-- Which keycode Roblox sees for shift is decided at runtime rather than guessed:
+-- whichever of LSHIFT / generic SHIFT reads as held is the one re-asserted.
+local SHIFT_VKS = { 0xA0, 0x10 }
+local melSprintAt = 0
+local function melHeldShift()
+    for _, vk in ipairs(SHIFT_VKS) do
+        local ok, d = pcall(function() return iskeypressed(vk) end)
+        if ok and d then return vk end
+    end
+    return nil
+end
+local function melKeepSprint()
+    if not ML.KeepSprint then return end
+    local now = tick()
+    if (now - melSprintAt) < 0.15 then return end   -- our own click also trips the
+    melSprintAt = now                               -- manual watcher; debounce it
+    local vk = melHeldShift()
+    if not vk or not keypress or not keyrelease then return end
+    task.spawn(function()
+        task.wait(ML.SprintDelay)      -- let the swing's cancel land first
+        pcall(function() keyrelease(vk) end)
+        task.wait(0.03)
+        pcall(function() keypress(vk) end)
+    end)
+end
 
 -- ---- key state, same dual approach as the aimbot ----
 local MEL_VK = { m1=0x01, m2=0x02, shift=0x10, ctrl=0x11, alt=0x12, space=0x20, tab=0x09 }
@@ -2559,13 +2601,10 @@ local function melKeyHeld()
 end
 
 -- ---- equipped weapon, resolved on a timer because FindFirstChild is 0.71 ms ----
-local melHb, melHbOrig, melAt = nil, nil, 0
-
-local function melRestoreHitbox()
-    if melHb and melHbOrig then
-        pcall(function() melHb.Size = melHbOrig end)
-    end
-end
+-- The hitbox is only ever READ. Writing its Size was tested and the server
+-- ignores it entirely - hit detection is server-side - so there is nothing to
+-- gain and a permanently wrong part size to be caught with.
+local melHb, melHbSize, melAt = nil, nil, 0
 
 local function melResolve(now)
     if (now - melAt) < MEL_REFRESH then return end
@@ -2576,30 +2615,20 @@ local function melResolve(now)
     local eqd = ch and ch:FindFirstChild("Equipped")
     local w = eqd and eqd:GetChildren()[1]
     if not w then
-        melRestoreHitbox()
-        melHb, melHbOrig, ML.Weapon, ML.Reach = nil, nil, nil, 0
+        melHb, melHbSize, ML.Weapon, ML.Reach = nil, nil, nil, 0
         return
-    end
-    if ML.Weapon ~= w.Name then
-        melRestoreHitbox()          -- hand the previous weapon back untouched
-        melHb, melHbOrig = nil, nil
     end
     ML.Weapon = w.Name
     local hb = w:FindFirstChild("Hitbox")
     if not hb then
-        melHb, melHbOrig, ML.Reach = nil, nil, 0
+        melHb, melHbSize, ML.Reach = nil, nil, 0
         return
     end
-    if melHb ~= hb then
-        melHb = hb
-        local ok, sz = pcall(function() return hb.Size end)
-        melHbOrig = ok and sz or nil
-    end
-    if melHbOrig then
-        ML.Reach = math.max(melHbOrig.X, melHbOrig.Y, melHbOrig.Z)
-        local want = ML.ExtendHb and (melHbOrig * ML.HbMul) or melHbOrig
-        local ok, cur = pcall(function() return hb.Size end)
-        if ok and cur ~= want then pcall(function() hb.Size = want end) end
+    melHb = hb
+    local ok, sz = pcall(function() return hb.Size end)
+    melHbSize = ok and sz or nil
+    if melHbSize then
+        ML.Reach = math.max(melHbSize.X, melHbSize.Y, melHbSize.Z)
     end
 end
 
@@ -2651,42 +2680,59 @@ task.spawn(function()
                 ML.State = "waiting for " .. string.upper(tostring(ML.Key))
             elseif (now - lastSwing) < ML.Cooldown then
                 ML.State = "cooldown"
-            end
+            else
+                ML.State = "ready"      -- never leave it stale: a frozen state
+            end                         -- reads as a failing check that is not failing
             if melHb and ML.Reach > 0 and melKeyHeld() and (now - lastSwing) >= ML.Cooldown then
                 local okp, origin = pcall(function() return melHb.Position end)
                 local cam = workspace.CurrentCamera
-                local okc, cf = cam and pcall(function() return cam.CFrame end)
-                if okp and origin and okc and cf then
+                local cf
+                if cam then
+                    local ok, v = pcall(function() return cam.CFrame end)
+                    if ok then cf = v end   -- NOT 'cam and pcall(...)': the 'and'
+                end                         -- truncates, leaving cf nil forever
+                if okp and origin and cf then
                     local look = cf.LookVector
                     local limit = ML.Reach + ML.RangePad
                     local arcCos = math.cos(math.rad(ML.Arc))
                     local hit = false
 
+                    -- Distance is measured to the target's SURFACE, not its centre.
+                    -- The hitbox is a swept box and Matcha exposes no overlap test
+                    -- (no Touched, no GetTouchingParts), so a hit is approximated
+                    -- as "the target's body is within reach". Measured while
+                    -- standing next to a zombie: 4.35 studs centre-to-centre with
+                    -- a 2.93 reach, so comparing centres refused every real hit.
+                    -- Nearest in-arc candidate, and its surface distance. The range
+                    -- test happens after, so prediction can be applied to it.
+                    local bestPart, bestSurf
                     local function consider(part)
-                        if hit then return end
                         local ok, pos = pcall(function() return part.Position end)
                         if not ok or not pos then return end
                         local d = pos - origin
                         local m = d.Magnitude
-                        if m > limit or m <= 0 then return end
+                        if m <= 0 then return end
                         -- must be in front, since a swing only covers the arc ahead
                         if look:Dot(d * (1 / m)) < arcCos then return end
-                        hit = true
+                        local radius = 1.0
+                        local oks, sz = pcall(function() return part.Size end)
+                        if oks and sz then radius = math.max(sz.X, sz.Z) * 0.5 end
+                        local surf = m - radius
+                        if surf > limit + MEL_LOOKAHEAD then return end
+                        if not bestSurf or surf < bestSurf then
+                            bestPart, bestSurf = part, surf
+                        end
                     end
 
                     if ML.Zombies then
-                        for i = 1, #melZ do
-                            if hit then break end
-                            consider(melZ[i])
-                        end
+                        for i = 1, #melZ do consider(melZ[i]) end
                     end
-                    if ML.Players and not hit then
+                    if ML.Players then
                         local P = svcPlayers()
                         local lp = P and P.LocalPlayer
                         local lpId = lp and lp.UserId
                         if P then
                             for _, pl in ipairs(P:GetPlayers()) do
-                                if hit then break end
                                 if pl.UserId ~= lpId then
                                     local okc2, pch = pcall(function() return pl.Character end)
                                     local r = (okc2 and pch) and pch:FindFirstChild("HumanoidRootPart") or nil
@@ -2696,10 +2742,41 @@ task.spawn(function()
                         end
                     end
 
+                    -- ---- swing prediction ----
+                    -- Damage lands at the far point of the swing, not when the
+                    -- swing starts, so committing only once the target is already
+                    -- inside reach means the hit arrives late - by then a closing
+                    -- target has walked past you, and a fleeing one is gone.
+                    -- Closing RATE is tracked rather than velocity, because the
+                    -- rate of change of distance already accounts for both your
+                    -- movement and theirs, and Velocity is unsupported in Matcha.
+                    local effective = bestSurf
+                    if bestPart and bestSurf then
+                        if melTrackPart ~= bestPart then
+                            melTrackPart, melTrackSurf, melTrackRate = bestPart, bestSurf, 0
+                            melTrackAt = now
+                        else
+                            local dt = now - melTrackAt
+                            if dt >= 0.03 then
+                                local raw = (bestSurf - melTrackSurf) / dt
+                                melTrackRate = melTrackRate * 0.5 + raw * 0.5
+                                melTrackSurf, melTrackAt = bestSurf, now
+                            end
+                        end
+                        ML.Closing = -melTrackRate
+                        if ML.Predict then
+                            -- where it will be when the blade actually arrives
+                            effective = bestSurf + melTrackRate * ML.Windup
+                            if effective < 0 then effective = 0 end
+                        end
+                    end
+                    hit = (effective ~= nil) and (effective <= limit)
+
                     if hit and mouse1click then
                         pcall(function() mouse1click() end)
                         lastSwing = now
                         ML.State = "swinging"
+                        melKeepSprint()
                     else
                         ML.State = hit and "no mouse1click" or "nothing in reach"
                     end
@@ -2708,7 +2785,23 @@ task.spawn(function()
         end
         task.wait(0.03)
     end
-    melRestoreHitbox()
+end)
+
+-- Your own clicks cancel sprint too, so watch the real mouse button as well.
+-- Only acts while a melee is equipped, so it never interferes with shooting.
+task.spawn(function()
+    local was = false
+    while _G.AR2HUB_GEN == GEN do
+        if ML.KeepSprint and melHb then
+            local ok, down = pcall(function() return iskeypressed(0x01) end)
+            down = (ok and down) and true or false
+            if down and not was then melKeepSprint() end
+            was = down
+        else
+            was = false
+        end
+        task.wait(0.03)
+    end
 end)
 
 task.spawn(function()
@@ -2716,10 +2809,12 @@ task.spawn(function()
         pcall(function()
             if not ML.Weapon then
                 melInfo:SetText("no melee equipped")
+                melPredInfo:SetText("closing: -")
             else
-                melInfo:SetText(string.format("%s - reach %.2f studs%s%s", ML.Weapon, ML.Reach,
-                    ML.ExtendHb and string.format(" (hitbox x%.2f)", ML.HbMul) or "",
+                melInfo:SetText(string.format("%s - reach %.2f studs%s", ML.Weapon, ML.Reach,
                     (ML.Enabled and ML.State) and ("  |  " .. ML.State) or ""))
+                melPredInfo:SetText(string.format("closing at %.1f studs/s  ->  swings %.2f studs early",
+                    ML.Closing or 0, math.max(0, (ML.Closing or 0) * ML.Windup)))
             end
         end)
         task.wait(0.4)
