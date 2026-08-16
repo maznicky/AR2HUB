@@ -2493,13 +2493,13 @@ end)
 _G.MELEE = _G.MELEE or {}
 local ML = _G.MELEE
 ML.Enabled   = false
-ML.HoldOnly  = (ML.HoldOnly ~= false)      -- default: only while holding the key
+ML.KeyMode   = dropStr(ML.KeyMode, "Hold") -- "Hold" | "Toggle" | "Always"
+ML.Armed     = ML.Armed == true            -- used by Toggle mode
 ML.Key       = ML.Key or "v"
 ML.Players   = ML.Players == true
 ML.Zombies   = (ML.Zombies ~= false)
 ML.Cooldown  = ML.Cooldown or 0.6
-ML.RangePad  = ML.RangePad or 1            -- extra studs on the CHECK only
-ML.Arc       = ML.Arc or 60                -- degrees in front that counts
+ML.FrontOnly = (ML.FrontOnly ~= false)     -- ignore targets behind you
 ML.KeepSprint = (ML.KeepSprint ~= false)   -- re-press shift after a swing
 ML.SprintDelay = 0.02                      -- measured as the value that works
 ML.Predict   = (ML.Predict ~= false)       -- swing early so the hit lands on time
@@ -2512,6 +2512,13 @@ local MEL_REFRESH = 0.4        -- how often to re-resolve the equipped weapon
 local MEL_LOOKAHEAD = 8        -- studs beyond reach still worth tracking, so a
                                -- closing target is already being measured when
                                -- the prediction needs its closing rate
+-- Fixed allowance on the range check, in studs. It exists because the check
+-- approximates a swept hitbox with a distance test, and it is not a user knob
+-- because there is no intuitive way to describe it. 1 stud was measured as the
+-- value that makes normal adjacency register.
+local MEL_PAD = 1.0
+local MEL_ARC_FRONT = 70       -- degrees counted as "in front of you"
+local MEL_ARC_ANY   = 180
 local melKeyHandle
 local melTrackPart, melTrackSurf, melTrackRate, melTrackAt = nil, 0, 0, 0
 
@@ -2523,14 +2530,15 @@ local melPred = melsub:Section("Swing Prediction", "Full")
 
 melSec:Toggle("Auto Melee", false, function(v) ML.Enabled = v end,
     "Swings automatically when something you have selected is inside the weapon's own reach and in front of you.")
-melSec:Toggle("Only While Holding Key", true, function(v) ML.HoldOnly = v end,
-    "Strongly recommended. With this off it swings at anything in range the moment it comes close.")
-melKeyHandle = melSec:Keybind("Melee Key (hold)", "v", function(k) ML.Key = k end)
+melSec:Dropdown("Key Mode", "Hold", {"Hold", "Toggle", "Always"}, false,
+    function(v) ML.KeyMode = dropStr(v, "Hold") end,
+    "Hold: only swings while you hold the key. Toggle: tap the key to switch it on, tap again for off. Always: no key needed, swings at anything in range.")
+melKeyHandle = melSec:Keybind("Melee Key", "v", function(k) ML.Key = k end)
 
 melTgt:Toggle("Target Zombies", true, function(v) ML.Zombies = v end)
 melTgt:Toggle("Target Players", false, function(v) ML.Players = v end)
-melTgt:Slider("Swing Arc", 60, 5, 10, 180, " deg", function(v) ML.Arc = v end,
-    "How far off centre a target may be and still be swung at. The real swing only covers what is in front of you.")
+melTgt:Toggle("Only Hit What's In Front Of You", true, function(v) ML.FrontOnly = v end,
+    "On: ignores anything behind or beside you, because a real swing only reaches forward. Off: swings at anything close, even behind you.")
 
 melTune:Slider("Cooldown", 0.6, 0.05, 0.1, 2.0, " s", function(v) ML.Cooldown = v end,
     "Minimum gap between swings. The weapon's real cooldown is not readable, so tune this by feel; too fast just wastes clicks.")
@@ -2538,8 +2546,6 @@ melTune:Toggle("Keep Sprint When Swinging", true, function(v) ML.KeepSprint = v 
     "Swinging drops you to a walk. This re-presses shift straight after the swing, exactly as you would by hand, so you keep running. Works for your own clicks as well as auto swings.")
 melTune:Slider("Sprint Re-press Delay", 0.02, 0.01, 0.01, 0.4, " s", function(v) ML.SprintDelay = v end,
     "How long to wait after the swing before re-pressing shift. Too early and the swing cancels it again; too late and you walk for a moment.")
-melTune:Slider("Range Padding", 1, 0.25, 0, 6, " studs", function(v) ML.RangePad = v end,
-    "Adds to the in-range CHECK only, on top of the target's own body radius. It does not make the weapon reach further - it just lets it start swinging slightly early. Raise it if swings start too late.")
 
 melPred:Toggle("Predict Swing", true, function(v) ML.Predict = v end,
     "Damage lands at the far point of the swing, not when it starts. This swings early by the windup time so the blade arrives as the target reaches you, instead of hitting where it used to be.")
@@ -2581,8 +2587,7 @@ end
 
 -- ---- key state, same dual approach as the aimbot ----
 local MEL_VK = { m1=0x01, m2=0x02, shift=0x10, ctrl=0x11, alt=0x12, space=0x20, tab=0x09 }
-local function melKeyHeld()
-    if not ML.HoldOnly then return true end
+local function melRawKeyDown()
     if melKeyHandle then
         local ok, v = pcall(function() return melKeyHandle:IsActivated() end)
         if ok and v then return true end
@@ -2598,6 +2603,22 @@ local function melKeyHeld()
         if ok and d then return true end
     end
     return false
+end
+
+-- Hold: active while the key is down. Toggle: press once to arm, again to
+-- disarm. Always: no key at all.
+local melKeyWas = false
+local function melKeyHeld()
+    local mode = ML.KeyMode
+    if mode == "Always" then return true end
+    local down = melRawKeyDown()
+    if mode == "Toggle" then
+        if down and not melKeyWas then ML.Armed = not ML.Armed end
+        melKeyWas = down
+        return ML.Armed == true
+    end
+    melKeyWas = down
+    return down
 end
 
 -- ---- equipped weapon, resolved on a timer because FindFirstChild is 0.71 ms ----
@@ -2618,12 +2639,14 @@ local function melResolve(now)
         melHb, melHbSize, ML.Weapon, ML.Reach = nil, nil, nil, 0
         return
     end
-    ML.Weapon = w.Name
     local hb = w:FindFirstChild("Hitbox")
     if not hb then
-        melHb, melHbSize, ML.Reach = nil, nil, 0
+        -- held item with no Hitbox is not a melee weapon at all (a bandage, a
+        -- gun, a map), so report nothing rather than "reach 0.00"
+        melHb, melHbSize, ML.Weapon, ML.Reach = nil, nil, nil, 0
         return
     end
+    ML.Weapon = w.Name
     melHb = hb
     local ok, sz = pcall(function() return hb.Size end)
     melHbSize = ok and sz or nil
@@ -2674,16 +2697,20 @@ task.spawn(function()
         melResolve(now)
         if ML.Enabled then
             if ML.Zombies then melZombieStep(now) end
+            -- evaluated ONCE per tick: in Toggle mode this edge-detects the key,
+            -- so calling it twice would flip the state twice on a single press
+            local active = melKeyHeld()
             if not melHb then
                 ML.State = "no melee equipped"
-            elseif not melKeyHeld() then
-                ML.State = "waiting for " .. string.upper(tostring(ML.Key))
+            elseif not active then
+                ML.State = (ML.KeyMode == "Toggle") and ("off - tap " .. string.upper(tostring(ML.Key)))
+                           or ("waiting for " .. string.upper(tostring(ML.Key)))
             elseif (now - lastSwing) < ML.Cooldown then
                 ML.State = "cooldown"
             else
                 ML.State = "ready"      -- never leave it stale: a frozen state
             end                         -- reads as a failing check that is not failing
-            if melHb and ML.Reach > 0 and melKeyHeld() and (now - lastSwing) >= ML.Cooldown then
+            if melHb and ML.Reach > 0 and active and (now - lastSwing) >= ML.Cooldown then
                 local okp, origin = pcall(function() return melHb.Position end)
                 local cam = workspace.CurrentCamera
                 local cf
@@ -2693,8 +2720,9 @@ task.spawn(function()
                 end                         -- truncates, leaving cf nil forever
                 if okp and origin and cf then
                     local look = cf.LookVector
-                    local limit = ML.Reach + ML.RangePad
-                    local arcCos = math.cos(math.rad(ML.Arc))
+                    local limit = ML.Reach + MEL_PAD
+                    local arcCos = math.cos(math.rad(
+                        ML.FrontOnly and MEL_ARC_FRONT or MEL_ARC_ANY))
                     local hit = false
 
                     -- Distance is measured to the target's SURFACE, not its centre.
