@@ -2959,6 +2959,140 @@ task.spawn(function()
         task.wait(0.4)
     end
 end)
+
+-- ==================== Handling (Gun Mods) ====================
+-- Found by a getgc sweep of candidate key names (3,191 entries in 50s):
+--   FireRate       99 entries, 95 numeric   e.g. 700, 830, 330, 530  (RPM)
+--   ReloadTime      5 entries,  5 numeric   e.g. 0.85, 0.75, 2.65    (seconds)
+--   MuzzleVelocity 111 entries              e.g. 2090-3580 studs/s
+--   Spread       2692 entries               a much larger set than SpreadBase
+-- Sway, shake, breathing and zoom keys do not exist under any name tried, so
+-- weapon sway is not a config value in this game.
+--
+-- These are SCALED, not zeroed, so the write path differs from No Spread/Recoil:
+-- every write is derived from the ORIGINAL captured value, never from the live
+-- one, otherwise toggling twice compounds the multiplier.
+--
+-- UNTESTED. Whether the client honours any of them is unknown - the server may
+-- rate-limit shots and time reloads itself, in which case these do nothing.
+-- Test one at a time, and expect Fast Fire to be the most likely to be refused.
+local __oldHandling = _G.HANDLING
+_G.HANDLING = {
+    Prepared  = false,
+    Scanning  = false,
+    Cache     = nil,
+    Originals = {},          -- addr -> captured value
+    FireMul   = 2,
+    ReloadDiv = 2,
+    VelMul    = 2,
+    Keys      = { "FireRate", "ReloadTime", "MuzzleVelocity" },
+}
+local HD = _G.HANDLING
+-- carry the scan across script reloads, like the combat cache
+if __oldHandling and __oldHandling.Prepared and __oldHandling.Cache then
+    HD.Cache     = __oldHandling.Cache
+    HD.Originals = __oldHandling.Originals or {}
+    HD.Prepared  = true
+    print("[handling] reusing prepared scan - no rescan needed")
+end
+__oldHandling = nil
+
+local hdSec  = gunsub:Section("Handling (experimental)", "Full")
+local hdLbl  = hdSec:Label("not prepared")
+
+local function hdStatus(s) pcall(function() hdLbl:SetText(s) end) end
+
+local function hdPrepare()
+    if HD.Scanning then return end
+    HD.Scanning = true
+    hdStatus("scanning... freezes ~50s, ONCE per session")
+    task.wait(0.1)
+    task.spawn(function()
+        local t0 = tick()
+        local ok, cache = pcall(function() return getgc(HD.Keys) end)
+        local secs = tick() - t0
+        if not ok or type(cache) ~= "table" or #cache == 0 then
+            HD.Scanning = false
+            hdStatus(string.format("scan failed after %.0fs", secs))
+            return
+        end
+        HD.Originals = {}
+        local counts = {}
+        for _, e in ipairs(cache) do
+            if e.addr and tostring(e.type) == "number" then
+                HD.Originals[e.addr] = tonumber(e.value) or 0
+                local k = tostring(e.key)
+                counts[k] = (counts[k] or 0) + 1
+            end
+        end
+        HD.Cache, HD.Prepared, HD.Scanning = cache, true, false
+        local bits = {}
+        for k, n in pairs(counts) do bits[#bits + 1] = string.format("%s %d", k, n) end
+        table.sort(bits)
+        hdStatus(string.format("ready in %.0fs - %s", secs, table.concat(bits, ", ")))
+        print("[handling] prepared: " .. table.concat(bits, ", "))
+    end)
+end
+
+-- Scaled write. `factor` multiplies the ORIGINAL value; factor 1 restores it.
+-- An address is only written if it still holds something we recognise - either
+-- the original, or a previously scaled version of it - so a recycled heap slot
+-- is skipped rather than corrupted. Same guard that protects No Recoil.
+local function hdApply(keyName, factor, label)
+    if not HD.Prepared then hdStatus("press Prepare first") return end
+    local function near(a, b)
+        if a == b then return true end
+        local m = math.max(math.abs(a), math.abs(b), 1)
+        return math.abs(a - b) / m < 0.02
+    end
+    local t0, written, skipped = tick(), 0, 0
+    for _, e in ipairs(HD.Cache) do
+        if e.addr and tostring(e.key) == keyName and tostring(e.type) == "number" then
+            local orig = HD.Originals[e.addr]
+            local okr, live = pcall(function() return memory_read("double", e.addr) end)
+            if orig and okr and type(live) == "number"
+               and (near(live, orig) or near(live, orig * factor)
+                    or near(live, orig * HD.FireMul) or near(live, orig / HD.ReloadDiv)
+                    or near(live, orig * HD.VelMul)) then
+                local okw = pcall(function() memory_write("double", e.addr, orig * factor) end)
+                if okw then written = written + 1 else skipped = skipped + 1 end
+            else
+                skipped = skipped + 1
+            end
+        end
+    end
+    hdStatus(string.format("%s x%.2f - %d written, %d skipped (%.0fms)",
+        label, factor, written, skipped, (tick() - t0) * 1000))
+    print(string.format("[handling] %s factor %.2f: %d written, %d skipped",
+        label, factor, written, skipped))
+end
+
+hdSec:Button("Prepare Handling Scan", function() hdPrepare() end,
+    "One getgc sweep for FireRate, ReloadTime and MuzzleVelocity. Freezes ~50s. Survives script reloads but not a Matcha restart.")
+hdSec:Label("Run once per join, with all three toggles OFF.")
+
+hdSec:Divider("Fire Rate")
+hdSec:Toggle("Fast Fire", false, function(on)
+    hdApply("FireRate", on and HD.FireMul or 1, "Fast Fire")
+end, "Multiplies each weapon's rounds-per-minute. If the server rate-limits shots this will do nothing - test it alone first.")
+hdSec:Slider("Fire Rate Multiplier", 2, 0.25, 1, 5, "x", function(v) HD.FireMul = v end,
+    "Try 1.5x before 5x. Values are real RPM, so 700 becomes 1400 at 2x.")
+
+hdSec:Divider("Reload")
+hdSec:Toggle("Fast Reload", false, function(on)
+    hdApply("ReloadTime", on and (1 / HD.ReloadDiv) or 1, "Fast Reload")
+end, "Divides reload durations. Only 5 entries were found, which suggests it covers loaded weapons only - re-Prepare after equipping something new if it has no effect.")
+hdSec:Slider("Reload Divider", 2, 0.25, 1, 5, "x faster", function(v) HD.ReloadDiv = v end)
+
+hdSec:Divider("Ballistics")
+hdSec:Toggle("Flat Trajectory", false, function(on)
+    hdApply("MuzzleVelocity", on and HD.VelMul or 1, "Muzzle Velocity")
+end, "Raises bullet speed, which flattens the arc and cuts the lead needed. Bullets are projectiles here - 2090 to 3580 studs/s - not hitscan as we first assumed.")
+hdSec:Slider("Velocity Multiplier", 2, 0.25, 1, 5, "x", function(v) HD.VelMul = v end)
+
+hdSec:Divider("Notes")
+hdSec:Label("Damage was found too (131 numeric) but is not exposed:")
+hdSec:Label("servers own damage, and inflating it is the most obvious tell.")
 -- ==================== Settings tab ====================
 -- INS-ui ships its own Settings tab. Enabling it gives Theme, Appearance,
 -- Interface (which already contains the "Menu key" bind that opens/closes this
