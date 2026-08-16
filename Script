@@ -2608,8 +2608,12 @@ task.spawn(function()
     local lastSwing = 0
     while _G.AR2HUB_GEN == GEN do
         local now = tick()
+        -- Resolved every tick regardless of Auto Melee, so the readout shows the
+        -- weapon and its reach as soon as you hold one, and so Extend Hitbox can
+        -- be used on its own. melResolve puts the hitbox back to its original
+        -- size whenever Extend Hitbox is off, so no separate restore is needed.
+        melResolve(now)
         if ML.Enabled then
-            melResolve(now)
             if melHb and ML.Reach > 0 and melKeyHeld() and (now - lastSwing) >= ML.Cooldown then
                 local okp, origin = pcall(function() return melHb.Position end)
                 local cam = workspace.CurrentCamera
@@ -2665,8 +2669,6 @@ task.spawn(function()
                     end
                 end
             end
-        else
-            melRestoreHitbox()
         end
         task.wait(0.03)
     end
