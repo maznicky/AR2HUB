@@ -30,6 +30,31 @@ unknown rather than guessing.
 A live box per player: name, distance, and their Primary / Secondary / Melee
 with attachments. Boxes appear and disappear as players join and leave.
 
+### Zombies
+Zombies are classified by what they actually carry, read from their Equipment
+folder, and coloured accordingly:
+
+| colour | meaning |
+|--------|---------|
+| orange | special - carries an exclusive gun, melee or backpack |
+| blue   | armed - an ordinary gun, melee or bag |
+| white  | normal - nothing worth taking |
+
+Categories toggle independently: **Special Guns**, **Special Melee**,
+**Special Backpacks**, **Armed**, **Normal**. All start off; `Toggle All Types`
+selects or clears everything.
+
+Special detection is a rule, not a list: any item whose name carries a `Mod1` /
+`Mod2` suffix counts, which covers every modified variant automatically. The
+handful of exclusives without a suffix (Patriot, SOCOM MK23, Garbage Bag, Heavy
+Survey bags, Military Duffel) are matched by name.
+
+**Items In World** lists every distinct gun and bag currently out there with
+counts, specials starred and listed first. If an exclusive shows up unstarred,
+the detection rules are missing it.
+
+The label shows the zombie type, its distance, and the notable item it carries.
+
 ### Vehicles
 ESP for every vehicle, coloured by **wheel condition**, which is what governs
 how drivable one is:
@@ -42,19 +67,15 @@ how drivable one is:
 
 Boats are always green - they have no wheels to lose. Gray means no reading yet.
 A label like `39% (3/4)` means only three of four wheels reported, so the figure
-is built from a subset.
+is built from a subset rather than the whole set.
 
 Types are grouped (Civilian, Utility, Law & Rescue, Military, Boats) and all
-start **off**; `Toggle All Types` selects or clears everything at once. Any
-vehicle type not in the built-in list gets a toggle added automatically under
-**Other**.
+start off; `Toggle All Types` selects or clears everything. Any vehicle type not
+in the built-in list gets a toggle added automatically under **Other**.
 
 The **Details** panel lists in-range vehicles of the types you have enabled,
-nearest first, with the full component breakdown: engine, body, fuel tank, fuel
-and glass. Those are informational only - they never affect the ESP colour.
-
-### Zombies
-Placeholder, not implemented.
+nearest first, with engine, body, fuel tank, fuel and glass condition. Those are
+informational only and never affect the ESP colour.
 
 ---
 
@@ -71,10 +92,15 @@ Hold **E** (rebindable) to aim at the nearest valid target.
 - **Distance** - ignore anything further away.
 - **Smoothness** - settling time, roughly 16 ms per unit.
 - **Sensitivity** - trim for the calibrated 0.002443 rad/count.
-- **Prediction** - aims ahead of a moving target, in studs, along its travel.
-  Fades to zero inside 15 m. These pistols are hitscan, so start at 0.
-- **Drop Prediction** - raises or lowers the aim point. The value is the lift at
-  100 m and scales with the square of range.
+- **Prediction** - three states:
+  - off: aim exactly where the target is, no lead at all
+  - on, Amount 0: tracking compensation only, so it stops trailing runners
+  - on, Amount above 0: that many studs of lead along the target's travel
+- **Drop Prediction** - raises or lowers the aim point. With **Scale With Range**
+  on it is the lift at 100 m and grows with the square of distance; with it off
+  it is a flat offset at every range, which is far easier to verify.
+- **Target Zombies** - testing only. Turn it off for real fights: a zombie near
+  your crosshair will outrank a player.
 
 **Requires Windows "Enhance pointer precision" to be OFF.**
 Settings → Bluetooth & devices → Mouse → Additional mouse settings → Pointer
@@ -91,8 +117,13 @@ scan (~30 s, the game freezes) and caches ~2,500 addresses. After that both
 toggles apply in about 2 ms and are fully reversible. The cache survives script
 reloads, so you only pay the freeze once per join.
 
-`Refresh cache` under Advanced is not normally needed - the addresses stay valid
-for the whole session, including across respawns and weapon swaps.
+Writes are verified before they land: an address is only written if it still
+holds the value that was captured. If more than a quarter of the cache no longer
+matches, the toggle refuses outright and asks you to run Prepare again, rather
+than writing into memory that has been reused.
+
+`Refresh cache` under Advanced is not normally needed - addresses stay valid for
+the whole session, including across respawns and weapon swaps.
 
 ---
 
@@ -127,6 +158,8 @@ Everything starts disabled; nothing scans until you toggle it on.
 
 Distances are shown in metres (studs / 2.75) to match Matcha's own ESP.
 
-The input watchdog exists because Matcha's Players handle can go stale
-mid-session. If that happens, player-based features idle and recover on their
-own rather than erroring, and you get a notification when the handle returns.
+Matcha's Players handle can go stale mid-session. When it does, player-based
+features idle and recover on their own instead of erroring, and the aimbot says
+so rather than silently tracking only zombies. The script also waits for the
+handle before loading the UI, because the menu cannot accept clicks if it is
+built while the handle is down.
