@@ -29,6 +29,19 @@ unknown rather than guessing.
 A live box per player: name, distance, and their Primary / Secondary / Melee
 with attachments.
 
+**Marked Players** - click a player's box to mark them:
+
+| mark | effect |
+|------|--------|
+| Whitelist | ignored completely - the aimbot and auto melee will not touch them |
+| Prioritise | red ESP so you can pick them out of a crowd |
+
+`Clear All Marks` wipes both lists. Marks also carry over to the map dots.
+
+**Player Corpse ESP** lists dead players. Red = the body still has gear on it,
+gray = already stripped, and the label says how many items are left. There's a
+toggle for showing only the ones worth walking to.
+
 ### Zombies
 Zombies are classified by what they actually carry
 
@@ -71,6 +84,45 @@ The **Details** panel lists in-range vehicles of the types you have enabled,
 nearest first, with engine, body, fuel tank, fuel and glass condition. Those are
 informational only and never affect the ESP color.
 
+### Map
+Draws dots onto the real in-game map - open it with **M** as normal.
+
+Players, zombies and vehicles each toggle separately, and all start off. Players
+keep their mark colour (prioritised show red), and zombies and vehicles keep the
+colours from their own tabs, wheel condition included.
+
+Zombie and vehicle dots reuse those tabs' caches, so their ESP needs to be on
+for the map to have anything to draw.
+
+Everything is positioned relative to your own marker, so panning and zooming the
+map are handled for you. Two extras worth knowing:
+
+- **Show My Own Dot** - off by default, it just sits on top of your real marker.
+- **Map Is Open (override)** - for when the map opens without the script
+  noticing, which would otherwise leave dots sat in the middle of your screen.
+- **Scale Trim** - only needed if dots drift from where things really are.
+
+### Loot
+
+**Loot ESP** marks searchable objects - drawers, lockers, cabinets, boxes, bags -
+and the kind of loot each one can roll. Each is a *chance* of loot, not a
+promise: what's actually inside doesn't exist until you open it, so whether a
+given box has anything in it can't be shown. Most objects roll several tables and
+only the categories you've enabled get named.
+
+Firearms, Ammo, Medical, Backpacks, Utility, Blueprint, MeleeWeapons and Vests
+start on. Consumables, Clothing, Hats, Belts, Accessories and VehicleParts start
+off - soda cans and student shirts are most of the map and would bury everything
+else.
+
+**Ground Items** marks items actually lying on the floor, including anything
+dropped by a player. These are real objects so the positions are exact.
+
+| label | meaning |
+|-------|---------|
+| green, exact name | close enough for the game to name it (roughly 10-15 studs) |
+| red / pink / white with a trailing `?` | further out - a guess from the item's shape: firearm, melee, or something else |
+
 ---
 
 ## Combat
@@ -96,6 +148,8 @@ Hold **E** (rebindable) to aim at the nearest valid target.
 - **Target Zombies** - testing only. Turn it off for real fights: a zombie near
   your crosshair will outrank a player.
 
+Whitelisted players are skipped entirely.
+
 **Requires Windows "Enhance pointer precision" to be OFF.**
 If you're having issues with the Aimbot try doing what I did:
 Settings → Bluetooth & devices → Mouse → Additional mouse settings → Pointer
@@ -111,6 +165,32 @@ reloads, so you only pay the freeze once per join.
 
 `Refresh cache` under Advanced is not normally needed - addresses stay valid for
 the whole session, including across respawns and weapon swaps.
+
+### Melee Mods
+**Auto Melee** swings only when something is actually within your weapon's reach,
+read from the melee you're currently holding - so a machete swings sooner than a
+pocket knife.
+
+- **Key Mode** - Hold, Toggle or Always. Default key is **V**.
+- **Targets** - zombies on, players off. Whitelisted players are never hit.
+- **Only Hit What's In Front Of You** - ignores anything behind you.
+- **Cooldown** - how often it's allowed to swing.
+- **Keep Sprint When Swinging** - swinging normally drops you out of sprint, so
+  this presses it again straight after.
+- **Predict Swing** - damage doesn't land when the swing starts, it lands near
+  the end of the animation. This starts the swing early based on how fast the
+  target is closing on you, so runners get hit instead of missed.
+
+Reach and cooldown themselves are the server's call, so nothing here makes your
+weapon longer or faster - it just times the swings better than a human can.
+
+### Movement
+**Dash** is a short burst in the direction you're facing, default **X**, with
+adjustable speed, duration and cooldown.
+
+Worth being aware: this is the most visible thing in the script, since the server
+does see you move. It's deliberately built as short bursts with a cooldown rather
+than constant speed.
 
 ---
 
@@ -134,6 +214,9 @@ Plus two script sections:
 |-----|--------|
 | P   | Open / close the menu |
 | E   | Hold to aim (rebindable) |
+| V   | Auto melee (rebindable, Hold / Toggle / Always) |
+| X   | Dash (rebindable) |
+| M   | The game's own map - Map ESP draws onto it |
 | F7  | Panic - kills the ESP and releases input |
 | F8  | Site Probe sweep (also runs automatically every 60 s) |
 
@@ -144,6 +227,9 @@ Plus two script sections:
 Everything starts disabled; nothing scans until you toggle it on.
 
 Distances are shown in meters (studs / 2.75) to match Matchas.
+
+Map ESP and the exact names on ground items read the game's own interface, so
+those two need **Hybrid mode** on. Everything else works without it.
 
 Matcha's Players handle can go stale mid-session (unless its the games anti-cheat i have no idea.)
 When it does, player-based features idle and recover on their own instead of erroring.
