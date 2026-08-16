@@ -2132,9 +2132,17 @@ task.spawn(function()
                     if n >= VEH_POOL then break end
                     local e = list[i]
                     if VE.Types[e.name] == true then
+                        -- The arithmetic is wrapped, not just the read: Matcha
+                        -- falls back to FindFirstChild for unsupported properties,
+                        -- so .Position can hand back an INSTANCE instead of a
+                        -- Vector3. That threw "Vector3Meta expected, got Instance"
+                        -- and silently killed the loop it happened in.
                         local ok, pos = pcall(function() return e.part.Position end)
+                        local okd, d = false, nil
                         if ok and pos then
-                            local d = (pos - cp).Magnitude
+                            okd, d = pcall(function() return (pos - cp).Magnitude end)
+                        end
+                        if okd and type(d) == "number" then
                             if d <= maxStuds then
                                 local pt, visible = toScreen(pos + Vector3.new(0, 3, 0))
                                 if visible then
@@ -2229,9 +2237,17 @@ task.spawn(function()
                 local maxStuds = VE.MaxM * E.DistanceDivisor
                 for _, e in ipairs(VE.Cache) do
                     if VE.Types[e.name] == true then
+                        -- The arithmetic is wrapped, not just the read: Matcha
+                        -- falls back to FindFirstChild for unsupported properties,
+                        -- so .Position can hand back an INSTANCE instead of a
+                        -- Vector3. That threw "Vector3Meta expected, got Instance"
+                        -- and silently killed the loop it happened in.
                         local ok, pos = pcall(function() return e.part.Position end)
+                        local okd, d = false, nil
                         if ok and pos then
-                            local d = (pos - cp).Magnitude
+                            okd, d = pcall(function() return (pos - cp).Magnitude end)
+                        end
+                        if okd and type(d) == "number" then
                             if d <= maxStuds then
                                 shortlist[#shortlist + 1] = { e = e, d = d }
                             end
@@ -2484,9 +2500,17 @@ task.spawn(function()
                     if n >= ZOMB_POOL then break end
                     local e = list[i]
                     if ZE.Show[e.cat] then
+                        -- The arithmetic is wrapped, not just the read: Matcha
+                        -- falls back to FindFirstChild for unsupported properties,
+                        -- so .Position can hand back an INSTANCE instead of a
+                        -- Vector3. That threw "Vector3Meta expected, got Instance"
+                        -- and silently killed the loop it happened in.
                         local ok, pos = pcall(function() return e.part.Position end)
+                        local okd, d = false, nil
                         if ok and pos then
-                            local d = (pos - cp).Magnitude
+                            okd, d = pcall(function() return (pos - cp).Magnitude end)
+                        end
+                        if okd and type(d) == "number" then
                             if d <= maxStuds then
                                 local pt, visible = toScreen(pos + Vector3.new(0, 2, 0))
                                 if visible then
@@ -2960,204 +2984,38 @@ task.spawn(function()
     end
 end)
 
--- ==================== Handling (Gun Mods) ====================
--- Found by a getgc sweep of candidate key names (3,191 entries in 50s):
---   FireRate       99 entries, 95 numeric   e.g. 700, 830, 330, 530  (RPM)
---   ReloadTime      5 entries,  5 numeric   e.g. 0.85, 0.75, 2.65    (seconds)
---   MuzzleVelocity 111 entries              e.g. 2090-3580 studs/s
---   Spread       2692 entries               a much larger set than SpreadBase
--- Sway, shake, breathing and zoom keys do not exist under any name tried, so
--- weapon sway is not a config value in this game.
+-- ==================== Player Corpse ESP (Visuals > Players) ====================
+-- workspace.Corpses holds the dead. Infected corpses are named "Infected...";
+-- a player corpse carries the player's own username - verified when my own body
+-- appeared in the list as "tootnickylol". Only player corpses are shown: zombie
+-- corpses were tried and were not worth the screen clutter.
+-- Corpses keep their Equipment folder, so the label reports how much loot is
+-- still on the body. Hybrid mode is NOT needed: plain DataModel reads.
 --
--- These are SCALED, not zeroed, so the write path differs from No Spread/Recoil:
--- every write is derived from the ORIGINAL captured value, never from the live
--- one, otherwise toggling twice compounds the multiplier.
---
--- ALL THREE HAVE NOW BEEN TESTED IN GAME, and none is worth using:
---   MuzzleVelocity  works locally, but the server simulates flight too, so a
---                   raised value makes hits arrive early client-side and get
---                   discarded. 5x visibly lost hits.
---   FireRate        fires faster, but the server enforces the real rate and
---                   drops the surplus. Same damage, double the ammo spent.
---   ReloadTime      no effect whatsoever. Server owns reload timing.
--- The pattern across all of them, plus the failed hitbox expansion and melee
--- reach tests: AR2 owns anything affecting damage, rate or geometry server-side.
--- What DOES work is client-side aim and dispersion - No Spread and No Recoil -
--- because those only change where your own shot goes, not what it is allowed
--- to do. Kept here so the findings are not lost and not retried.
-local __oldHandling = _G.HANDLING
-_G.HANDLING = {
-    Prepared  = false,
-    Scanning  = false,
-    Cache     = nil,
-    Originals = {},          -- addr -> captured value
-    FireMul   = 2,
-    ReloadDiv = 2,
-    VelMul    = 1.25,        -- capped low: the server simulates flight as well
-    Keys      = { "FireRate", "ReloadTime", "MuzzleVelocity" },
-}
-local HD = _G.HANDLING
--- carry the scan across script reloads, like the combat cache
-if __oldHandling and __oldHandling.Prepared and __oldHandling.Cache then
-    HD.Cache     = __oldHandling.Cache
-    HD.Originals = __oldHandling.Originals or {}
-    HD.Prepared  = true
-    print("[handling] reusing prepared scan - no rescan needed")
-end
-__oldHandling = nil
-
-local hdSec  = gunsub:Section("Handling (experimental)", "Full")
-local hdLbl  = hdSec:Label("not prepared")
-
-local function hdStatus(s) pcall(function() hdLbl:SetText(s) end) end
-
-local function hdPrepare()
-    if HD.Scanning then return end
-    HD.Scanning = true
-    hdStatus("scanning... freezes ~50s, ONCE per session")
-    task.wait(0.1)
-    task.spawn(function()
-        local t0 = tick()
-        local ok, cache = pcall(function() return getgc(HD.Keys) end)
-        local secs = tick() - t0
-        if not ok or type(cache) ~= "table" or #cache == 0 then
-            HD.Scanning = false
-            hdStatus(string.format("scan failed after %.0fs", secs))
-            return
-        end
-        HD.Originals = {}
-        local counts = {}
-        for _, e in ipairs(cache) do
-            if e.addr and tostring(e.type) == "number" then
-                HD.Originals[e.addr] = tonumber(e.value) or 0
-                local k = tostring(e.key)
-                counts[k] = (counts[k] or 0) + 1
-            end
-        end
-        HD.Cache, HD.Prepared, HD.Scanning = cache, true, false
-        local bits = {}
-        for k, n in pairs(counts) do bits[#bits + 1] = string.format("%s %d", k, n) end
-        table.sort(bits)
-        hdStatus(string.format("ready in %.0fs - %s", secs, table.concat(bits, ", ")))
-        print("[handling] prepared: " .. table.concat(bits, ", "))
-    end)
-end
-
--- Scaled write. `factor` multiplies the ORIGINAL value; factor 1 restores it.
--- An address is only written if it still holds something we recognise - either
--- the original, or a previously scaled version of it - so a recycled heap slot
--- is skipped rather than corrupted. Same guard that protects No Recoil.
-local function hdApply(keyName, factor, label)
-    if not HD.Prepared then hdStatus("press Prepare first") return end
-    local function near(a, b)
-        if a == b then return true end
-        local m = math.max(math.abs(a), math.abs(b), 1)
-        return math.abs(a - b) / m < 0.02
-    end
-    local t0, written, skipped = tick(), 0, 0
-    for _, e in ipairs(HD.Cache) do
-        if e.addr and tostring(e.key) == keyName and tostring(e.type) == "number" then
-            local orig = HD.Originals[e.addr]
-            local okr, live = pcall(function() return memory_read("double", e.addr) end)
-            if orig and okr and type(live) == "number"
-               and (near(live, orig) or near(live, orig * factor)
-                    or near(live, orig * HD.FireMul) or near(live, orig / HD.ReloadDiv)
-                    or near(live, orig * HD.VelMul)) then
-                local okw = pcall(function() memory_write("double", e.addr, orig * factor) end)
-                if okw then written = written + 1 else skipped = skipped + 1 end
-            else
-                skipped = skipped + 1
-            end
-        end
-    end
-    hdStatus(string.format("%s x%.2f - %d written, %d skipped (%.0fms)",
-        label, factor, written, skipped, (tick() - t0) * 1000))
-    print(string.format("[handling] %s factor %.2f: %d written, %d skipped",
-        label, factor, written, skipped))
-end
-
-hdSec:Button("Prepare Handling Scan", function() hdPrepare() end,
-    "One getgc sweep for FireRate, ReloadTime and MuzzleVelocity. Freezes ~50s. Survives script reloads but not a Matcha restart.")
-hdSec:Label("Run once per join, with all three toggles OFF.")
-
-hdSec:Divider("Fire Rate")
-hdSec:Label("TESTED: fires faster, but only SOME rounds register.")
-hdSec:Label("The server enforces the real rate and discards the rest,")
-hdSec:Label("so damage output stays about the same while every shot")
-hdSec:Label("still costs ammo. Faster feel, no more damage, 2x the ammo.")
-hdSec:Toggle("Fast Fire", false, function(on)
-    hdApply("FireRate", on and HD.FireMul or 1, "Fast Fire")
-end, "Multiplies rounds-per-minute. Tested: the extra shots are discarded server-side, so this trades ammo for nothing. Left in only because the write itself works.")
-hdSec:Slider("Fire Rate Multiplier", 1.5, 0.25, 1, 3, "x", function(v) HD.FireMul = v end,
-    "Values are real RPM, so 700 becomes 1050 at 1.5x. Capped at 3x since surplus rounds do not land anyway.")
-
-hdSec:Divider("Reload")
-hdSec:Label("TESTED: no effect at all. The values change (0.85 -> 0.42")
-hdSec:Label("confirmed in memory) but reloads take just as long, so the")
-hdSec:Label("server owns reload timing entirely. Nothing to gain here.")
-hdSec:Toggle("Fast Reload", false, function(on)
-    hdApply("ReloadTime", on and (1 / HD.ReloadDiv) or 1, "Fast Reload")
-end, "Tested and confirmed useless: the write lands but the server times reloads itself.")
-hdSec:Slider("Reload Divider", 2, 0.25, 1, 5, "x faster", function(v) HD.ReloadDiv = v end)
-
-hdSec:Divider("Ballistics")
-hdSec:Label("TESTED: works, but the SERVER simulates flight too.")
-hdSec:Label("Raising it makes your client show the round arriving")
-hdSec:Label("before the server's does, and those hits are discarded.")
-hdSec:Label("5x dropped hits noticeably. Keep it low or leave it off.")
-hdSec:Toggle("Flat Trajectory", false, function(on)
-    hdApply("MuzzleVelocity", on and HD.VelMul or 1, "Muzzle Velocity")
-end, "Raises bullet speed, cutting the lead needed at range. Bullets really are projectiles here (median 3440 studs/s), but the server tracks them independently, so a large multiplier trades registered hits for less lead. Rarely worth it.")
-hdSec:Slider("Velocity Multiplier", 1.25, 0.05, 1, 2, "x", function(v) HD.VelMul = v end,
-    "Capped at 2x because 5x visibly lost hits. Even 1.25x only saves about a quarter of a stud of lead at 300 studs, so the honest answer is that this toggle is mostly not worth using.")
-
-hdSec:Divider("Notes")
-hdSec:Label("Damage was found too (131 numeric) but is not exposed:")
-hdSec:Label("servers own damage, and inflating it is the most obvious tell.")
-
--- ==================== Corpse ESP + Anti-Zombie (Visuals > Zombies) ====================
--- workspace.Corpses holds the dead. Every one seen so far is named "Infected..."
--- (14 of 14), and several still carry an Equipment folder with 1-2 items - so a
--- corpse is a loot container, not just a death marker. Anything NOT named
--- Infected is treated as a player corpse; unverified, since no player has died
--- nearby during testing. Hybrid mode is NOT needed: plain DataModel reads.
---
--- IMPORTANT: this block deliberately uses almost no top-level locals. The main
--- chunk sits at Luau's 200 local-register limit, and adding ~10 more here failed
--- with "Out of local registers". State and UI handles hang off the _G tables
--- instead, and anything else lives inside the task.spawn closures. Any future
--- feature block must be written the same way.
+-- Almost no top-level locals: the main chunk is at Luau's 200 register limit,
+-- so state and UI handles hang off _G.CORPSE.
 do
-_G.CORPSE   = _G.CORPSE or {}
-_G.ANTIZOMB = _G.ANTIZOMB or {}
-local CO, AZ = _G.CORPSE, _G.ANTIZOMB
-
+_G.CORPSE = _G.CORPSE or {}
+local CO = _G.CORPSE
 CO.Enabled  = false
-CO.Zombie   = (CO.Zombie ~= false)
-CO.Player   = (CO.Player ~= false)
 CO.LootOnly = CO.LootOnly == true
-CO.MaxM     = CO.MaxM or 400
+CO.MaxM     = CO.MaxM or 600
 CO.Live     = CO.Live or {}
 CO.At       = 0
-CO.POOL     = 24
+CO.POOL     = 12
 CO.col = {
-    loot   = C( 80, 230, 120),   -- still carrying equipment
-    empty  = C(165, 170, 180),   -- stripped
-    player = C(235,  80,  80),   -- a player, not an infected
+    loot  = C(235,  80,  80),   -- red: a player body, still carrying
+    empty = C(165, 170, 180),   -- gray: already stripped
 }
 
 CO.ui = {}
-CO.ui.sec = zombietab:Section("Corpse ESP", "Full")
-CO.ui.sec:Toggle("Corpse ESP", false, function(v) CO.Enabled = v end,
-    "Corpses keep their Equipment, so this doubles as a loot marker. Green = still has items, gray = stripped, red = a player corpse.")
-CO.ui.sec:Toggle("Infected Corpses", true, function(v) CO.Zombie = v end)
-CO.ui.sec:Toggle("Player Corpses", true, function(v) CO.Player = v end)
-CO.ui.sec:Toggle("Only Show Ones With Loot", false, function(v) CO.LootOnly = v end)
-CO.ui.sec:Slider("Distance", 400, 25, 25, 3000, " m", function(v) CO.MaxM = v end)
+CO.ui.sec = playertab:Section("Player Corpse ESP", "Full")
+CO.ui.sec:Toggle("Player Corpse ESP", false, function(v) CO.Enabled = v end,
+    "Marks dead players. Corpses keep their Equipment, so this doubles as a loot marker: red = still carrying, gray = stripped.")
+CO.ui.sec:Toggle("Only Ones With Loot", false, function(v) CO.LootOnly = v end)
+CO.ui.sec:Slider("Distance", 600, 25, 25, 3000, " m", function(v) CO.MaxM = v end)
 CO.ui.info = CO.ui.sec:Label("-")
 
--- Corpses is a small folder (14), so a full resolve costs about 10 ms and can
--- run on a timer instead of incrementally like the zombie sweep.
 CO.rebuild = function(now)
     if (now - CO.At) < 1.0 then return end
     CO.At = now
@@ -3165,26 +3023,23 @@ CO.rebuild = function(now)
     local out = {}
     if folder then
         for _, c in ipairs(folder:GetChildren()) do
-            local part = c:FindFirstChild("Head") or c:FindFirstChild("HumanoidRootPart")
-            if part then
-                local eq = c:FindFirstChild("Equipment")
-                local items, loot = 0, nil
-                if eq then
-                    for _, it in ipairs(eq:GetChildren()) do
-                        items = items + 1
-                        local g = string.match(it.Name, "^Backpack Firearm (.+)$")
-                               or string.match(it.Name, "^Belt Firearm (.+)$")
-                               or string.match(it.Name, "^Backpack (.+)$")
-                        if g and not loot then loot = g end
+            -- players only: anything named Infected... is a zombie body
+            if string.find(c.Name, "^Infected") == nil then
+                local part = c:FindFirstChild("Head") or c:FindFirstChild("HumanoidRootPart")
+                if part then
+                    local eq = c:FindFirstChild("Equipment")
+                    local items, loot = 0, nil
+                    if eq then
+                        for _, it in ipairs(eq:GetChildren()) do
+                            items = items + 1
+                            local g = string.match(it.Name, "^Backpack Firearm (.+)$")
+                                   or string.match(it.Name, "^Belt Firearm (.+)$")
+                                   or string.match(it.Name, "^Backpack (.+)$")
+                            if g and not loot then loot = g end
+                        end
                     end
+                    out[#out + 1] = { part = part, name = c.Name, items = items, loot = loot }
                 end
-                out[#out + 1] = {
-                    part   = part,
-                    name   = c.Name,
-                    player = (string.find(c.Name, "^Infected") == nil),
-                    items  = items,
-                    loot   = loot,
-                }
             end
         end
     end
@@ -3206,28 +3061,33 @@ task.spawn(function()
     while _G.AR2HUB_GEN == GEN do
         local n = 0
         if CO.Enabled then
-            local now = tick()
-            CO.rebuild(now)
+            CO.rebuild(tick())
             local cp = camPos()
             if cp then
                 local maxStuds = CO.MaxM * E.DistanceDivisor
                 for i = 1, #CO.Live do
                     if n >= CO.POOL then break end
                     local e = CO.Live[i]
-                    local wanted = (e.player and CO.Player) or ((not e.player) and CO.Zombie)
-                    if wanted and (not CO.LootOnly or e.items > 0) then
+                    if (not CO.LootOnly) or e.items > 0 then
+                        -- The arithmetic is wrapped, not just the read: Matcha
+                        -- falls back to FindFirstChild for unsupported properties,
+                        -- so .Position can hand back an INSTANCE instead of a
+                        -- Vector3. That threw "Vector3Meta expected, got Instance"
+                        -- and silently killed the loop it happened in.
                         local ok, pos = pcall(function() return e.part.Position end)
+                        local okd, d = false, nil
                         if ok and pos then
-                            local d = (pos - cp).Magnitude
+                            okd, d = pcall(function() return (pos - cp).Magnitude end)
+                        end
+                        if okd and type(d) == "number" then
                             if d <= maxStuds then
                                 local pt, vis = toScreen(pos + Vector3.new(0, 1, 0))
                                 if vis then
                                     n = n + 1
                                     local o = pool[n]
-                                    local col = e.player and CO.col.player
-                                             or (e.items > 0 and CO.col.loot or CO.col.empty)
+                                    local col = (e.items > 0) and CO.col.loot or CO.col.empty
                                     o.ring.Position = pt; o.ring.Color = col; o.ring.Visible = true
-                                    o.name.Text = e.name
+                                    o.name.Text = e.name .. " (body)"
                                     o.name.Position = Vector2.new(pt.X, pt.Y - 26)
                                     o.name.Color = STYLE.name; o.name.Visible = true
                                     local detail = metres(d) .. E.DistanceUnit
@@ -3247,14 +3107,9 @@ task.spawn(function()
                     end
                 end
             end
-            local withLoot, players = 0, 0
-            for _, e in ipairs(CO.Live) do
-                if e.items > 0 then withLoot = withLoot + 1 end
-                if e.player then players = players + 1 end
-            end
             pcall(function()
-                CO.ui.info:SetText(string.format("%d corpses - %d with loot, %d player",
-                    #CO.Live, withLoot, players))
+                CO.ui.info:SetText((#CO.Live == 0) and "no player corpses"
+                    or string.format("%d player corpse%s", #CO.Live, (#CO.Live == 1) and "" or "s"))
             end)
         end
         for i = n + 1, CO.POOL do
@@ -3270,55 +3125,338 @@ task.spawn(function()
         pcall(function() pool[i].sub:Remove() end)
     end
 end)
+end
+-- ==================== Movement (Combat > Movement) ====================
+-- Everything here rides on ONE verified mechanism: writes to
+-- HumanoidRootPart.AssemblyLinearVelocity apply. Measured live:
+--   * (0,60,0) lifted Y from 60.05 to 68.34, then fell back under gravity
+--   * writing (0,99,0) read back as (0,97,0), so the write lands
+--   * 140 studs/s held for 0.24s moved 39.6 studs, and 1.5s later the position
+--     was still 45.5 studs from the start - no snap-back, no rubber-band
+-- What does NOT work, both tested: HumanoidRootPart.CFrame writes are silently
+-- discarded (so no teleporting), and workspace:Raycast always returns nil even
+-- straight down onto solid ground (so no ground checks - which is why fall
+-- protection clamps speed instead of predicting impact).
+--
+-- Hybrid mode is NOT required: these are ordinary property writes.
+--
+-- RISK NOTE, deliberately in the file and in the panel: this is the most
+-- externally visible thing in the script. No Spread only changes where your own
+-- bullet goes; this moves your character in ways the server sees. Bursts with
+-- gaps are used rather than sustained speed, since sustained velocity is the
+-- obvious shape for a movement check to catch.
+--
+-- Written with almost no top-level locals: the main chunk is at Luau's 200
+-- register limit, so state and UI handles hang off _G.MOVE.
+do
+_G.MOVE = _G.MOVE or {}
+local MV = _G.MOVE
 
--- ---------------- anti-zombie (experimental) ----------------
--- Aggro state lives in values under a child named "Animator": AgroPercent,
--- AgroState ("Wandering"), MoveState. All three accept writes; TargetPosition
--- refuses. Whether writing them changes BEHAVIOUR is the open question - if the
--- server drives zombie AI these are replicated readouts and this does nothing.
-AZ.Enabled = false
-AZ.RangeM  = AZ.RangeM or 60
-AZ.ui = {}
-AZ.ui.sec = zombietab:Section("Anti-Zombie (experimental)", "Full")
-AZ.ui.sec:Label("Writes AgroPercent 0 / AgroState Wandering on nearby")
-AZ.ui.sec:Label("zombies. UNTESTED: if the server drives their AI this")
-AZ.ui.sec:Label("does nothing, because these values are only readouts.")
-AZ.ui.sec:Toggle("Suppress Aggro", false, function(v) AZ.Enabled = v end)
-AZ.ui.sec:Slider("Range", 60, 5, 10, 300, " m", function(v) AZ.RangeM = v end)
-AZ.ui.info = AZ.ui.sec:Label("idle")
+MV.DashOn   = false
+MV.Key      = MV.Key or "x"
+MV.Speed    = MV.Speed or 140          -- studs/sec during the burst
+MV.Time     = MV.Time or 0.24          -- burst length, seconds
+MV.CD       = MV.CD or 1.0             -- cooldown between bursts
+MV.Lift     = MV.Lift or 4             -- small upward component, clears kerbs
+MV.State    = "off"
+MV.LastDash = 0
+MV.LastDist = 0
+MV.VK = { m1=0x01, m2=0x02, shift=0x10, ctrl=0x11, alt=0x12, space=0x20, tab=0x09 }
 
+MV.ui = {}
+MV.ui.sub = combattab:Sub("Movement", "zap")
+MV.ui.dashSec = MV.ui.sub:Section("Dash", "Full")
+MV.ui.dashSec:Label("Velocity bursts, not teleports: CFrame writes are ignored")
+MV.ui.dashSec:Label("by this game. This IS visible to the server - the most")
+MV.ui.dashSec:Label("conspicuous thing in the script. Bursts + cooldown keep")
+MV.ui.dashSec:Label("it away from the shape a movement check looks for.")
+MV.ui.dashSec:Toggle("Enable Dash", false, function(v) MV.DashOn = v end)
+MV.ui.key = MV.ui.dashSec:Keybind("Dash Key", "x", function(k) MV.Key = k end)
+MV.ui.dashSec:Slider("Dash Speed", 140, 10, 40, 300, " studs/s", function(v) MV.Speed = v end,
+    "140 for 0.24s measured 39.6 studs with no correction. Higher is further but more obvious.")
+MV.ui.dashSec:Slider("Dash Duration", 0.24, 0.02, 0.06, 0.5, " s", function(v) MV.Time = v end)
+MV.ui.dashSec:Slider("Cooldown", 1.0, 0.1, 0.2, 3, " s", function(v) MV.CD = v end,
+    "Gaps between bursts matter more than burst size for staying unremarkable.")
+MV.ui.dashInfo = MV.ui.dashSec:Label("off")
+
+
+-- resolves the dash key the same way the aimbot and melee do: the lib handle
+-- first, then a raw iskeypressed fallback so it works with the menu closed
+MV.keyDown = function()
+    if MV.ui.key then
+        local ok, v = pcall(function() return MV.ui.key:IsActivated() end)
+        if ok and v then return true end
+    end
+    local k = string.lower(tostring(MV.Key or ""))
+    local vk = MV.VK[k]
+    if not vk and #k == 1 then
+        local b = string.byte(string.upper(k))
+        if b >= 48 and b <= 90 then vk = b end
+    end
+    if vk and iskeypressed then
+        local ok, d = pcall(function() return iskeypressed(vk) end)
+        if ok and d then return true end
+    end
+    return false
+end
+
+MV.root = function()
+    local ok, P = pcall(function() return game:GetService("Players") end)
+    local lp = (ok and P) and P.LocalPlayer or nil
+    local ch = lp and lp.Character
+    return ch and ch:FindFirstChild("HumanoidRootPart") or nil
+end
+
+-- dash
+task.spawn(function()
+    local was = false
+    while _G.AR2HUB_GEN == GEN do
+        if MV.DashOn then
+            local now = tick()
+            local down = MV.keyDown()
+            if down and not was and (now - MV.LastDash) >= MV.CD then
+                local hrp = MV.root()
+                local cam = workspace.CurrentCamera
+                local cf
+                if cam then
+                    local ok, v = pcall(function() return cam.CFrame end)
+                    if ok then cf = v end
+                end
+                if hrp and cf then
+                    local look = cf.LookVector
+                    local flat = Vector3.new(look.X, 0, look.Z)
+                    if flat.Magnitude > 0.01 then
+                        flat = flat / flat.Magnitude
+                        MV.LastDash = now
+                        local from = hrp.Position
+                        MV.State = "dashing"
+                        local finish = now + MV.Time
+                        while tick() < finish and _G.AR2HUB_GEN == GEN do
+                            pcall(function()
+                                hrp.AssemblyLinearVelocity = flat * MV.Speed + Vector3.new(0, MV.Lift, 0)
+                            end)
+                            task.wait(0.03)
+                        end
+                        local to = hrp.Position
+                        MV.LastDist = (Vector3.new(to.X, 0, to.Z) - Vector3.new(from.X, 0, from.Z)).Magnitude
+                        MV.State = "cooldown"
+                    end
+                end
+            elseif (now - MV.LastDash) < MV.CD then
+                MV.State = "cooldown"
+            else
+                MV.State = "ready"
+            end
+            was = down
+        else
+            MV.State = "off"
+            was = false
+        end
+        task.wait(0.03)
+    end
+end)
+
+-- readouts
 task.spawn(function()
     while _G.AR2HUB_GEN == GEN do
-        if AZ.Enabled then
-            local cp = camPos()
-            local zf = workspace:FindFirstChild("Zombies")
-            local touched, aggroed = 0, 0
-            if cp and zf then
-                local maxStuds = AZ.RangeM * E.DistanceDivisor
-                for _, z in ipairs(zf:GetChildren()) do
-                    local anim = z:FindFirstChild("Animator")
-                    local root = z:FindFirstChild("HumanoidRootPart")
-                    if anim and root then
-                        local okp, pos = pcall(function() return root.Position end)
-                        if okp and pos and (pos - cp).Magnitude <= maxStuds then
-                            local ap = anim:FindFirstChild("AgroPercent")
-                            local as = anim:FindFirstChild("AgroState")
-                            if ap then
-                                local okr, v = pcall(function() return ap.Value end)
-                                if okr and type(v) == "number" and v > 0 then aggroed = aggroed + 1 end
-                                pcall(function() ap.Value = 0 end)
-                                touched = touched + 1
+        pcall(function()
+            MV.ui.dashInfo:SetText(MV.DashOn
+                and string.format("%s%s", MV.State,
+                    (MV.LastDist > 0) and string.format("  |  last dash %.0f studs", MV.LastDist) or "")
+                or "off")
+        end)
+        task.wait(0.2)
+    end
+end)
+end
+-- ==================== Map ESP (Visuals > Map) ====================
+-- Draws players, zombies and vehicles ONTO the in-game map (M). This was
+-- previously impossible because Matcha could not enumerate PlayerGui; with
+-- hybrid mode on it now can, and the whole map tree is readable:
+--   PlayerGui.Map.ClipBin              the visible viewport (0 size when closed)
+--     .DragBin                         pans and zooms
+--       .Map                           the world image, four 512x462 tiles
+--       .LocalMarker.MarkerCenter       a ZERO-SIZE anchor at YOUR position
+--
+-- MarkerCenter is what makes this work: everything is drawn relative to your own
+-- marker, so panning and zooming are handled for free - no world bounds needed.
+--
+-- Scale was measured by nudging the character with velocity (the map screen locks
+-- input, so walking cannot calibrate it) and watching the marker move:
+--   43.8 studs -> 3.33 px  = 0.07586 px/stud on X
+--   63.1 studs -> 4.71 px  = 0.07468 px/stud on Z
+-- Within 1.6% of each other, so the projection is uniform. Held as a fraction of
+-- DragBin's width (7.353e-5 px/stud per px) so zooming rescales automatically.
+--
+-- Hybrid mode IS required for this feature: without it PlayerGui reads as empty
+-- and there is no map to draw on.
+do
+_G.MAPESP = _G.MAPESP or {}
+local MP = _G.MAPESP
+MP.Enabled  = false
+MP.Players  = (MP.Players ~= false)
+MP.Zombies  = MP.Zombies == true
+MP.Vehicles = MP.Vehicles == true
+MP.Names    = (MP.Names ~= false)
+MP.Scale    = MP.Scale or 7.353e-5     -- px per stud, per px of DragBin width
+MP.POOL     = 60
+MP.Refs     = nil
+MP.At       = 0
+MP.Open     = false
+MP.Shown    = 0
+MP.col = {
+    player   = C(245, 246, 250),
+    priority = C(235,  80,  80),
+    zombie   = C(245, 170,  70),
+    vehicle  = C(120, 190, 255),
+}
+
+MP.ui = {}
+MP.ui.sub = vis:Sub("Map", "map")
+MP.ui.sec = MP.ui.sub:Section("Map ESP", "Full")
+MP.ui.sec:Label("Draws onto the real map. Open it with M.")
+MP.ui.sec:Label("Everything is positioned relative to your own marker,")
+MP.ui.sec:Label("so panning and zooming the map are handled automatically.")
+MP.ui.sec:Toggle("Map ESP", false, function(v) MP.Enabled = v end)
+MP.ui.sec:Toggle("Players", true, function(v) MP.Players = v end,
+    "Marked players keep their colour: prioritised show red.")
+MP.ui.sec:Toggle("Zombies", false, function(v) MP.Zombies = v end,
+    "Uses the Zombies tab's cache, so enable Zombie ESP for this to have anything to draw.")
+MP.ui.sec:Toggle("Vehicles", false, function(v) MP.Vehicles = v end,
+    "Uses the Vehicles tab's cache, so enable Vehicle ESP for this to have anything to draw.")
+MP.ui.sec:Toggle("Show Names", true, function(v) MP.Names = v end)
+MP.ui.sec:Slider("Scale Trim", 100, 1, 50, 200, " %", function(v) MP.Trim = v end,
+    "Only needed if dots drift from where things really are. 100% is the measured value.")
+MP.ui.info = MP.ui.sec:Label("map closed")
+MP.Trim = MP.Trim or 100
+
+-- GUI refs are resolved on a timer: the map tree can be rebuilt, and
+-- FindFirstChild is expensive enough not to want it every frame.
+MP.resolve = function(now)
+    if MP.Refs and (now - MP.At) < 1.0 then return MP.Refs end
+    MP.At = now
+    MP.Refs = nil
+    local ok, refs = pcall(function()
+        local P = game:GetService("Players")
+        local lp = P and P.LocalPlayer
+        local pg = lp and lp:FindFirstChildOfClass("PlayerGui")
+        local gui = pg and pg:FindFirstChild("Map")
+        local clip = gui and gui:FindFirstChild("ClipBin")
+        local drag = clip and clip:FindFirstChild("DragBin")
+        local marker = drag and drag:FindFirstChild("LocalMarker")
+        local center = marker and marker:FindFirstChild("MarkerCenter")
+        if clip and drag and center then
+            return { clip = clip, drag = drag, center = center }
+        end
+        return nil
+    end)
+    MP.Refs = ok and refs or nil
+    return MP.Refs
+end
+
+task.spawn(function()
+    local pool = {}
+    for i = 1, MP.POOL do
+        local dot = Drawing.new("Circle")
+        dot.Filled = true; dot.NumSides = 8; dot.Radius = 3; dot.Visible = false
+        local nm = Drawing.new("Text")
+        nm.Size = 12; nm.Center = true; nm.Outline = true; nm.Visible = false
+        pool[i] = { dot = dot, name = nm }
+    end
+    local function hide(o) o.dot.Visible = false; o.name.Visible = false end
+
+    while _G.AR2HUB_GEN == GEN do
+        local n = 0
+        if MP.Enabled then
+            local now = tick()
+            local refs = MP.resolve(now)
+            local open = false
+            if refs then
+                local oks, cs = pcall(function() return refs.clip.AbsoluteSize end)
+                -- ClipBin measures 0x0 while the map is closed, 769x695 when open
+                open = oks and cs and cs.X > 2 and cs.Y > 2
+            end
+            MP.Open = open
+            if open then
+                local okd, ds = pcall(function() return refs.drag.AbsoluteSize end)
+                local okc, cpx = pcall(function() return refs.center.AbsolutePosition end)
+                local okr, cr = pcall(function() return refs.clip.AbsolutePosition end)
+                local oks, cs = pcall(function() return refs.clip.AbsoluteSize end)
+                local P = svcPlayers()
+                local lp = P and P.LocalPlayer
+                local hrp = lp and lp.Character and lp.Character:FindFirstChild("HumanoidRootPart")
+                local okm, me = false, nil
+                if hrp then okm, me = pcall(function() return hrp.Position end) end
+                if okd and okc and okr and oks and okm and ds and cpx and me then
+                    local scale = ds.X * MP.Scale * (MP.Trim / 100)
+                    local minX, minY = cr.X, cr.Y
+                    local maxX, maxY = cr.X + cs.X, cr.Y + cs.Y
+
+                    local function plot(wpos, col, label)
+                        if n >= MP.POOL then return end
+                        local sx = cpx.X + (wpos.X - me.X) * scale
+                        local sy = cpx.Y + (wpos.Z - me.Z) * scale
+                        -- clip to the viewport, or dots spill outside the map frame
+                        if sx < minX or sx > maxX or sy < minY or sy > maxY then return end
+                        n = n + 1
+                        local o = pool[n]
+                        o.dot.Position = Vector2.new(sx, sy)
+                        o.dot.Color = col
+                        o.dot.Visible = true
+                        if MP.Names and label then
+                            o.name.Text = label
+                            o.name.Position = Vector2.new(sx, sy - 13)
+                            o.name.Color = col
+                            o.name.Visible = true
+                        else
+                            o.name.Visible = false
+                        end
+                    end
+
+                    if MP.Players and P then
+                        local marks = _G.PLAYERMARK or {}
+                        for _, pl in ipairs(P:GetPlayers()) do
+                            if pl.UserId ~= lp.UserId and marks[pl.UserId] ~= "whitelist" then
+                                local okc2, ch = pcall(function() return pl.Character end)
+                                local r = (okc2 and ch) and ch:FindFirstChild("HumanoidRootPart") or nil
+                                if r then
+                                    local okp, p = pcall(function() return r.Position end)
+                                    if okp and p then
+                                        plot(p, (marks[pl.UserId] == "priority") and MP.col.priority
+                                                or MP.col.player, pl.Name)
+                                    end
+                                end
                             end
-                            if as then pcall(function() as.Value = "Wandering" end) end
+                        end
+                    end
+                    -- these reuse the other tabs' caches rather than re-scanning
+                    if MP.Zombies and _G.ZOMBESP and _G.ZOMBESP.Live then
+                        for _, e in ipairs(_G.ZOMBESP.Live) do
+                            local okp, p = pcall(function() return e.part.Position end)
+                            if okp and p then plot(p, MP.col.zombie, e.item or nil) end
+                        end
+                    end
+                    if MP.Vehicles and _G.VEHESP and _G.VEHESP.Cache then
+                        for _, e in ipairs(_G.VEHESP.Cache) do
+                            local okp, p = pcall(function() return e.part.Position end)
+                            if okp and p then plot(p, MP.col.vehicle, e.name) end
                         end
                     end
                 end
             end
+            MP.Shown = n
             pcall(function()
-                AZ.ui.info:SetText(string.format("%d in range, %d were aggroed", touched, aggroed))
+                MP.ui.info:SetText(open
+                    and string.format("map open - %d marks drawn", n)
+                    or (refs and "map closed (press M)" or "map GUI not found"))
             end)
         end
-        task.wait(0.2)
+        for i = n + 1, MP.POOL do hide(pool[i]) end
+        task.wait(0.05)
+    end
+    for i = 1, MP.POOL do
+        pcall(function() pool[i].dot:Remove() end)
+        pcall(function() pool[i].name:Remove() end)
     end
 end)
 end
