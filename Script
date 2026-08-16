@@ -3334,18 +3334,28 @@ MP.ui.cal:Label("measurable signal. Tune these against a player whose real")
 MP.ui.cal:Label("location you know, or against your own dot.")
 MP.ui.cal:Slider("Scale Trim", 100, 1, 40, 200, " %", function(v) MP.Trim = v end,
     "Scales distance from you. If distant things are too far out, lower this; if they bunch up, raise it.")
--- -15 / +20 was dialled in against the game's own marker while zoomed out.
--- The offset is in screen pixels and is deliberately NOT scaled by zoom: the
--- marker measures 51x60 at both zoom levels (the map doubles, the marker does
--- not), so a fixed pixel offset is correct at either.
-MP.ui.cal:Slider("Offset X", -15, 1, -60, 60, " px", function(v) MP.OffX = v end)
-MP.ui.cal:Slider("Offset Y", 20, 1, -60, 60, " px", function(v) MP.OffY = v end)
+-- Offsets are no longer exposed: they were dialled in by hand and nobody else
+-- needs to touch them. Measured against the game's own marker:
+--   zoomed out (DragBin 1024 wide): X -15, Y +25
+--   zoomed in  (DragBin 2048 wide): X -25, Y +25
+-- Y is constant, X moves 10 px between the two zoom levels, so X is
+-- interpolated from DragBin's width and Y is fixed. See MP.anchor below.
 MP.ui.info = MP.ui.sec:Label("map closed")
 MP.Trim = MP.Trim or 100
--- explicit nil checks, not `or`: zero is truthy in Lua, so `MP.OffX or -15`
--- would keep a stored 0 and silently ignore the calibrated default
-if MP.OffX == nil then MP.OffX = -15 end
-if MP.OffY == nil then MP.OffY = 20 end
+-- X offset interpolated across zoom: -15 at DragBin 1024, -25 at 2048.
+MP.offsetFor = function(dragWidth)
+    return -5 - 10 * ((dragWidth or 1024) / 1024), 25
+end
+
+-- The map's geometry is IDENTICAL open or closed - every property tested was
+-- byte-for-byte the same, so there is nothing to read. But the map screen locks
+-- your movement (verified: 24 samples, 0.0 studs travelled), so state is tracked
+-- from the M key and auto-corrected by motion: if we think the map is open and
+-- you are clearly moving, it must actually be closed.
+MP.MapOpen = false
+MP.lastPos = nil
+MP.lastAt  = 0
+MP.mWas    = false
 MP.Self = MP.Self == true
 
 -- GUI refs are resolved on a timer: the map tree can be rebuilt, and
@@ -3392,12 +3402,29 @@ task.spawn(function()
         if MP.Enabled then
             local now = tick()
             local refs = MP.resolve(now)
-            local open = false
-            if refs then
-                local oks, cs = pcall(function() return refs.clip.AbsoluteSize end)
-                -- ClipBin measures 0x0 while the map is closed, 769x695 when open
-                open = oks and cs and cs.X > 2 and cs.Y > 2
+            -- track M, and treat Escape as a close
+            local mDown = iskeypressed and iskeypressed(0x4D) or false
+            if mDown and not MP.mWas then MP.MapOpen = not MP.MapOpen end
+            MP.mWas = mDown
+            if iskeypressed and iskeypressed(0x1B) then MP.MapOpen = false end
+
+            -- movement means the map cannot really be open, so resync
+            local P0 = svcPlayers()
+            local lp0 = P0 and P0.LocalPlayer
+            local hrp0 = lp0 and lp0.Character and lp0.Character:FindFirstChild("HumanoidRootPart")
+            if hrp0 then
+                local okp0, p0 = pcall(function() return hrp0.Position end)
+                if okp0 and p0 then
+                    if MP.lastPos and (now - MP.lastAt) > 0.25 then
+                        local moved = (Vector3.new(p0.X, 0, p0.Z) - Vector3.new(MP.lastPos.X, 0, MP.lastPos.Z)).Magnitude
+                        if moved > 3 then MP.MapOpen = false end
+                        MP.lastPos, MP.lastAt = p0, now
+                    elseif not MP.lastPos then
+                        MP.lastPos, MP.lastAt = p0, now
+                    end
+                end
             end
+            local open = MP.MapOpen and refs ~= nil
             MP.Open = open
             if open then
                 local okd, ds = pcall(function() return refs.drag.AbsoluteSize end)
@@ -3405,8 +3432,9 @@ task.spawn(function()
                 local okc, cpx = pcall(function()
                     local mp2 = refs.marker.AbsolutePosition
                     local ms2 = refs.marker.AbsoluteSize
-                    return Vector2.new(mp2.X + ms2.X / 2 + MP.OffX,
-                                       mp2.Y + ms2.Y / 2 + MP.OffY)
+                    local ox, oy = MP.offsetFor(refs.drag.AbsoluteSize.X)
+                    return Vector2.new(mp2.X + ms2.X / 2 + ox,
+                                       mp2.Y + ms2.Y / 2 + oy)
                 end)
                 local okr, cr = pcall(function() return refs.clip.AbsolutePosition end)
                 local oks, cs = pcall(function() return refs.clip.AbsoluteSize end)
@@ -3479,7 +3507,7 @@ task.spawn(function()
             pcall(function()
                 MP.ui.info:SetText(open
                     and string.format("map open - %d marks drawn", n)
-                    or (refs and "map closed (press M)" or "map GUI not found"))
+                    or (refs and "map closed - press M" or "map GUI not found"))
             end)
         end
         for i = n + 1, MP.POOL do hide(pool[i]) end
