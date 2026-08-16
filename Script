@@ -1077,23 +1077,43 @@ local function apply(keys, on, label)
     if not CB.Prepared then setStatus("press Prepare first"); return end
     local want = {}
     for _, k in ipairs(keys) do want[k] = true end
-    local t0, written, skipped = tick(), 0, 0
+
+    -- Crash guard. These addresses came from a getgc snapshot; if Lua has since
+    -- freed or reused any of that memory, writing to it corrupts something
+    -- unrelated and the game dies. So verify first: an address is only written
+    -- if it still reads back as the value we captured (or as 0, meaning we
+    -- already zeroed it). If too much of the cache has moved, refuse outright
+    -- rather than write into whatever now lives there.
+    local targets, moved = {}, 0
     for _, e in ipairs(CB.Cache) do
         if e.addr and want[tostring(e.key)] and tostring(e.type) == "number" then
-            if on then
-                local ok = pcall(function() memory_write("double", e.addr, 0) end)
-                if ok then written = written + 1 else skipped = skipped + 1 end
+            local orig = CB.Originals[e.addr]
+            local okr, live = pcall(function() return memory_read("double", e.addr) end)
+            if orig and okr and type(live) == "number" and (live == orig or live == 0) then
+                targets[#targets + 1] = e
             else
-                -- guarded restore: only write back where the live value still reads
-                local orig = CB.Originals[e.addr]
-                local okr, live = pcall(function() return memory_read("double", e.addr) end)
-                if orig and okr and type(live) == "number" then
-                    pcall(function() memory_write("double", e.addr, orig) end)
-                    written = written + 1
-                else
-                    skipped = skipped + 1
-                end
+                moved = moved + 1
             end
+        end
+    end
+    local checked = #targets + moved
+    if checked > 0 and moved * 4 > checked then      -- more than 25% unrecognisable
+        setStatus(string.format("%s ABORTED - %d of %d addresses moved, press Prepare again",
+            label, moved, checked))
+        warn(string.format("[combat] %s aborted: %d of %d addresses no longer hold their captured value. Re-run Prepare.",
+            label, moved, checked))
+        return
+    end
+
+    local t0, written, skipped = tick(), 0, moved
+    for _, e in ipairs(targets) do
+        if on then
+            local ok = pcall(function() memory_write("double", e.addr, 0) end)
+            if ok then written = written + 1 else skipped = skipped + 1 end
+        else
+            local orig = CB.Originals[e.addr]
+            local ok = pcall(function() memory_write("double", e.addr, orig) end)
+            if ok then written = written + 1 else skipped = skipped + 1 end
         end
     end
     setStatus(string.format("%s %s - %d written, %d skipped (%.1fms)",
@@ -1141,6 +1161,16 @@ advSec:Label("Same applygc family that caused ~100ms stalls, so avoid it.")
 --     goes sluggish again, check that setting first.
 --   * mousemoverel only takes effect while the Roblox window has focus.
 --   * Camera.CFrame writes are silently discarded, which is why aim type is Mouse.
+-- INS-ui dropdown callbacks receive a TABLE, never a string: ab() wraps every
+-- value into an array and dW() dispatches dU.value, so a single-select dropdown
+-- hands back {"Torso"}. Comparing that to "Head" is always false, which is why
+-- Hit Part could not be switched back and Target = Distance never engaged.
+local function dropStr(v, fallback)
+    if type(v) == "table" then v = v[1] end
+    if type(v) == "string" and v ~= "" then return v end
+    return fallback
+end
+
 _G.AIMBOT = _G.AIMBOT or {}
 local AB = _G.AIMBOT
 AB.Enabled  = false
@@ -1154,11 +1184,13 @@ AB.DistM    = AB.DistM    or 300
 AB.Smooth   = AB.Smooth   or 3
 AB.Sens     = AB.Sens     or 1.0
 AB.Sticky   = AB.Sticky   == true   -- hold one target for as long as the key is down
-AB.Mode     = AB.Mode     or "Crosshair"   -- "Crosshair" | "Distance"
+AB.DropScale = (AB.DropScale ~= false)     -- scale drop with range, or flat studs
+-- sanitised, because a previous session may have stored a table here
+AB.Mode     = dropStr(AB.Mode, "Crosshair")   -- "Crosshair" | "Distance"
 AB.MinStep  = AB.MinStep  or 1      -- 1 verified 100% effective with pointer accel OFF
                                     -- (no UI: only needs changing if pointer
                                     --  acceleration is ever turned back on)
-AB.Part     = AB.Part     or "Head"
+AB.Part     = dropStr(AB.Part, "Head")
 AB.Zombies  = AB.Zombies  == true   -- TEMPORARY test targets
 AB.Locked   = nil
 
@@ -1467,8 +1499,16 @@ task.spawn(function()
                     -- drop. The slider is therefore "studs of lift at 100 m",
                     -- which makes one calibration hold at every range.
                     if AB.DropStud ~= 0 then
-                        local k = raw / DROP_REF
-                        local lift = AB.DropStud * k * k
+                        local lift
+                        if AB.DropScale then
+                            -- quadratic: correct for gravity, but it means the lift
+                            -- is tiny up close. 2 studs @100m is only 0.08 studs at
+                            -- 20 m, which is why it looked like it did nothing.
+                            local k = raw / DROP_REF
+                            lift = AB.DropStud * k * k
+                        else
+                            lift = AB.DropStud          -- flat, same at every range
+                        end
                         if lift >  40 then lift =  40 end   -- sanity clamp; at 1000 m
                         if lift < -40 then lift = -40 end   -- k^2 would run away
                         aimPos = aimPos + Vector3.new(0, lift, 0)
@@ -1521,11 +1561,28 @@ end)
 -- Sections were declared with the Combat tab; they are populated here.
 aimSec:Toggle("Enable Aimbot", false, function(v) AB.Enabled = v end)
 aimKeyHandle = aimSec:Keybind("Aim Key (hold)", "e", function(k) AB.Key = k end)
+-- Blank unless something is actually wrong. A stale Players handle silently
+-- removes every player from the target list, which looks exactly like
+-- "the aimbot only works on zombies".
+local aimWarn = aimSec:Label("")
+task.spawn(function()
+    while _G.AR2HUB_GEN == GEN do
+        local msg = ""
+        if svcPlayers() == nil then
+            msg = "players unavailable: Matcha's Players handle is stale - zombies only"
+        elseif AB.Enabled and not mousemoverel then
+            msg = "mousemoverel missing - aim cannot be applied"
+        end
+        pcall(function() aimWarn:SetText(msg) end)
+        task.wait(1)
+    end
+end)
 
 tgtSec:Dropdown("Target", "Crosshair", {"Crosshair", "Distance"}, false,
-    function(v) AB.Mode = v end,
+    function(v) AB.Mode = dropStr(v, "Crosshair") end,
     "Crosshair: whatever sits nearest the middle. Distance: nearest enemy, still only from inside the FOV circle.")
-tgtSec:Dropdown("Hit Part", "Head", {"Head", "Torso"}, false, function(v) AB.Part = v end)
+tgtSec:Dropdown("Hit Part", "Head", {"Head", "Torso"}, false,
+    function(v) AB.Part = dropStr(v, "Head") end)
 tgtSec:Toggle("Sticky Target", false, function(v) AB.Sticky = v end,
     "Holds one target until you release the aim key, instead of switching to whatever is closest.")
 tgtSec:Slider("FOV", 150, 5, 10, 600, " px", function(v) AB.FovPx = v end,
@@ -1542,8 +1599,10 @@ leadSec:Toggle("Prediction", false, function(v) AB.PredOn = v end,
     "Aims ahead of a moving target. Only needed for network latency; these pistols are hitscan.")
 leadSec:Slider("Prediction Amount", 0, 0.25, 0, 20, " studs", function(v) AB.PredStud = v end,
     "How far ahead of a moving target to aim, along its direction of travel. Fades to zero inside 15 m.")
-leadSec:Slider("Drop Prediction", 0, 0.25, -8, 8, " studs @100m", function(v) AB.DropStud = v end,
-    "Raises (+) or lowers (-) the aim point to compensate for bullet drop. Value is the lift at 100 m; it scales with the square of range, so 200 m gets 4x and 50 m gets a quarter.")
+leadSec:Slider("Drop Prediction", 0, 0.25, -8, 8, " studs", function(v) AB.DropStud = v end,
+    "Raises (+) or lowers (-) the aim point. With Scale With Range on, this is the lift at 100 m and it grows with the square of distance; with it off, it is a flat offset at every range.")
+leadSec:Toggle("Scale Drop With Range", true, function(v) AB.DropScale = v end,
+    "On: physically correct for gravity, but the lift is very small up close (2 studs at 100 m is 0.08 studs at 20 m). Off: flat offset, easy to see and verify.")
 
 dispSec:Toggle("Show FOV Circle", true, function(v) AB.ShowFov = v end)
 dispSec:Toggle("Target Zombies (testing only)", false, function(v) AB.Zombies = v end,
