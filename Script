@@ -3325,10 +3325,28 @@ MP.ui.sec:Toggle("Zombies", false, function(v) MP.Zombies = v end,
 MP.ui.sec:Toggle("Vehicles", false, function(v) MP.Vehicles = v end,
     "Uses the Vehicles tab's cache, so enable Vehicle ESP for this to have anything to draw.")
 MP.ui.sec:Toggle("Show Names", true, function(v) MP.Names = v end)
-MP.ui.sec:Slider("Scale Trim", 100, 1, 50, 200, " %", function(v) MP.Trim = v end,
-    "Only needed if dots drift from where things really are. 100% is the measured value.")
+MP.ui.sec:Toggle("Show My Own Dot", false, function(v) MP.Self = v end,
+    "Draws a dot at YOUR position. It should sit exactly on your own map marker - if it does not, adjust the offsets below until it does. That calibrates the anchor.")
+MP.ui.cal = MP.ui.sub:Section("Calibration", "Full")
+MP.ui.cal:Label("Automated calibration failed: the game's marker only updates")
+MP.ui.cal:Label("its position in coarse steps, so small test moves produce no")
+MP.ui.cal:Label("measurable signal. Tune these against a player whose real")
+MP.ui.cal:Label("location you know, or against your own dot.")
+MP.ui.cal:Slider("Scale Trim", 100, 1, 40, 200, " %", function(v) MP.Trim = v end,
+    "Scales distance from you. If distant things are too far out, lower this; if they bunch up, raise it.")
+-- -15 / +20 was dialled in against the game's own marker while zoomed out.
+-- The offset is in screen pixels and is deliberately NOT scaled by zoom: the
+-- marker measures 51x60 at both zoom levels (the map doubles, the marker does
+-- not), so a fixed pixel offset is correct at either.
+MP.ui.cal:Slider("Offset X", -15, 1, -60, 60, " px", function(v) MP.OffX = v end)
+MP.ui.cal:Slider("Offset Y", 20, 1, -60, 60, " px", function(v) MP.OffY = v end)
 MP.ui.info = MP.ui.sec:Label("map closed")
 MP.Trim = MP.Trim or 100
+-- explicit nil checks, not `or`: zero is truthy in Lua, so `MP.OffX or -15`
+-- would keep a stored 0 and silently ignore the calibrated default
+if MP.OffX == nil then MP.OffX = -15 end
+if MP.OffY == nil then MP.OffY = 20 end
+MP.Self = MP.Self == true
 
 -- GUI refs are resolved on a timer: the map tree can be rebuilt, and
 -- FindFirstChild is expensive enough not to want it every frame.
@@ -3345,8 +3363,12 @@ MP.resolve = function(now)
         local drag = clip and clip:FindFirstChild("DragBin")
         local marker = drag and drag:FindFirstChild("LocalMarker")
         local center = marker and marker:FindFirstChild("MarkerCenter")
-        if clip and drag and center then
-            return { clip = clip, drag = drag, center = center }
+        if clip and drag and marker then
+            -- LocalMarker's CENTRE is used as the anchor, not MarkerCenter:
+            -- MarkerCenter sits at the marker's top-left-ish corner, measured
+            -- 8.16 px right and 30.00 px above the marker's visual centre, and
+            -- that 30 px matches the vertical error seen in testing.
+            return { clip = clip, drag = drag, marker = marker, center = center }
         end
         return nil
     end)
@@ -3379,7 +3401,13 @@ task.spawn(function()
             MP.Open = open
             if open then
                 local okd, ds = pcall(function() return refs.drag.AbsoluteSize end)
-                local okc, cpx = pcall(function() return refs.center.AbsolutePosition end)
+                -- anchor = centre of the local marker, plus the user's offsets
+                local okc, cpx = pcall(function()
+                    local mp2 = refs.marker.AbsolutePosition
+                    local ms2 = refs.marker.AbsoluteSize
+                    return Vector2.new(mp2.X + ms2.X / 2 + MP.OffX,
+                                       mp2.Y + ms2.Y / 2 + MP.OffY)
+                end)
                 local okr, cr = pcall(function() return refs.clip.AbsolutePosition end)
                 local oks, cs = pcall(function() return refs.clip.AbsoluteSize end)
                 local P = svcPlayers()
@@ -3412,6 +3440,9 @@ task.spawn(function()
                             o.name.Visible = false
                         end
                     end
+
+                    -- your own dot: a calibration aid. It must land on your marker.
+                    if MP.Self then plot(me, C(120, 255, 160), "me") end
 
                     if MP.Players and P then
                         local marks = _G.PLAYERMARK or {}
