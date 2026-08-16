@@ -3163,8 +3163,15 @@ MV.LastDash = 0
 MV.LastDist = 0
 MV.VK = { m1=0x01, m2=0x02, shift=0x10, ctrl=0x11, alt=0x12, space=0x20, tab=0x09 }
 
+MV.JumpOn   = false
+MV.JumpPow  = MV.JumpPow or 50         -- upward studs/sec per extra jump
+MV.JumpGap  = MV.JumpGap or 0.25       -- min seconds between extra jumps
+MV.LastJump = 0
+MV.Jumps    = 0
+
 MV.ui = {}
-MV.ui.sub = combattab:Sub("Movement", "zap")
+MV.ui.tab = win:Tab("Character", "users")
+MV.ui.sub = MV.ui.tab:Sub("Movement", "zap")
 MV.ui.dashSec = MV.ui.sub:Section("Dash", "Full")
 MV.ui.dashSec:Label("Velocity bursts, not teleports: CFrame writes are ignored")
 MV.ui.dashSec:Label("by this game. This IS visible to the server - the most")
@@ -3178,6 +3185,20 @@ MV.ui.dashSec:Slider("Dash Duration", 0.24, 0.02, 0.06, 0.5, " s", function(v) M
 MV.ui.dashSec:Slider("Cooldown", 1.0, 0.1, 0.2, 3, " s", function(v) MV.CD = v end,
     "Gaps between bursts matter more than burst size for staying unremarkable.")
 MV.ui.dashInfo = MV.ui.dashSec:Label("off")
+
+-- Infinite jump on the same proven mechanism as the dash: writes to
+-- AssemblyLinearVelocity apply, so each extra jump is just an upward velocity while
+-- Space is held. Nothing here calls Humanoid:ChangeState - that is not bound in
+-- Matcha - so the server sees plain upward movement, same visibility as the dash.
+MV.ui.jumpSec = MV.ui.sub:Section("Infinite Jump", "Full")
+MV.ui.jumpSec:Label("Hold Space to keep jumping. Like Dash, this is real")
+MV.ui.jumpSec:Label("movement the server sees, so it is not a quiet feature.")
+MV.ui.jumpSec:Toggle("Infinite Jump", false, function(v) MV.JumpOn = v end)
+MV.ui.jumpSec:Slider("Jump Power", 50, 5, 20, 120, " studs/s", function(v) MV.JumpPow = v end,
+    "50 is roughly a normal jump. Higher goes further up and is more obvious.")
+MV.ui.jumpSec:Slider("Min Gap", 0.25, 0.05, 0.05, 1.0, " s", function(v) MV.JumpGap = v end,
+    "How long to wait between extra jumps. Very short gaps look like flying rather than jumping.")
+MV.ui.jumpInfo = MV.ui.jumpSec:Label("off")
 
 
 -- resolves the dash key the same way the aimbot and melee do: the lib handle
@@ -3256,6 +3277,36 @@ task.spawn(function()
     end
 end)
 
+-- infinite jump: an upward velocity write each time Space is held past the gap
+task.spawn(function()
+    while _G.AR2HUB_GEN == GEN do
+        if MV.JumpOn then
+            local held = false
+            if iskeypressed then
+                local ok, d = pcall(function() return iskeypressed(0x20) end)
+                held = ok and d or false
+            end
+            local now = tick()
+            if held and (now - MV.LastJump) >= MV.JumpGap then
+                local hrp = MV.root()
+                if hrp then
+                    local okv, v = pcall(function() return hrp.AssemblyLinearVelocity end)
+                    -- keep the horizontal component so jumping mid-run carries you
+                    local keep = (okv and v) and Vector3.new(v.X, 0, v.Z) or Vector3.new(0, 0, 0)
+                    local okw = pcall(function()
+                        hrp.AssemblyLinearVelocity = keep + Vector3.new(0, MV.JumpPow, 0)
+                    end)
+                    if okw then
+                        MV.LastJump = now
+                        MV.Jumps = MV.Jumps + 1
+                    end
+                end
+            end
+        end
+        task.wait(0.03)
+    end
+end)
+
 -- readouts
 task.spawn(function()
     while _G.AR2HUB_GEN == GEN do
@@ -3263,6 +3314,9 @@ task.spawn(function()
             MV.ui.dashInfo:SetText(MV.DashOn
                 and string.format("%s%s", MV.State,
                     (MV.LastDist > 0) and string.format("  |  last dash %.0f studs", MV.LastDist) or "")
+                or "off")
+            MV.ui.jumpInfo:SetText(MV.JumpOn
+                and string.format("armed  |  %d extra jump%s", MV.Jumps, (MV.Jumps == 1) and "" or "s")
                 or "off")
         end)
         task.wait(0.2)
@@ -3565,255 +3619,6 @@ task.spawn(function()
     end
 end)
 end
--- ==================== Loot ESP (Visuals > Loot) ====================
--- What "item ESP" actually means in this game, established by investigation:
---   * There are NO ground-item instances. Assets.Items holds 1,227 templates and
---     Assets.LootModels their loot versions, but nothing is instantiated in the
---     world. The "M1909 Snubnose" found early on was in Effects.MenuSet - the
---     main-menu display models.
---   * Container loot is VIRTUAL. Each container carries a NumberValue whose NAME
---     is its loot table ("Ammo Military", "Firearms Military Sidearm"), and the
---     contents only exist in the loot UI once opened.
---   * Dropped items are not client instances either: dropping one produced no new
---     child anywhere in workspace, and a 22-stud spatial sweep found only terrain.
--- So this marks CONTAINERS and tells you what class of loot each one rolls, which
--- is the useful form the game actually permits.
---
--- A full sweep of all 2,517 map elements costs about 2.4 s and finds ~212
--- LootGroups / ~297 containers within streaming range, so it is done incrementally
--- a few elements per tick and refreshed on a timer.
--- Hybrid mode is NOT required here: plain DataModel reads.
-do
-_G.LOOTESP = _G.LOOTESP or {}
-local LO = _G.LOOTESP
-LO.Enabled = false
-LO.MaxM    = 60         -- forced, not "or": must match the slider the UI draws below
-LO.Names   = (LO.Names ~= false)
-LO.Live    = LO.Live or {}
-LO.POOL    = 40
-LO.Cats    = LO.Cats or {}
--- first word of the loot table name is the category
--- MeleeWeapons and Vests were found only after the first full sweep; without an
--- entry here a category gets no toggle and can never be shown, so unknown ones
--- also get a toggle created at runtime (see LO.discover below).
-LO.order = { "Firearms", "Ammo", "Medical", "Backpacks", "Utility", "Blueprint",
-             "MeleeWeapons", "Vests", "VehicleParts", "Accessories", "Hats",
-             "Belts", "Clothing", "Consumables", "Other" }
-LO.col = {
-    Firearms     = C(235,  80,  80),
-    Ammo         = C(245, 170,  70),
-    Medical      = C( 80, 230, 120),
-    Backpacks    = C(120, 190, 255),
-    Utility      = C(140, 230, 235),
-    Blueprint    = C(200, 150, 255),
-    VehicleParts = C(190, 190, 120),
-    Accessories  = C(200, 200, 210),
-    Hats         = C(200, 200, 210),
-    Belts        = C(200, 200, 210),
-    MeleeWeapons = C(255, 140, 200),
-    Vests        = C(160, 210, 160),
-    Clothing     = C(170, 170, 180),
-    Consumables  = C(245, 246, 250),
-    Other        = C(255, 255, 120),   -- catch-all, so a table I have not seen is still reachable
-}
--- the noisy ones start off: soda cans and student shirts are most of the map
-LO.defaultOn = { Firearms = true, Ammo = true, Medical = true, Backpacks = true,
-                 Utility = true, Blueprint = true, MeleeWeapons = true, Vests = true }
-
-LO.ui = {}
-LO.ui.sub = vis:Sub("Loot", "box")
-LO.ui.sec = LO.ui.sub:Section("Loot ESP", "Full")
-LO.ui.sec:Label("Marks searchable objects and what they can roll. Each one is")
-LO.ui.sec:Label("a CHANCE of loot, not a guarantee: contents are virtual until")
-LO.ui.sec:Label("opened, so whether a given box holds anything is not readable.")
-LO.ui.sec:Toggle("Loot ESP", false, function(v) LO.Enabled = v end)
-LO.ui.sec:Toggle("Show Loot Table", true, function(v) LO.Names = v end,
-    "Off shows the container name only. On adds the tables it can roll - only the ones whose category you have enabled, since most containers roll several.")
-LO.ui.sec:Slider("Distance", 60, 5, 15, 400, " m", function(v) LO.MaxM = v end,
-    "Kept low deliberately: 287 of 297 containers were within 150 m, far more than can be drawn at once, so a short range keeps the markers meaningful.")
-LO.ui.info = LO.ui.sec:Label("-")
-
-LO.ui.catSec = LO.ui.sub:Section("Categories", "Full")
-for _, cat in ipairs(LO.order) do
-    if LO.Cats[cat] == nil then LO.Cats[cat] = LO.defaultOn[cat] == true end
-    LO.ui.catSec:Toggle(cat, LO.Cats[cat] == true, function(v) LO.Cats[cat] = v end)
-end
-
--- ---- incremental sweep ----
-LO.cursor, LO.buffer, LO.sweptAt, LO.sweeping = 1, nil, 0, false
-LO.PERTICK = 6          -- elements walked per tick; each costs about 1.2 ms
-
-LO.step = function(now)
-    local els = workspace.Map and workspace.Map:FindFirstChild("Elements")
-    if not els then return end
-    if not LO.sweeping then
-        if (now - LO.sweptAt) < 15 then return end
-        LO.kids = els:GetChildren()
-        LO.cursor, LO.buffer, LO.sweeping = 1, {}, true
-    end
-    local done = 0
-    while LO.cursor <= #LO.kids and done < LO.PERTICK do
-        local e = LO.kids[LO.cursor]
-        LO.cursor = LO.cursor + 1
-        done = done + 1
-        local ok, desc = pcall(function() return e:GetDescendants() end)
-        if ok and desc then
-            for _, d in ipairs(desc) do
-                if d.Name == "LootGroup" then
-                    for _, cont in ipairs(d:GetChildren()) do
-                        -- a container usually rolls SEVERAL tables, not one: sampling
-                        -- 600 elements found 8 of 12 containers with more than one and
-                        -- up to 7, so all of them are kept and the categories unioned
-                        local tbls, cats = {}, {}
-                        for _, v in ipairs(cont:GetChildren()) do
-                            if v.ClassName == "NumberValue" then
-                                tbls[#tbls + 1] = v.Name
-                                local c = string.match(v.Name, "^(%a+)") or "Other"
-                                if not cats[c] then cats[c] = true end
-                            end
-                        end
-                        local tbl = tbls[1]
-                        if tbl then
-                            -- find something with a readable Position, once, here
-                            local part = cont.PrimaryPart
-                            if not part then
-                                local okd, cd = pcall(function() return cont:GetDescendants() end)
-                                if okd and cd then
-                                    for _, x in ipairs(cd) do
-                                        local okp, p = pcall(function() return x.Position end)
-                                        if okp and p then
-                                            local okm = pcall(function() return (p - p).Magnitude end)
-                                            if okm then part = x break end
-                                        end
-                                    end
-                                end
-                            end
-                            if part then
-                                local catList = {}
-                                for c in pairs(cats) do catList[#catList + 1] = c end
-                                table.sort(catList)
-                                -- DisplayName is a real attribute on containers ("Metal Box"),
-                                -- much more readable than the model name BoxMetalLong01
-                                local disp
-                                local okn, dn = pcall(function() return cont:GetAttribute("DisplayName") end)
-                                if okn and type(dn) == "string" and dn ~= "" then disp = dn end
-                                LO.buffer[#LO.buffer + 1] = {
-                                    part = part,
-                                    tbl  = tbl,
-                                    tbls = tbls,
-                                    cats = catList,
-                                    cat  = catList[1] or "Other",
-                                    disp = disp or cont.Name,
-                                }
-                            end
-                        end
-                    end
-                end
-            end
-        end
-    end
-    if LO.cursor > #LO.kids then
-        LO.Live, LO.buffer, LO.sweeping = LO.buffer, nil, false
-        LO.sweptAt = now
-    end
-end
-
-task.spawn(function()
-    local pool = {}
-    for i = 1, LO.POOL do
-        local ring = Drawing.new("Circle")
-        ring.Thickness = 1; ring.Filled = false; ring.NumSides = 10
-        ring.Radius = 4; ring.Visible = false
-        local nm = Drawing.new("Text")
-        nm.Size = STYLE.SubSize; nm.Center = true; nm.Outline = true; nm.Visible = false
-        local sb = Drawing.new("Text")
-        sb.Size = STYLE.SubSize; sb.Center = true; sb.Outline = true; sb.Visible = false
-        pool[i] = { ring = ring, name = nm, sub = sb }
-    end
-    -- only the tables you actually asked for are worth naming: a garbage bag
-    -- rolling Backpacks + Belts should not print Consumables at you as well
-    local function labelFor(e)
-        local keep = {}
-        for _, t in ipairs(e.tbls or { e.tbl }) do
-            local c = string.match(t, "^(%a+)") or "Other"
-            if LO.Cats[c] then keep[#keep + 1] = t end
-        end
-        if #keep == 0 then return e.tbl end
-        if #keep <= 2 then return table.concat(keep, " + ") end
-        return string.format("%s + %d more", keep[1], #keep - 1)
-    end
-    -- colour comes from the first ENABLED category, not the first category, or a
-    -- container whose only enabled table is Firearms could still draw grey
-    local function colourFor(e)
-        for _, c in ipairs(e.cats or { e.cat }) do
-            if LO.Cats[c] then return LO.col[c] or STYLE.unknown end
-        end
-        return LO.col[e.cat] or STYLE.unknown
-    end
-    while _G.AR2HUB_GEN == GEN do
-        local n = 0
-        if LO.Enabled then
-            local now = tick()
-            LO.step(now)
-            local cp = camPos()
-            if cp then
-                local maxStuds = LO.MaxM * E.DistanceDivisor
-                for i = 1, #LO.Live do
-                    if n >= LO.POOL then break end
-                    local e = LO.Live[i]
-                    local wanted = false
-                    for _, c in ipairs(e.cats or { e.cat }) do
-                        if LO.Cats[c] then wanted = true break end
-                    end
-                    if wanted then
-                        local ok, pos = pcall(function() return e.part.Position end)
-                        local okd, d = false, nil
-                        if ok and pos then
-                            okd, d = pcall(function() return (pos - cp).Magnitude end)
-                        end
-                        if okd and type(d) == "number" and d <= maxStuds then
-                            local pt, vis2 = toScreen(pos + Vector3.new(0, 1, 0))
-                            if vis2 then
-                                n = n + 1
-                                local o = pool[n]
-                                local col = colourFor(e)
-                                o.ring.Position = pt; o.ring.Color = col; o.ring.Visible = true
-                                o.name.Text = string.format("%s  %d%s", e.disp or "?", metres(d), E.DistanceUnit)
-                                o.name.Position = Vector2.new(pt.X, pt.Y - (LO.Names and 27 or 14))
-                                o.name.Color = col
-                                o.name.Visible = true
-                                if LO.Names then
-                                    o.sub.Text = labelFor(e)
-                                    o.sub.Position = Vector2.new(pt.X, pt.Y - 14)
-                                    o.sub.Color = col
-                                    o.sub.Visible = true
-                                else
-                                    o.sub.Visible = false
-                                end
-                            end
-                        end
-                    end
-                end
-            end
-            pcall(function()
-                LO.ui.info:SetText(string.format("%d containers cached%s | %d shown",
-                    #LO.Live, LO.sweeping and " (sweeping...)" or "", n))
-            end)
-        end
-        for i = n + 1, LO.POOL do
-            pool[i].ring.Visible = false
-            pool[i].name.Visible = false
-            pool[i].sub.Visible = false
-        end
-        task.wait(0.05)
-    end
-    for i = 1, LO.POOL do
-        pcall(function() pool[i].ring:Remove() end)
-        pcall(function() pool[i].name:Remove() end)
-        pcall(function() pool[i].sub:Remove() end)
-    end
-end)
-end
 -- ==================== Ground Item ESP (Visuals > Loot) ====================
 -- Items lying on the floor DO exist as world instances - I was wrong earlier when
 -- I said they did not. They live at:
@@ -3827,21 +3632,20 @@ end
 -- item (Lantern, Flashlight, FieldDressing); firearms and ammo packs use generic
 -- part names (Base, SightMount, MeshPart). Two sources are combined:
 --
---   1. EXACT names, for items in "vicinity" range, from the loot UI's ground list
---      at PlayerGui.MainMenu.Content.Loot.Main.Vicinity...Ground.ContentsFrame.
---      This list is LIVE even with the window shut - proven by walking away from a
---      pile of 13 items and watching it drop from 15 entries to 0 while every world
---      node still existed at 187 studs. It is ordered the same way the world nodes
---      are: checked against 12 nodes at once and all 12 agreed, including 5 exact
---      name matches and a bandage whose mesh is called FieldDressing.
---   2. STRUCTURE, for everything further out, where the UI list has nothing: parts
---      named Blade/HandGuard mean melee, BarrelMount/Muzzle/Charging Handle mean a
---      firearm, and an oddly-named mesh is usually the item's own name.
+-- Labels come from the model's own STRUCTURE: parts named Blade/HandGuard mean melee,
+-- BarrelMount/Muzzle/Charging Handle mean a firearm, and a mesh with a real item name
+-- (Lantern, Flashlight, Energy Drink Yellow) names itself. Anything else is "Item".
 --
--- Alignment only claims the k nearest nodes, where k is however many entries the UI
--- is showing, so a name is never invented for an item the UI does not know about.
--- Hybrid mode IS required for the exact names (PlayerGui must be readable); the
--- markers themselves work without it.
+-- Items CANNOT be identified by name. The game's nearby-loot list holds the real
+-- names, and three routes to them were tried and all failed:
+--   * template lookup - of 2,287 LootModels only 721 have readable children and 339
+--     readable sizes, with names coming back "Unreadable_name" and sizes 0,0,0
+--   * list order - see the note on assign() below
+--   * model fingerprint - also see assign(); the UI's copies are scaled
+-- So categories are honest but coarse: Firearms and Melees are provable from
+-- structure, a named mesh can imply Consumables or VehicleParts, and everything else
+-- lands in Other. Ammo, Backpacks and Accessories mostly cannot be told apart.
+-- Hybrid mode is NOT required for any of this.
 do
 _G.ITEMESP = _G.ITEMESP or {}
 _G.ITEMESP.Enabled = false
@@ -3851,25 +3655,72 @@ _G.ITEMESP.Live    = _G.ITEMESP.Live or {}
 _G.ITEMESP.POOL    = 30
 _G.ITEMESP.At      = 0
 _G.ITEMESP.Named   = 0
+_G.ITEMESP.order = { "Firearms", "Ammo", "Backpacks", "Melees", "Accessories",
+                     "VehicleParts", "Consumables", "Other" }
 _G.ITEMESP.col = {
-    firearm = C(235,  80,  80),
-    melee   = C(255, 140, 200),
-    named   = C(120, 255, 180),
-    generic = C(245, 246, 250),
+    Firearms     = C(235,  80,  80),
+    Ammo         = C(245, 170,  70),
+    Backpacks    = C(120, 190, 255),
+    Melees       = C(255, 140, 200),
+    Accessories  = C(200, 200, 210),
+    VehicleParts = C(190, 190, 120),
+    Consumables  = C( 80, 230, 120),
+    Other        = C(245, 246, 250),
 }
+_G.ITEMESP.Cats = _G.ITEMESP.Cats or {}
 
 _G.ITEMESP.ui = {}
-_G.ITEMESP.ui.sec = _G.LOOTESP.ui.sub:Section("Ground Items", "Full")
-_G.ITEMESP.ui.sec:Label("Items dropped or lying on the floor. Real world objects,")
-_G.ITEMESP.ui.sec:Label("so these are exact positions, not container guesses.")
-_G.ITEMESP.ui.sec:Label("Names come from the game's own nearby-loot list, so they")
-_G.ITEMESP.ui.sec:Label("are exact up close and a best guess further out.")
+_G.ITEMESP.ui.sub = vis:Sub("Loot", "box")
+_G.ITEMESP.ui.sec = _G.ITEMESP.ui.sub:Section("Ground Items", "Full")
+_G.ITEMESP.ui.sec:Label("Items lying on the floor, including anything dropped.")
+_G.ITEMESP.ui.sec:Label("Positions are exact. Labels are read off the item's model,")
+_G.ITEMESP.ui.sec:Label("so a gun reads 'Firearm' rather than naming the model -")
+_G.ITEMESP.ui.sec:Label("the game gives no way to tie a name to a specific item.")
 _G.ITEMESP.ui.sec:Toggle("Ground Item ESP", false, function(v) _G.ITEMESP.Enabled = v end)
-_G.ITEMESP.ui.sec:Toggle("Show Names", true, function(v) _G.ITEMESP.Names = v end,
-    "Exact names only reach about 10-15 studs, the range at which the game itself lists nearby loot (measured: named at 10.2 studs, not named at 15.5). Past that the label is a guess from the model's shape and ends in '?'.")
+_G.ITEMESP.ui.sec:Toggle("Show Labels", true, function(v) _G.ITEMESP.Names = v end,
+    "Off leaves just the coloured dot.")
 _G.ITEMESP.ui.sec:Slider("Distance", 100, 5, 10, 300, " m", function(v) _G.ITEMESP.MaxM = v end,
     "Nodes stay loaded to roughly 200 studs, so there is little to gain past that.")
 _G.ITEMESP.ui.info = _G.ITEMESP.ui.sec:Label("-")
+
+_G.ITEMESP.ui.catSec = _G.ITEMESP.ui.sub:Section("Categories", "Full")
+_G.ITEMESP.ui.catSec:Label("Only named items can be sorted properly, so anything")
+_G.ITEMESP.ui.catSec:Label("past about 15 studs shows as Firearms, Melees or Other")
+_G.ITEMESP.ui.catSec:Label("until you get close enough for the game to name it.")
+for _, cat in ipairs(_G.ITEMESP.order) do
+    if _G.ITEMESP.Cats[cat] == nil then _G.ITEMESP.Cats[cat] = true end
+    _G.ITEMESP.ui.catSec:Toggle(cat, true, function(v) _G.ITEMESP.Cats[cat] = v end)
+end
+
+-- Category from the item's name where there is one, else from its shape. Ammo is
+-- tested before Backpacks on purpose: "12 Gauge Ammo Pack 24rd" contains "pack".
+_G.ITEMESP.catWords = {
+    { "Ammo",         { "ammo", "speedloader", "magazine", "buckshot", "slug", " rd", "rd ", "round", "shell", "belt of" } },
+    { "Backpacks",    { "backpack", "rucksack", "duffel", "satchel", "bag", "pack" } },
+    { "VehicleParts", { "tire", "wheel", "fuel", "gasoline", "jerry", "battery", "spark", "repair", "engine", "oil", "canister" } },
+    { "Consumables",  { "drink", "water", "soda", "beans", "canned", "food", "mre", "snack", "energy",
+                        "booster", "bandage", "dressing", "morphine", "pill", "medical", "medkit",
+                        "syringe", "splint", "antibiotic", "ration", "candy", "chocolate" } },
+    { "Accessories",  { "hat", "cap", "helmet", "vest", "shirt", "pants", "jacket", "coat", "mask",
+                        "glasses", "goggles", "boots", "gloves", "belt", "armor", "armour", "plate",
+                        "uniform", "hoodie", "beanie", "bandana", "accessory" } },
+    { "Melees",       { "knife", "machete", "axe", "hatchet", "bat", "crowbar", "hammer", "shovel", "wrench", "sword" } },
+    { "Firearms",     { "rifle", "pistol", "shotgun", "smg", "carbine", "revolver", "sniper", "snubnose" } },
+}
+_G.ITEMESP.catOf = function(label, kind, exact)
+    if exact and type(label) == "string" then
+        local low = string.lower(label)
+        for _, pair in ipairs(_G.ITEMESP.catWords) do
+            for _, w in ipairs(pair[2]) do
+                if string.find(low, w, 1, true) then return pair[1] end
+            end
+        end
+    end
+    -- shape only: these two are the ones structure can actually prove
+    if kind == "firearm" then return "Firearms" end
+    if kind == "melee" then return "Melees" end
+    return "Other"
+end
 
 -- a few meshes are named differently from the item they belong to: a Common
 -- Bandage's mesh is FieldDressing. Only affects the far-away guess, since up close
@@ -3878,6 +3729,15 @@ _G.ITEMESP.alias = {
     FieldDressing = "Bandage",
     ["Hunting Spray"] = "Scent Cover Spray",
 }
+
+-- material and geometry names that are not item names
+_G.ITEMESP.junk = {}
+for _, w in ipairs({ "plastic", "metal", "glass", "wood", "rubber", "cloth", "fabric",
+                     "part", "union", "cylinder", "block", "wedge", "sphere", "mesh",
+                     "handle", "cap", "lid", "body", "top", "bottom", "middle",
+                     "color", "color2", "colour", "geometry", "primary", "secondary" }) do
+    _G.ITEMESP.junk[w] = true
+end
 
 -- structural guess, used wherever the UI list cannot name something
 _G.ITEMESP.hintOf = function(m)
@@ -3892,13 +3752,42 @@ _G.ITEMESP.hintOf = function(m)
     if has.ActionConstant or (has.Action and has.Constant) then return "firearm", "Firearm" end
     for _, p in ipairs(kids) do
         local n = p.Name
-        -- a mesh with a real name is nearly always the item itself
+        -- a mesh with a real name is often the item itself, but plenty are named
+        -- after their material or their source file instead ("Plastic",
+        -- "Meshes/frames") and those read as nonsense on screen
         if n ~= "Base" and n ~= "MeshPart" and n ~= "Model" and not string.match(n, "^%d+$")
-           and not string.match(n, "^Projection") and not string.match(n, "^SightLine") then
+           and not string.match(n, "^Projection") and not string.match(n, "^SightLine")
+           and not string.find(n, "/") and not _G.ITEMESP.junk[string.lower(n)] then
             return "named", _G.ITEMESP.alias[n] or n
         end
     end
     return "generic", "Item"
+end
+
+-- multiset of part sizes, the fingerprint used to tie a name to an object. Base is
+-- skipped: every ground model has one and it is always the same size, so it would
+-- score a point for every candidate equally.
+_G.ITEMESP.sizesOf = function(root)
+    local out, n = {}, 0
+    local ok, desc = pcall(function() return root:GetDescendants() end)
+    if not ok or not desc then return out end
+    for _, p in ipairs(desc) do
+        if p.Name ~= "Base" then
+            local oks, s = pcall(function() return p.Size end)
+            if oks and s then
+                local okf, key = pcall(function()
+                    return string.format("%.3f,%.3f,%.3f", s.X, s.Y, s.Z)
+                end)
+                -- 0,0,0 turns up on unloaded parts and matches everything, so drop it
+                if okf and key ~= "0.000,0.000,0.000" then
+                    out[key] = (out[key] or 0) + 1
+                    n = n + 1
+                end
+            end
+        end
+    end
+    out.__n = n
+    return out
 end
 
 -- the game's own list of ground loot near you, exact names, live while shut
@@ -3912,7 +3801,15 @@ _G.ITEMESP.uiNames = function()
         local okk, kids = pcall(function() return content:GetChildren() end)
         if okk and kids then
             for _, c in ipairs(kids) do
-                if c.ClassName == "ImageButton" then out[#out + 1] = c.Name end
+                if c.ClassName == "ImageButton" then
+                    -- the entry embeds a copy of the item's model; its part sizes are
+                    -- what ties this name to a specific object in the world
+                    local okw, wm = pcall(function() return c.Item.WorldModel end)
+                    out[#out + 1] = {
+                        name  = c.Name,
+                        sizes = (okw and wm) and _G.ITEMESP.sizesOf(wm) or {},
+                    }
+                end
             end
         end
     end
@@ -3971,9 +3868,20 @@ _G.ITEMESP.step = function(now)
     end
 end
 
--- cheap pass over the handful of nodes already found: refresh distances, then hand
--- the k nearest the UI's k names. k is whatever the UI is showing, so a name is
--- never invented for an item the game does not list.
+-- Cheap pass over the nodes already found: refresh distances and categories.
+--
+-- There is deliberately NO exact naming here. The game's nearby-loot list has the
+-- real names, but nothing ties an entry to a specific object in the world:
+--   * BY ORDER - looked perfect (12 of 12) but the test was taken on a pile where
+--     everything sat 4-6 studs away so the orderings coincided. In the field labels
+--     swapped between items depending on which one you stood nearer.
+--   * BY MODEL FINGERPRINT - the UI entry embeds a copy of the item's model, but its
+--     parts are scaled to fit the inventory grid, so the sizes do not match the world
+--     model. A gasoline can 7 studs away scored higher against the chemlight's entry
+--     than against its own, and single-part items make it worse: one coincidental
+--     size match is a 100% score.
+-- Two wrong methods was enough. Labels now come only from the model's own structure,
+-- which cannot claim something it does not know.
 _G.ITEMESP.assign = function(now, cp)
     local IT = _G.ITEMESP
     if (now - (IT.AssignAt or 0)) < 1.0 then return end
@@ -3989,23 +3897,9 @@ _G.ITEMESP.assign = function(now, cp)
         else
             e.d = 1e9
         end
+        e.cat = IT.catOf(e.label, e.kind, false)
     end
-    local names = IT.uiNames()
     IT.Named = 0
-    if #names == 0 then return end
-    local order = {}
-    for i = 1, #live do order[i] = i end
-    table.sort(order, function(a, b) return live[a].d < live[b].d end)
-    local inRange = {}
-    for i = 1, math.min(#names, #live) do inRange[#inRange + 1] = order[i] end
-    table.sort(inRange)          -- back into world order, which is the UI's order
-    for i, idx in ipairs(inRange) do
-        if names[i] then
-            live[idx].label = names[i]
-            live[idx].exact = true
-            IT.Named = IT.Named + 1
-        end
-    end
 end
 
 task.spawn(function()
@@ -4031,7 +3925,11 @@ task.spawn(function()
                 for i = 1, #IT.Live do
                     if n >= IT.POOL then break end
                     local e = IT.Live[i]
-                    local ok, pos = pcall(function() return e.part.Position end)
+                    local cat = e.cat or "Other"
+                    local ok, pos = false, nil
+                    if IT.Cats[cat] then
+                        ok, pos = pcall(function() return e.part.Position end)
+                    end
                     local okd, d = false, nil
                     if ok and pos then
                         okd, d = pcall(function() return (pos - cp).Magnitude end)
@@ -4041,8 +3939,7 @@ task.spawn(function()
                         if vis2 then
                             n = n + 1
                             local o = pool[n]
-                            local col = IT.col[e.kind] or IT.col.generic
-                            if e.exact then col = IT.col.named end
+                            local col = IT.col[cat] or IT.col.Other
                             o.dot.Position = pt; o.dot.Color = col; o.dot.Visible = true
                             if IT.Names then
                                 o.name.Text = string.format("%s  %d%s%s", e.label, metres(d),
