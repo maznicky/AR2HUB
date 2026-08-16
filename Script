@@ -2973,9 +2973,18 @@ end)
 -- every write is derived from the ORIGINAL captured value, never from the live
 -- one, otherwise toggling twice compounds the multiplier.
 --
--- UNTESTED. Whether the client honours any of them is unknown - the server may
--- rate-limit shots and time reloads itself, in which case these do nothing.
--- Test one at a time, and expect Fast Fire to be the most likely to be refused.
+-- ALL THREE HAVE NOW BEEN TESTED IN GAME, and none is worth using:
+--   MuzzleVelocity  works locally, but the server simulates flight too, so a
+--                   raised value makes hits arrive early client-side and get
+--                   discarded. 5x visibly lost hits.
+--   FireRate        fires faster, but the server enforces the real rate and
+--                   drops the surplus. Same damage, double the ammo spent.
+--   ReloadTime      no effect whatsoever. Server owns reload timing.
+-- The pattern across all of them, plus the failed hitbox expansion and melee
+-- reach tests: AR2 owns anything affecting damage, rate or geometry server-side.
+-- What DOES work is client-side aim and dispersion - No Spread and No Recoil -
+-- because those only change where your own shot goes, not what it is allowed
+-- to do. Kept here so the findings are not lost and not retried.
 local __oldHandling = _G.HANDLING
 _G.HANDLING = {
     Prepared  = false,
@@ -2984,7 +2993,7 @@ _G.HANDLING = {
     Originals = {},          -- addr -> captured value
     FireMul   = 2,
     ReloadDiv = 2,
-    VelMul    = 2,
+    VelMul    = 1.25,        -- capped low: the server simulates flight as well
     Keys      = { "FireRate", "ReloadTime", "MuzzleVelocity" },
 }
 local HD = _G.HANDLING
@@ -3072,27 +3081,247 @@ hdSec:Button("Prepare Handling Scan", function() hdPrepare() end,
 hdSec:Label("Run once per join, with all three toggles OFF.")
 
 hdSec:Divider("Fire Rate")
+hdSec:Label("TESTED: fires faster, but only SOME rounds register.")
+hdSec:Label("The server enforces the real rate and discards the rest,")
+hdSec:Label("so damage output stays about the same while every shot")
+hdSec:Label("still costs ammo. Faster feel, no more damage, 2x the ammo.")
 hdSec:Toggle("Fast Fire", false, function(on)
     hdApply("FireRate", on and HD.FireMul or 1, "Fast Fire")
-end, "Multiplies each weapon's rounds-per-minute. If the server rate-limits shots this will do nothing - test it alone first.")
-hdSec:Slider("Fire Rate Multiplier", 2, 0.25, 1, 5, "x", function(v) HD.FireMul = v end,
-    "Try 1.5x before 5x. Values are real RPM, so 700 becomes 1400 at 2x.")
+end, "Multiplies rounds-per-minute. Tested: the extra shots are discarded server-side, so this trades ammo for nothing. Left in only because the write itself works.")
+hdSec:Slider("Fire Rate Multiplier", 1.5, 0.25, 1, 3, "x", function(v) HD.FireMul = v end,
+    "Values are real RPM, so 700 becomes 1050 at 1.5x. Capped at 3x since surplus rounds do not land anyway.")
 
 hdSec:Divider("Reload")
+hdSec:Label("TESTED: no effect at all. The values change (0.85 -> 0.42")
+hdSec:Label("confirmed in memory) but reloads take just as long, so the")
+hdSec:Label("server owns reload timing entirely. Nothing to gain here.")
 hdSec:Toggle("Fast Reload", false, function(on)
     hdApply("ReloadTime", on and (1 / HD.ReloadDiv) or 1, "Fast Reload")
-end, "Divides reload durations. Only 5 entries were found, which suggests it covers loaded weapons only - re-Prepare after equipping something new if it has no effect.")
+end, "Tested and confirmed useless: the write lands but the server times reloads itself.")
 hdSec:Slider("Reload Divider", 2, 0.25, 1, 5, "x faster", function(v) HD.ReloadDiv = v end)
 
 hdSec:Divider("Ballistics")
+hdSec:Label("TESTED: works, but the SERVER simulates flight too.")
+hdSec:Label("Raising it makes your client show the round arriving")
+hdSec:Label("before the server's does, and those hits are discarded.")
+hdSec:Label("5x dropped hits noticeably. Keep it low or leave it off.")
 hdSec:Toggle("Flat Trajectory", false, function(on)
     hdApply("MuzzleVelocity", on and HD.VelMul or 1, "Muzzle Velocity")
-end, "Raises bullet speed, which flattens the arc and cuts the lead needed. Bullets are projectiles here - 2090 to 3580 studs/s - not hitscan as we first assumed.")
-hdSec:Slider("Velocity Multiplier", 2, 0.25, 1, 5, "x", function(v) HD.VelMul = v end)
+end, "Raises bullet speed, cutting the lead needed at range. Bullets really are projectiles here (median 3440 studs/s), but the server tracks them independently, so a large multiplier trades registered hits for less lead. Rarely worth it.")
+hdSec:Slider("Velocity Multiplier", 1.25, 0.05, 1, 2, "x", function(v) HD.VelMul = v end,
+    "Capped at 2x because 5x visibly lost hits. Even 1.25x only saves about a quarter of a stud of lead at 300 studs, so the honest answer is that this toggle is mostly not worth using.")
 
 hdSec:Divider("Notes")
 hdSec:Label("Damage was found too (131 numeric) but is not exposed:")
 hdSec:Label("servers own damage, and inflating it is the most obvious tell.")
+
+-- ==================== Corpse ESP + Anti-Zombie (Visuals > Zombies) ====================
+-- workspace.Corpses holds the dead. Every one seen so far is named "Infected..."
+-- (14 of 14), and several still carry an Equipment folder with 1-2 items - so a
+-- corpse is a loot container, not just a death marker. Anything NOT named
+-- Infected is treated as a player corpse; unverified, since no player has died
+-- nearby during testing. Hybrid mode is NOT needed: plain DataModel reads.
+--
+-- IMPORTANT: this block deliberately uses almost no top-level locals. The main
+-- chunk sits at Luau's 200 local-register limit, and adding ~10 more here failed
+-- with "Out of local registers". State and UI handles hang off the _G tables
+-- instead, and anything else lives inside the task.spawn closures. Any future
+-- feature block must be written the same way.
+do
+_G.CORPSE   = _G.CORPSE or {}
+_G.ANTIZOMB = _G.ANTIZOMB or {}
+local CO, AZ = _G.CORPSE, _G.ANTIZOMB
+
+CO.Enabled  = false
+CO.Zombie   = (CO.Zombie ~= false)
+CO.Player   = (CO.Player ~= false)
+CO.LootOnly = CO.LootOnly == true
+CO.MaxM     = CO.MaxM or 400
+CO.Live     = CO.Live or {}
+CO.At       = 0
+CO.POOL     = 24
+CO.col = {
+    loot   = C( 80, 230, 120),   -- still carrying equipment
+    empty  = C(165, 170, 180),   -- stripped
+    player = C(235,  80,  80),   -- a player, not an infected
+}
+
+CO.ui = {}
+CO.ui.sec = zombietab:Section("Corpse ESP", "Full")
+CO.ui.sec:Toggle("Corpse ESP", false, function(v) CO.Enabled = v end,
+    "Corpses keep their Equipment, so this doubles as a loot marker. Green = still has items, gray = stripped, red = a player corpse.")
+CO.ui.sec:Toggle("Infected Corpses", true, function(v) CO.Zombie = v end)
+CO.ui.sec:Toggle("Player Corpses", true, function(v) CO.Player = v end)
+CO.ui.sec:Toggle("Only Show Ones With Loot", false, function(v) CO.LootOnly = v end)
+CO.ui.sec:Slider("Distance", 400, 25, 25, 3000, " m", function(v) CO.MaxM = v end)
+CO.ui.info = CO.ui.sec:Label("-")
+
+-- Corpses is a small folder (14), so a full resolve costs about 10 ms and can
+-- run on a timer instead of incrementally like the zombie sweep.
+CO.rebuild = function(now)
+    if (now - CO.At) < 1.0 then return end
+    CO.At = now
+    local folder = workspace:FindFirstChild("Corpses")
+    local out = {}
+    if folder then
+        for _, c in ipairs(folder:GetChildren()) do
+            local part = c:FindFirstChild("Head") or c:FindFirstChild("HumanoidRootPart")
+            if part then
+                local eq = c:FindFirstChild("Equipment")
+                local items, loot = 0, nil
+                if eq then
+                    for _, it in ipairs(eq:GetChildren()) do
+                        items = items + 1
+                        local g = string.match(it.Name, "^Backpack Firearm (.+)$")
+                               or string.match(it.Name, "^Belt Firearm (.+)$")
+                               or string.match(it.Name, "^Backpack (.+)$")
+                        if g and not loot then loot = g end
+                    end
+                end
+                out[#out + 1] = {
+                    part   = part,
+                    name   = c.Name,
+                    player = (string.find(c.Name, "^Infected") == nil),
+                    items  = items,
+                    loot   = loot,
+                }
+            end
+        end
+    end
+    CO.Live = out
+end
+
+task.spawn(function()
+    local pool = {}
+    for i = 1, CO.POOL do
+        local ring = Drawing.new("Circle")
+        ring.Thickness = 1; ring.Filled = false; ring.NumSides = 14
+        ring.Radius = STYLE.Ring; ring.Visible = false
+        local nm = Drawing.new("Text")
+        nm.Size = STYLE.NameSize; nm.Center = true; nm.Outline = true; nm.Visible = false
+        local sb = Drawing.new("Text")
+        sb.Size = STYLE.SubSize; sb.Center = true; sb.Outline = true; sb.Visible = false
+        pool[i] = { ring = ring, name = nm, sub = sb }
+    end
+    while _G.AR2HUB_GEN == GEN do
+        local n = 0
+        if CO.Enabled then
+            local now = tick()
+            CO.rebuild(now)
+            local cp = camPos()
+            if cp then
+                local maxStuds = CO.MaxM * E.DistanceDivisor
+                for i = 1, #CO.Live do
+                    if n >= CO.POOL then break end
+                    local e = CO.Live[i]
+                    local wanted = (e.player and CO.Player) or ((not e.player) and CO.Zombie)
+                    if wanted and (not CO.LootOnly or e.items > 0) then
+                        local ok, pos = pcall(function() return e.part.Position end)
+                        if ok and pos then
+                            local d = (pos - cp).Magnitude
+                            if d <= maxStuds then
+                                local pt, vis = toScreen(pos + Vector3.new(0, 1, 0))
+                                if vis then
+                                    n = n + 1
+                                    local o = pool[n]
+                                    local col = e.player and CO.col.player
+                                             or (e.items > 0 and CO.col.loot or CO.col.empty)
+                                    o.ring.Position = pt; o.ring.Color = col; o.ring.Visible = true
+                                    o.name.Text = e.name
+                                    o.name.Position = Vector2.new(pt.X, pt.Y - 26)
+                                    o.name.Color = STYLE.name; o.name.Visible = true
+                                    local detail = metres(d) .. E.DistanceUnit
+                                    if e.items > 0 then
+                                        detail = detail .. string.format("  %d item%s", e.items,
+                                            (e.items == 1) and "" or "s")
+                                        if e.loot then detail = detail .. "  " .. e.loot end
+                                    else
+                                        detail = detail .. "  empty"
+                                    end
+                                    o.sub.Text = detail
+                                    o.sub.Position = Vector2.new(pt.X, pt.Y - 13)
+                                    o.sub.Color = col; o.sub.Visible = true
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+            local withLoot, players = 0, 0
+            for _, e in ipairs(CO.Live) do
+                if e.items > 0 then withLoot = withLoot + 1 end
+                if e.player then players = players + 1 end
+            end
+            pcall(function()
+                CO.ui.info:SetText(string.format("%d corpses - %d with loot, %d player",
+                    #CO.Live, withLoot, players))
+            end)
+        end
+        for i = n + 1, CO.POOL do
+            pool[i].ring.Visible = false
+            pool[i].name.Visible = false
+            pool[i].sub.Visible = false
+        end
+        task.wait(0.08)
+    end
+    for i = 1, CO.POOL do
+        pcall(function() pool[i].ring:Remove() end)
+        pcall(function() pool[i].name:Remove() end)
+        pcall(function() pool[i].sub:Remove() end)
+    end
+end)
+
+-- ---------------- anti-zombie (experimental) ----------------
+-- Aggro state lives in values under a child named "Animator": AgroPercent,
+-- AgroState ("Wandering"), MoveState. All three accept writes; TargetPosition
+-- refuses. Whether writing them changes BEHAVIOUR is the open question - if the
+-- server drives zombie AI these are replicated readouts and this does nothing.
+AZ.Enabled = false
+AZ.RangeM  = AZ.RangeM or 60
+AZ.ui = {}
+AZ.ui.sec = zombietab:Section("Anti-Zombie (experimental)", "Full")
+AZ.ui.sec:Label("Writes AgroPercent 0 / AgroState Wandering on nearby")
+AZ.ui.sec:Label("zombies. UNTESTED: if the server drives their AI this")
+AZ.ui.sec:Label("does nothing, because these values are only readouts.")
+AZ.ui.sec:Toggle("Suppress Aggro", false, function(v) AZ.Enabled = v end)
+AZ.ui.sec:Slider("Range", 60, 5, 10, 300, " m", function(v) AZ.RangeM = v end)
+AZ.ui.info = AZ.ui.sec:Label("idle")
+
+task.spawn(function()
+    while _G.AR2HUB_GEN == GEN do
+        if AZ.Enabled then
+            local cp = camPos()
+            local zf = workspace:FindFirstChild("Zombies")
+            local touched, aggroed = 0, 0
+            if cp and zf then
+                local maxStuds = AZ.RangeM * E.DistanceDivisor
+                for _, z in ipairs(zf:GetChildren()) do
+                    local anim = z:FindFirstChild("Animator")
+                    local root = z:FindFirstChild("HumanoidRootPart")
+                    if anim and root then
+                        local okp, pos = pcall(function() return root.Position end)
+                        if okp and pos and (pos - cp).Magnitude <= maxStuds then
+                            local ap = anim:FindFirstChild("AgroPercent")
+                            local as = anim:FindFirstChild("AgroState")
+                            if ap then
+                                local okr, v = pcall(function() return ap.Value end)
+                                if okr and type(v) == "number" and v > 0 then aggroed = aggroed + 1 end
+                                pcall(function() ap.Value = 0 end)
+                                touched = touched + 1
+                            end
+                            if as then pcall(function() as.Value = "Wandering" end) end
+                        end
+                    end
+                end
+            end
+            pcall(function()
+                AZ.ui.info:SetText(string.format("%d in range, %d were aggroed", touched, aggroed))
+            end)
+        end
+        task.wait(0.2)
+    end
+end)
+end
 -- ==================== Settings tab ====================
 -- INS-ui ships its own Settings tab. Enabling it gives Theme, Appearance,
 -- Interface (which already contains the "Menu key" bind that opens/closes this
