@@ -2603,6 +2603,36 @@ local function melResolve(now)
     end
 end
 
+-- ---- zombie root cache ----
+-- FindFirstChild costs 0.71 ms in Matcha, so resolving roots for ~100 zombies
+-- is a 70 ms stall. Doing that on every swing attempt would hitch visibly while
+-- the key is held, so roots are resolved a few per tick and reused. The refs
+-- stay valid; positions are still read fresh at check time.
+local melZ, melZQueue, melZOut, melZIdx, melZAt = {}, nil, nil, 1, 0
+local function melZombieStep(now)
+    if not melZQueue then
+        if (now - melZAt) < 2.0 then return end
+        local zf = workspace:FindFirstChild("Zombies")
+        melZQueue = zf and zf:GetChildren() or {}
+        melZOut, melZIdx = {}, 1
+    end
+    local done = 0
+    while melZIdx <= #melZQueue and done < 3 do
+        local z = melZQueue[melZIdx]
+        melZIdx = melZIdx + 1
+        done = done + 1
+        if z then
+            local r = z:FindFirstChild("HumanoidRootPart")
+            if r then melZOut[#melZOut + 1] = r end
+        end
+    end
+    if melZIdx > #melZQueue then
+        melZ = melZOut
+        melZQueue, melZOut, melZIdx = nil, nil, 1
+        melZAt = now
+    end
+end
+
 -- ---- the loop ----
 task.spawn(function()
     local lastSwing = 0
@@ -2614,6 +2644,14 @@ task.spawn(function()
         -- size whenever Extend Hitbox is off, so no separate restore is needed.
         melResolve(now)
         if ML.Enabled then
+            if ML.Zombies then melZombieStep(now) end
+            if not melHb then
+                ML.State = "no melee equipped"
+            elseif not melKeyHeld() then
+                ML.State = "waiting for " .. string.upper(tostring(ML.Key))
+            elseif (now - lastSwing) < ML.Cooldown then
+                ML.State = "cooldown"
+            end
             if melHb and ML.Reach > 0 and melKeyHeld() and (now - lastSwing) >= ML.Cooldown then
                 local okp, origin = pcall(function() return melHb.Position end)
                 local cam = workspace.CurrentCamera
@@ -2637,14 +2675,9 @@ task.spawn(function()
                     end
 
                     if ML.Zombies then
-                        local zf = workspace:FindFirstChild("Zombies")
-                        if zf then
-                            for _, z in ipairs(zf:GetChildren()) do
-                                if hit then break end
-                                -- cheap pre-filter on the root before touching Head
-                                local r = z:FindFirstChild("HumanoidRootPart")
-                                if r then consider(r) end
-                            end
+                        for i = 1, #melZ do
+                            if hit then break end
+                            consider(melZ[i])
                         end
                     end
                     if ML.Players and not hit then
@@ -2666,6 +2699,9 @@ task.spawn(function()
                     if hit and mouse1click then
                         pcall(function() mouse1click() end)
                         lastSwing = now
+                        ML.State = "swinging"
+                    else
+                        ML.State = hit and "no mouse1click" or "nothing in reach"
                     end
                 end
             end
@@ -2681,8 +2717,9 @@ task.spawn(function()
             if not ML.Weapon then
                 melInfo:SetText("no melee equipped")
             else
-                melInfo:SetText(string.format("%s - reach %.2f studs%s", ML.Weapon, ML.Reach,
-                    ML.ExtendHb and string.format(" (hitbox x%.2f)", ML.HbMul) or ""))
+                melInfo:SetText(string.format("%s - reach %.2f studs%s%s", ML.Weapon, ML.Reach,
+                    ML.ExtendHb and string.format(" (hitbox x%.2f)", ML.HbMul) or "",
+                    (ML.Enabled and ML.State) and ("  |  " .. ML.State) or ""))
             end
         end)
         task.wait(0.4)
