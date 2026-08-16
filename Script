@@ -657,7 +657,7 @@ local vis = win:Tab("Visuals", "monitor")
 
 local eventtab  = vis:Sub("Events", "World")
 local playertab = vis:Sub("Players", "Users")    -- placeholder, not implemented
-local zombietab = vis:Sub("Zombies", "Skull")    -- placeholder, not implemented
+local zombietab = vis:Sub("Zombies", "skull")
 
 local readouts = {}   -- cat -> { amount = handle, list = handle }
 
@@ -679,8 +679,7 @@ for _, g in ipairs(E.Groups) do
     end
 end
 
-zombietab:Section("Zombie ESP", "Left")
-zombietab:Section("Options", "Right")
+-- Zombie ESP is built further down, next to the vehicle ESP.
 
 -- one wrapping label per event: the lib re-flows text on width
 task.spawn(function()
@@ -1474,22 +1473,30 @@ task.spawn(function()
                 else
                     local raw = (tpos - cp).Magnitude
                     local vel = velOf(lockKey, tpos, now)
-                    -- The controller's own lag (tau) is always led for, since a
-                    -- proportional controller structurally trails a moving
-                    -- target. That part stays time-based; it is not a user knob.
-                    local aimPos = tpos + vel * tau
-                    -- Prediction proper is a DISTANCE: aim this many studs ahead
-                    -- of the target along its direction of travel. Faded out at
-                    -- close range by FALLOFF_M, and skipped below a walking pace
-                    -- so a stationary target does not jitter on velocity noise.
-                    if AB.PredOn and AB.PredStud > 0 then
-                        local sp = vel.Magnitude
-                        if sp > 2 then
-                            local lead = AB.PredStud
-                            if fallStuds > 0 and raw < fallStuds then
-                                lead = lead * (raw / fallStuds)
+                    -- Prediction OFF means no velocity lead of any kind: aim at
+                    -- where the target is. Previously the controller-lag term
+                    -- (vel * tau) was applied unconditionally, so "off" still
+                    -- led a sprinter by over a stud - the toggle looked broken.
+                    -- Three usable states now:
+                    --   off              -> no lead at all
+                    --   on, amount 0     -> tracking compensation only (tau)
+                    --   on, amount N     -> compensation plus N studs of lead
+                    local aimPos = tpos
+                    if AB.PredOn then
+                        aimPos = tpos + vel * tau
+                        -- Prediction proper is a DISTANCE: this many studs ahead
+                        -- along the target's travel. Faded out at close range by
+                        -- FALLOFF_M, and skipped below a walking pace so a
+                        -- stationary target does not jitter on velocity noise.
+                        if AB.PredStud > 0 then
+                            local sp = vel.Magnitude
+                            if sp > 2 then
+                                local lead = AB.PredStud
+                                if fallStuds > 0 and raw < fallStuds then
+                                    lead = lead * (raw / fallStuds)
+                                end
+                                aimPos = aimPos + vel * (lead / sp)
                             end
-                            aimPos = aimPos + vel * (lead / sp)
                         end
                     end
                     -- Drop Prediction: lifts or lowers the aim point off the
@@ -1596,7 +1603,7 @@ feelSec:Slider("Sensitivity", 1.0, 0.05, 0.1, 3, "x", function(v) AB.Sens = v en
     "Trim for the calibrated 0.002443 rad/count. Leave at 1.00 unless you change in-game sensitivity.")
 
 leadSec:Toggle("Prediction", false, function(v) AB.PredOn = v end,
-    "Aims ahead of a moving target. Only needed for network latency; these pistols are hitscan.")
+    "Off = aim exactly where the target is, no lead at all. On with Amount 0 = tracking compensation only, which stops it trailing runners. On with Amount above 0 adds that much lead on top.")
 leadSec:Slider("Prediction Amount", 0, 0.25, 0, 20, " studs", function(v) AB.PredStud = v end,
     "How far ahead of a moving target to aim, along its direction of travel. Fades to zero inside 15 m.")
 leadSec:Slider("Drop Prediction", 0, 0.25, -8, 8, " studs", function(v) AB.DropStud = v end,
@@ -2164,6 +2171,301 @@ task.spawn(function()
                 end
             end
         end
+        task.wait(0.5)
+    end
+end)
+
+-- ==================== Zombie ESP (Visuals > Zombies) ====================
+-- What a zombie carries is readable from its Equipment folder. Verified live:
+--   Backpack Firearm <gun>   slung primary   e.g. "Backpack Firearm SPAS-12"
+--   Belt Firearm <gun>       holstered       e.g. "Belt Firearm Makarov"
+--   Backpack <bag>           actual bag      e.g. "Backpack Rucksack Brown"
+--   Hat/Vest/Pants/Accessory/Belt/Shirt      cosmetic only
+-- Special variants carry a Mod<digit> suffix - confirmed in the world as
+-- "Belt Firearm Winchester 1894Mod1" on Unique Trapper Winchester 1894Mod1.
+-- That rule is generic, so every Mod1/Mod2 gun is caught without a name list;
+-- SPECIAL_EXTRA covers the exclusives that have no Mod suffix.
+-- Zombies have no Humanoid and no Id attribute, and the population churns
+-- (94 -> 101 within minutes), so the cache is rebuilt by an incremental sweep
+-- into a second buffer and swapped in whole. Resolving Equipment costs ~0.8 ms
+-- per zombie, which is why it is never done in bulk.
+_G.ZOMBESP = _G.ZOMBESP or {}
+local ZE = _G.ZOMBESP
+ZE.Enabled = false
+ZE.MaxM    = ZE.MaxM or 250
+ZE.Show    = ZE.Show or {}      -- category -> true
+ZE.Live    = ZE.Live or {}      -- rendered list
+
+local ZOMB_POOL    = 80
+local ZOMB_PERTICK = 3          -- zombies classified per tick during a sweep
+local ZOMB_SWEEP   = 1.5        -- seconds between sweeps
+
+local ZCOL = {
+    special = C(245, 170,  70),  -- orange, same as the vehicle middle band
+    armed   = C(120, 190, 255),  -- blue: notable, not a jackpot
+    normal  = C(245, 246, 250),  -- white
+}
+
+-- Exclusives with no Mod suffix. Matched case-insensitively as substrings, so
+-- "Heavy Survey" covers every colour of that bag.
+local SPECIAL_EXTRA = {
+    "patriot", "socom", "mk23",
+    "garbage bag", "heavy survey", "military duffel",
+}
+
+local ZOMB_CATS = {
+    { key = "sgun",   label = "Special Guns",     side = "Left"  },
+    { key = "smelee", label = "Special Melee",    side = "Left"  },
+    { key = "sbag",   label = "Special Backpacks",side = "Left"  },
+    { key = "armed",  label = "Armed Zombies",    side = "Right" },
+    { key = "normal", label = "Normal Zombies",   side = "Right" },
+}
+
+local zombToggles = {}
+
+local zombSec = zombietab:Section("Zombie ESP", "Full")
+zombSec:Toggle("Zombie ESP", false, function(v) ZE.Enabled = v end)
+zombSec:Slider("Distance", 250, 25, 0, 10000, " m", function(v) ZE.MaxM = v end,
+    "Zombies replicate map-wide, so a high value really does show the whole map - and there are around a hundred of them.")
+zombSec:Button("Toggle All Types", function()
+    local anyOn = false
+    for _, c in ipairs(ZOMB_CATS) do
+        if ZE.Show[c.key] then anyOn = true break end
+    end
+    local target = not anyOn
+    for _, h in ipairs(zombToggles) do pcall(function() h:Set(target) end) end
+end, "Selects every category, or clears them all if any are currently on.")
+local zombCount = zombSec:Label("0 of 5 categories selected")
+
+local zSpecSec = zombietab:Section("Special (orange)", "Left")
+local zRestSec = zombietab:Section("Other", "Right")
+for _, c in ipairs(ZOMB_CATS) do
+    if ZE.Show[c.key] == nil then ZE.Show[c.key] = false end
+    local target = (c.side == "Left") and zSpecSec or zRestSec
+    zombToggles[#zombToggles + 1] =
+        target:Toggle(c.label, ZE.Show[c.key] == true,
+            function(v) ZE.Show[c.key] = v end)
+end
+zRestSec:Label("Armed = ordinary gun, melee or bag.")
+zRestSec:Label("Normal = carries nothing worth taking.")
+
+-- ---- classification ----
+local function isSpecialName(item)
+    local low = string.lower(item)
+    if string.find(low, "mod%d") then return true end
+    for _, s in ipairs(SPECIAL_EXTRA) do
+        if string.find(low, s, 1, true) then return true end
+    end
+    return false
+end
+
+-- returns category key, a short description of the notable item
+local function classify(z)
+    local eq = z:FindFirstChild("Equipment")
+    if not eq then return "normal", nil end
+    local gun, melee, bag
+    local sGun, sMelee, sBag
+    for _, it in ipairs(eq:GetChildren()) do
+        local nm = it.Name
+        local item = string.match(nm, "^Backpack Firearm (.+)$")
+                  or string.match(nm, "^Belt Firearm (.+)$")
+        if item then
+            gun = gun or item
+            if isSpecialName(item) then sGun = sGun or item end
+        else
+            local m = string.match(nm, "^Backpack Melee (.+)$")
+                   or string.match(nm, "^Belt Melee (.+)$")
+            if m then
+                melee = melee or m
+                if isSpecialName(m) then sMelee = sMelee or m end
+            else
+                local b = string.match(nm, "^Backpack (.+)$")
+                if b then
+                    bag = bag or b
+                    if isSpecialName(b) then sBag = sBag or b end
+                end
+            end
+        end
+    end
+    if sGun   then return "sgun",   sGun   end
+    if sMelee then return "smelee", sMelee end
+    if sBag   then return "sbag",   sBag   end
+    if gun    then return "armed",  gun    end
+    if melee  then return "armed",  melee  end
+    if bag    then return "armed",  bag    end
+    return "normal", nil
+end
+
+-- long names like "Unique Convoy US Soldier Woodland Camo Mask M16A2" do not fit
+local function shortName(n)
+    n = string.gsub(n, "^Male ", "")
+    n = string.gsub(n, "^Female ", "")
+    n = string.gsub(n, "^NB ", "")
+    if #n > 26 then n = string.sub(n, 1, 25) .. "." end
+    return n
+end
+
+-- ---- incremental sweep ----
+local zQueue, zOut, zIdx, zSweptAt = nil, nil, 1, 0
+
+local function zombSweepStep(now)
+    if not zQueue then
+        if (now - zSweptAt) < ZOMB_SWEEP then return end
+        local zf = workspace:FindFirstChild("Zombies")
+        zQueue = zf and zf:GetChildren() or {}
+        zOut, zIdx = {}, 1
+    end
+    local done = 0
+    while zIdx <= #zQueue and done < ZOMB_PERTICK do
+        local z = zQueue[zIdx]
+        zIdx = zIdx + 1
+        done = done + 1
+        if z then
+            local part = z:FindFirstChild("Head") or z:FindFirstChild("HumanoidRootPart")
+            if part then
+                local cat, item = classify(z)
+                zOut[#zOut + 1] = { part = part, name = shortName(z.Name), cat = cat, item = item }
+            end
+        end
+    end
+    if zIdx > #zQueue then
+        ZE.Live = zOut                     -- swap in whole, so nothing flickers
+        zQueue, zOut, zIdx = nil, nil, 1
+        zSweptAt = now
+    end
+end
+
+task.spawn(function()
+    local pool = {}
+    for i = 1, ZOMB_POOL do
+        local ring = Drawing.new("Circle")
+        ring.Thickness = 1; ring.Filled = false; ring.NumSides = 18
+        ring.Radius = STYLE.Ring; ring.Visible = false
+        local core = Drawing.new("Circle")
+        core.Filled = true; core.NumSides = 12
+        core.Radius = STYLE.Core; core.Visible = false
+        local name = Drawing.new("Text")
+        name.Size = STYLE.NameSize; name.Center = true; name.Outline = true
+        name.Visible = false
+        local sub = Drawing.new("Text")
+        sub.Size = STYLE.SubSize; sub.Center = true; sub.Outline = true
+        sub.Visible = false
+        pool[i] = { ring = ring, core = core, name = name, sub = sub }
+    end
+    local function hide(o)
+        o.ring.Visible = false; o.core.Visible = false
+        o.name.Visible = false; o.sub.Visible = false
+    end
+
+    while _G.AR2HUB_GEN == GEN do
+        local n = 0
+        if ZE.Enabled then
+            local now = tick()
+            zombSweepStep(now)
+            local cp = camPos()
+            if cp then
+                local maxStuds = ZE.MaxM * E.DistanceDivisor
+                local list = ZE.Live
+                for i = 1, #list do
+                    if n >= ZOMB_POOL then break end
+                    local e = list[i]
+                    if ZE.Show[e.cat] then
+                        local ok, pos = pcall(function() return e.part.Position end)
+                        if ok and pos then
+                            local d = (pos - cp).Magnitude
+                            if d <= maxStuds then
+                                local pt, visible = toScreen(pos + Vector3.new(0, 2, 0))
+                                if visible then
+                                    n = n + 1
+                                    local o = pool[n]
+                                    local col = (e.cat == "armed") and ZCOL.armed
+                                             or (e.cat == "normal") and ZCOL.normal
+                                             or ZCOL.special
+
+                                    o.ring.Position = pt
+                                    o.ring.Color = col
+                                    o.ring.Visible = true
+
+                                    o.core.Position = pt
+                                    o.core.Color = col
+                                    o.core.Visible = true
+
+                                    o.name.Text = e.name
+                                    o.name.Position = Vector2.new(pt.X, pt.Y - 30)
+                                    o.name.Color = STYLE.name
+                                    o.name.Visible = true
+
+                                    local detail = metres(d) .. E.DistanceUnit
+                                    if e.item then detail = detail .. "  " .. e.item end
+                                    o.sub.Text = detail
+                                    o.sub.Position = Vector2.new(pt.X, pt.Y - 16)
+                                    o.sub.Color = col
+                                    o.sub.Visible = true
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+        for i = n + 1, ZOMB_POOL do hide(pool[i]) end
+        task.wait(0.05)
+    end
+    for i = 1, ZOMB_POOL do
+        pcall(function() pool[i].ring:Remove() end)
+        pcall(function() pool[i].core:Remove() end)
+        pcall(function() pool[i].name:Remove() end)
+        pcall(function() pool[i].sub:Remove() end)
+    end
+end)
+
+-- ---- what is actually out there ----
+-- Every distinct gun, melee and bag currently in the world, so a special I have
+-- not accounted for is visible rather than silently classified as ordinary.
+local ZOMB_ROWS = 12
+local zItemSec = zombietab:Section("Items In World", "Right")
+local zItemHead = zItemSec:Label("-")
+local zItemRows = {}
+for i = 1, ZOMB_ROWS do zItemRows[i] = zItemSec:Label("") end
+
+task.spawn(function()
+    while _G.AR2HUB_GEN == GEN do
+        if ZE.Enabled then
+            local counts, tally = {}, {}
+            local totals = { sgun = 0, smelee = 0, sbag = 0, armed = 0, normal = 0 }
+            for _, e in ipairs(ZE.Live) do
+                totals[e.cat] = (totals[e.cat] or 0) + 1
+                if e.item then
+                    if not counts[e.item] then counts[e.item] = 0; tally[#tally + 1] = e.item end
+                    counts[e.item] = counts[e.item] + 1
+                end
+            end
+            table.sort(tally, function(a, b)
+                local sa, sb = isSpecialName(a), isSpecialName(b)
+                if sa ~= sb then return sa end          -- specials first
+                return a < b
+            end)
+            pcall(function()
+                zItemHead:SetText(string.format("%d tracked - special %d, armed %d, normal %d",
+                    #ZE.Live, totals.sgun + totals.smelee + totals.sbag, totals.armed, totals.normal))
+                for i = 1, ZOMB_ROWS do
+                    local nm = tally[i]
+                    zItemRows[i]:SetText(nm and string.format("%s%s x%d",
+                        isSpecialName(nm) and "* " or "", nm, counts[nm]) or "")
+                end
+            end)
+        end
+        task.wait(1)
+    end
+end)
+
+task.spawn(function()
+    while _G.AR2HUB_GEN == GEN do
+        local on, all = 0, #ZOMB_CATS
+        for _, c in ipairs(ZOMB_CATS) do if ZE.Show[c.key] then on = on + 1 end end
+        pcall(function()
+            zombCount:SetText(string.format("%d of %d categories selected", on, all))
+        end)
         task.wait(0.5)
     end
 end)
