@@ -1018,6 +1018,7 @@ Lib:Category("Combat")
 local combattab = win:Tab("Combat", "crosshair")
 local aimsub = combattab:Sub("Aimbot", "crosshair")
 local gunsub = combattab:Sub("Gun Mods", "sliders")
+local melsub = combattab:Sub("Melee Mods", "sword")
 
 -- Aimbot sub
 local aimSec  = aimsub:Section("Aimbot", "Full")
@@ -2473,6 +2474,218 @@ task.spawn(function()
     end
 end)
 
+
+-- ==================== Melee Mods (Combat tab) ====================
+-- How melee is reachable, all verified live:
+--   * The equipped weapon sits in Character.Equipped as a Model, and carries a
+--     "Hitbox" Part whose Size IS the weapon's reach. Measured: Pocket Knife
+--     2.93 studs, Hatchet 3.40 - so reach is read live and is automatically
+--     per-weapon, with no table of hardcoded numbers to go stale.
+--   * mouse1click / mouse1press / mouse1release all exist in Matcha, so a swing
+--     is initiated the same way a player initiates one. The server sees an
+--     ordinary attack rather than a forged remote, which is both safer and the
+--     only route that does not need AR2's obfuscated Networking remotes.
+--   * Hitbox has no Touched signal and no GetTouchingParts in Matcha, so "in
+--     range" is computed geometrically from the hitbox position instead.
+-- Cooldown is NOT readable from the weapon - it carries no attributes and no
+-- config - so it is a slider. Set it slower than the real swing rate; clicking
+-- faster than the game allows just wastes clicks, it does not swing faster.
+_G.MELEE = _G.MELEE or {}
+local ML = _G.MELEE
+ML.Enabled   = false
+ML.HoldOnly  = (ML.HoldOnly ~= false)      -- default: only while holding the key
+ML.Key       = ML.Key or "v"
+ML.Players   = ML.Players == true
+ML.Zombies   = (ML.Zombies ~= false)
+ML.Cooldown  = ML.Cooldown or 0.6
+ML.RangePad  = ML.RangePad or 0            -- extra studs on the CHECK only
+ML.Arc       = ML.Arc or 60                -- degrees in front that counts
+ML.ExtendHb  = ML.ExtendHb == true         -- writes Hitbox.Size (see warning)
+ML.HbMul     = ML.HbMul or 1
+ML.Weapon    = nil
+ML.Reach     = 0
+
+local MEL_REFRESH = 0.4        -- how often to re-resolve the equipped weapon
+local melKeyHandle
+
+local melSec  = melsub:Section("Auto Melee", "Full")
+local melInfo = melSec:Label("no melee equipped")
+local melTgt  = melsub:Section("Targets", "Left")
+local melTune = melsub:Section("Timing & Reach", "Right")
+local melRisk = melsub:Section("Hitbox (read the warning)", "Full")
+
+melSec:Toggle("Auto Melee", false, function(v) ML.Enabled = v end,
+    "Swings automatically when something you have selected is inside the weapon's own reach and in front of you.")
+melSec:Toggle("Only While Holding Key", true, function(v) ML.HoldOnly = v end,
+    "Strongly recommended. With this off it swings at anything in range the moment it comes close.")
+melKeyHandle = melSec:Keybind("Melee Key (hold)", "v", function(k) ML.Key = k end)
+
+melTgt:Toggle("Target Zombies", true, function(v) ML.Zombies = v end)
+melTgt:Toggle("Target Players", false, function(v) ML.Players = v end)
+melTgt:Slider("Swing Arc", 60, 5, 10, 180, " deg", function(v) ML.Arc = v end,
+    "How far off centre a target may be and still be swung at. The real swing only covers what is in front of you.")
+
+melTune:Slider("Cooldown", 0.6, 0.05, 0.1, 2.0, " s", function(v) ML.Cooldown = v end,
+    "Minimum gap between swings. The weapon's real cooldown is not readable, so tune this by feel; too fast just wastes clicks.")
+melTune:Slider("Range Padding", 0, 0.25, 0, 6, " studs", function(v) ML.RangePad = v end,
+    "Adds to the in-range CHECK only. It does not make the weapon reach further - it just lets it start swinging slightly early.")
+
+melRisk:Label("Hitbox.Size is writable and the change sticks locally.")
+melRisk:Label("Whether the SERVER honours a bigger hitbox is unverified.")
+melRisk:Label("If hit detection is server-side this does nothing but flag you.")
+melRisk:Toggle("Extend Hitbox", false, function(v) ML.ExtendHb = v end,
+    "Multiplies the weapon's own Hitbox part. Restored to its original size when switched off or when the weapon changes.")
+melRisk:Slider("Hitbox Multiplier", 1, 0.25, 1, 5, "x", function(v) ML.HbMul = v end)
+
+-- ---- key state, same dual approach as the aimbot ----
+local MEL_VK = { m1=0x01, m2=0x02, shift=0x10, ctrl=0x11, alt=0x12, space=0x20, tab=0x09 }
+local function melKeyHeld()
+    if not ML.HoldOnly then return true end
+    if melKeyHandle then
+        local ok, v = pcall(function() return melKeyHandle:IsActivated() end)
+        if ok and v then return true end
+    end
+    local k = string.lower(tostring(ML.Key or ""))
+    local vk = MEL_VK[k]
+    if not vk and #k == 1 then
+        local b = string.byte(string.upper(k))
+        if b >= 48 and b <= 90 then vk = b end
+    end
+    if vk and iskeypressed then
+        local ok, d = pcall(function() return iskeypressed(vk) end)
+        if ok and d then return true end
+    end
+    return false
+end
+
+-- ---- equipped weapon, resolved on a timer because FindFirstChild is 0.71 ms ----
+local melHb, melHbOrig, melAt = nil, nil, 0
+
+local function melRestoreHitbox()
+    if melHb and melHbOrig then
+        pcall(function() melHb.Size = melHbOrig end)
+    end
+end
+
+local function melResolve(now)
+    if (now - melAt) < MEL_REFRESH then return end
+    melAt = now
+    local P = svcPlayers()
+    local lp = P and P.LocalPlayer
+    local ch = lp and lp.Character
+    local eqd = ch and ch:FindFirstChild("Equipped")
+    local w = eqd and eqd:GetChildren()[1]
+    if not w then
+        melRestoreHitbox()
+        melHb, melHbOrig, ML.Weapon, ML.Reach = nil, nil, nil, 0
+        return
+    end
+    if ML.Weapon ~= w.Name then
+        melRestoreHitbox()          -- hand the previous weapon back untouched
+        melHb, melHbOrig = nil, nil
+    end
+    ML.Weapon = w.Name
+    local hb = w:FindFirstChild("Hitbox")
+    if not hb then
+        melHb, melHbOrig, ML.Reach = nil, nil, 0
+        return
+    end
+    if melHb ~= hb then
+        melHb = hb
+        local ok, sz = pcall(function() return hb.Size end)
+        melHbOrig = ok and sz or nil
+    end
+    if melHbOrig then
+        ML.Reach = math.max(melHbOrig.X, melHbOrig.Y, melHbOrig.Z)
+        local want = ML.ExtendHb and (melHbOrig * ML.HbMul) or melHbOrig
+        local ok, cur = pcall(function() return hb.Size end)
+        if ok and cur ~= want then pcall(function() hb.Size = want end) end
+    end
+end
+
+-- ---- the loop ----
+task.spawn(function()
+    local lastSwing = 0
+    while _G.AR2HUB_GEN == GEN do
+        local now = tick()
+        if ML.Enabled then
+            melResolve(now)
+            if melHb and ML.Reach > 0 and melKeyHeld() and (now - lastSwing) >= ML.Cooldown then
+                local okp, origin = pcall(function() return melHb.Position end)
+                local cam = workspace.CurrentCamera
+                local okc, cf = cam and pcall(function() return cam.CFrame end)
+                if okp and origin and okc and cf then
+                    local look = cf.LookVector
+                    local limit = ML.Reach + ML.RangePad
+                    local arcCos = math.cos(math.rad(ML.Arc))
+                    local hit = false
+
+                    local function consider(part)
+                        if hit then return end
+                        local ok, pos = pcall(function() return part.Position end)
+                        if not ok or not pos then return end
+                        local d = pos - origin
+                        local m = d.Magnitude
+                        if m > limit or m <= 0 then return end
+                        -- must be in front, since a swing only covers the arc ahead
+                        if look:Dot(d * (1 / m)) < arcCos then return end
+                        hit = true
+                    end
+
+                    if ML.Zombies then
+                        local zf = workspace:FindFirstChild("Zombies")
+                        if zf then
+                            for _, z in ipairs(zf:GetChildren()) do
+                                if hit then break end
+                                -- cheap pre-filter on the root before touching Head
+                                local r = z:FindFirstChild("HumanoidRootPart")
+                                if r then consider(r) end
+                            end
+                        end
+                    end
+                    if ML.Players and not hit then
+                        local P = svcPlayers()
+                        local lp = P and P.LocalPlayer
+                        local lpId = lp and lp.UserId
+                        if P then
+                            for _, pl in ipairs(P:GetPlayers()) do
+                                if hit then break end
+                                if pl.UserId ~= lpId then
+                                    local okc2, pch = pcall(function() return pl.Character end)
+                                    local r = (okc2 and pch) and pch:FindFirstChild("HumanoidRootPart") or nil
+                                    if r then consider(r) end
+                                end
+                            end
+                        end
+                    end
+
+                    if hit and mouse1click then
+                        pcall(function() mouse1click() end)
+                        lastSwing = now
+                    end
+                end
+            end
+        else
+            melRestoreHitbox()
+        end
+        task.wait(0.03)
+    end
+    melRestoreHitbox()
+end)
+
+task.spawn(function()
+    while _G.AR2HUB_GEN == GEN do
+        pcall(function()
+            if not ML.Weapon then
+                melInfo:SetText("no melee equipped")
+            else
+                melInfo:SetText(string.format("%s - reach %.2f studs%s", ML.Weapon, ML.Reach,
+                    ML.ExtendHb and string.format(" (hitbox x%.2f)", ML.HbMul) or ""))
+            end
+        end)
+        task.wait(0.4)
+    end
+end)
 -- ==================== Settings tab ====================
 -- INS-ui ships its own Settings tab. Enabling it gives Theme, Appearance,
 -- Interface (which already contains the "Menu key" bind that opens/closes this
