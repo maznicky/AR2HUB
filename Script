@@ -2636,11 +2636,25 @@ ML.Cooldown  = ML.Cooldown or 0.6
 ML.FrontOnly = (ML.FrontOnly ~= false)     -- ignore targets behind you
 ML.KeepSprint = (ML.KeepSprint ~= false)   -- re-press shift after a swing
 ML.SprintDelay = 0.02                      -- measured as the value that works
+ML.KeyGrace  = ML.KeyGrace or 0.25         -- hold-mode latch, see melKeyHeld
+ML.Trigger   = dropStr(ML.Trigger, "Key")  -- "Key" | "Mouse 4" | "Mouse 5" | "Right Mouse"
 ML.Predict   = (ML.Predict ~= false)       -- swing early so the hit lands on time
 ML.Windup    = ML.Windup or 0.15           -- swing start -> damage frame, seconds
 ML.Closing   = 0                           -- studs/sec the target is closing at
 ML.Weapon    = nil
 ML.Reach     = 0
+-- chase: dash at the target so the swing lands as you arrive
+ML.Chase      = false
+ML.ChaseMax   = ML.ChaseMax or 45          -- furthest gap worth dashing across
+ML.ChaseSpeed = ML.ChaseSpeed or 90        -- studs/sec during the chase burst
+ML.ChaseCD    = ML.ChaseCD or 1.2          -- seconds between chases
+ML.ChaseLead  = (ML.ChaseLead ~= false)    -- aim where the target will be
+ML.ChaseClose = ML.ChaseClose or 1.5       -- surface studs to close to
+ML.chaseUntil = 0
+ML.chaseLast  = 0
+ML.chaseVel   = nil
+ML.ChaseState = "off"
+ML.ChaseLeadStuds = 0
 
 local MEL_REFRESH = 0.4        -- how often to re-resolve the equipped weapon
 local MEL_LOOKAHEAD = 8        -- studs beyond reach still worth tracking, so a
@@ -2667,7 +2681,11 @@ melSec:Toggle("Auto Melee", false, function(v) ML.Enabled = v end,
 melSec:Dropdown("Key Mode", "Hold", {"Hold", "Toggle", "Always"}, false,
     function(v) ML.KeyMode = dropStr(v, "Hold") end,
     "Hold: only swings while you hold the key. Toggle: tap the key to switch it on, tap again for off. Always: no key needed, swings at anything in range.")
-melKeyHandle = melSec:Keybind("Melee Key", "v", function(k) ML.Key = k end)
+melSec:Dropdown("Trigger", "Key", { "Key", "Mouse 4", "Mouse 5", "Right Mouse" }, false,
+    function(v) ML.Trigger = dropStr(v, "Key") end,
+    "What actually fires it. A mouse button is strongly preferred: measured on this machine, V registered on only 3% of reads while W and shift were held, because a keyboard cannot report every key at once. Mouse buttons do not go through that matrix.")
+melKeyHandle = melSec:Keybind("Melee Key", "v", function(k) ML.Key = k end,
+    "Only used when Trigger is set to Key.")
 
 melTgt:Toggle("Target Zombies", true, function(v) ML.Zombies = v end)
 melTgt:Toggle("Target Players", false, function(v) ML.Players = v end)
@@ -2676,6 +2694,8 @@ melTgt:Toggle("Only Hit What's In Front Of You", true, function(v) ML.FrontOnly 
 
 melTune:Slider("Cooldown", 0.6, 0.05, 0.1, 2.0, " s", function(v) ML.Cooldown = v end,
     "Minimum gap between swings. The weapon's real cooldown is not readable, so tune this by feel; too fast just wastes clicks.")
+melTune:Slider("Key Hold Grace", 0.25, 0.05, 0.05, 1.0, " s", function(v) ML.KeyGrace = v end,
+    "How long a held key stays counted after the last successful read. Keyboards drop keys when several are held at once, and this bridges the gaps. Raise it if auto melee stutters while running; lower it if it keeps swinging after you let go.")
 melTune:Toggle("Keep Sprint When Swinging", true, function(v) ML.KeepSprint = v end,
     "Swinging drops you to a walk. This re-presses shift straight after the swing, exactly as you would by hand, so you keep running. Works for your own clicks as well as auto swings.")
 melTune:Slider("Sprint Re-press Delay", 0.02, 0.01, 0.01, 0.4, " s", function(v) ML.SprintDelay = v end,
@@ -2686,6 +2706,34 @@ melPred:Toggle("Predict Swing", true, function(v) ML.Predict = v end,
 melPred:Slider("Swing Windup", 0.15, 0.01, 0, 0.6, " s", function(v) ML.Windup = v end,
     "Time between the swing starting and the damage frame. Raise it if fast targets still slip past; lower it if it swings at thin air.")
 local melPredInfo = melPred:Label("closing: -")
+
+-- ---- chase ----
+-- Closes the gap with a velocity burst aimed at the target, then lets the existing
+-- swing prediction time the hit. Nothing extra is needed to time it: the prediction
+-- tracks the rate the DISTANCE is closing, which already includes your own dash, so
+-- the swing goes in early by the windup and the damage frame lands as you arrive.
+-- The one thing that needed handling is the horizon - at 90 studs/s the raw
+-- prediction would swing about 13 studs out, which is only right if the dash is
+-- still running when the damage lands, so the lookahead is capped to the burst's
+-- remaining time in the loop below.
+local melChase = melsub:Section("Chase", "Full")
+melChase:Label("Dashes at whatever you are about to swing at, so the")
+melChase:Label("hit lands as you arrive. Same velocity mechanism as the")
+melChase:Label("Dash in Character, so the server sees it - the most")
+melChase:Label("visible thing this tab does.")
+melChase:Toggle("Dash To Target", false, function(v) ML.Chase = v end,
+    "Only fires while Auto Melee is active and something is in front of you, past your reach but inside the chase distance.")
+melChase:Slider("Chase Distance", 45, 5, 10, 120, " studs", function(v) ML.ChaseMax = v end,
+    "The furthest gap it will dash across. Bigger values cross more ground in one obvious burst.")
+melChase:Slider("Chase Speed", 90, 5, 30, 250, " studs/s", function(v) ML.ChaseSpeed = v end,
+    "How fast the burst travels. Faster closes sooner but overshoots more easily, and is more conspicuous.")
+melChase:Slider("Chase Cooldown", 1.2, 0.1, 0.2, 4, " s", function(v) ML.ChaseCD = v end,
+    "Gap between chases. Short gaps chain into something that looks like flying rather than lunging.")
+melChase:Toggle("Aim Where They Will Be", true, function(v) ML.ChaseLead = v end,
+    "Dashes at an interception point instead of at the target itself. Without this the burst lands where they were standing when it started, which a knife's small hitbox will miss entirely.")
+melChase:Slider("Get This Close", 1.5, 0.1, 0.3, 4, " studs", function(v) ML.ChaseClose = v end,
+    "How close to their body the dash aims to finish. Smaller is better for a short weapon, but too small and you shove into them and slide past.")
+local melChaseInfo = melChase:Label("off")
 
 -- ---- keep sprint through a swing ----
 -- Swinging drops you to a walk, but pressing shift again resumes running even
@@ -2720,8 +2768,23 @@ local function melKeepSprint()
 end
 
 -- ---- key state, same dual approach as the aimbot ----
-local MEL_VK = { m1=0x01, m2=0x02, shift=0x10, ctrl=0x11, alt=0x12, space=0x20, tab=0x09 }
+-- mouse4/mouse5 are here because they bypass the keyboard matrix entirely: see the
+-- ghosting note on melKeyHeld below.
+local MEL_VK = { m1=0x01, m2=0x02, m3=0x04, m4=0x05, m5=0x06,
+                 mouse1=0x01, mouse2=0x02, mouse3=0x04, mouse4=0x05, mouse5=0x06,
+                 shift=0x10, ctrl=0x11, alt=0x12, space=0x20, tab=0x09 }
+local MEL_TRIG = { ["Mouse 4"] = 0x05, ["Mouse 5"] = 0x06, ["Right Mouse"] = 0x02 }
 local function melRawKeyDown()
+    -- A mouse button is read directly and never involves the keyboard's key matrix,
+    -- so it cannot be swallowed the way V is while W and shift are held.
+    local trig = MEL_TRIG[tostring(ML.Trigger or "Key")]
+    if trig then
+        if iskeypressed then
+            local ok, d = pcall(function() return iskeypressed(trig) end)
+            if ok and d then return true end
+        end
+        return false        -- explicit trigger chosen: do not fall through to the key
+    end
     if melKeyHandle then
         local ok, v = pcall(function() return melKeyHandle:IsActivated() end)
         if ok and v then return true end
@@ -2741,7 +2804,17 @@ end
 
 -- Hold: active while the key is down. Toggle: press once to arm, again to
 -- disarm. Always: no key at all.
+--
+-- Hold mode LATCHES for a grace period rather than trusting each read, because a
+-- keyboard cannot necessarily report the melee key at all while other keys are held.
+-- Measured on a 5s hold: with W and Shift down (running), V registered on 2 of 20
+-- samples, while Z, '3' and Space registered as phantoms despite not being touched -
+-- classic matrix ghosting on a non-NKRO board. Auto Melee therefore looked broken
+-- exactly when it mattered, since running is when you chase. The latch turns an
+-- intermittent read into a steady hold; a mouse button avoids the problem entirely
+-- because it never goes through the keyboard matrix.
 local melKeyWas = false
+local melKeyLast = 0
 local function melKeyHeld()
     local mode = ML.KeyMode
     if mode == "Always" then return true end
@@ -2752,7 +2825,9 @@ local function melKeyHeld()
         return ML.Armed == true
     end
     melKeyWas = down
-    return down
+    local now = tick()
+    if down then melKeyLast = now end
+    return (now - melKeyLast) < (ML.KeyGrace or 0.25)
 end
 
 -- ---- equipped weapon, resolved on a timer because FindFirstChild is 0.71 ms ----
@@ -2844,7 +2919,10 @@ task.spawn(function()
             else
                 ML.State = "ready"      -- never leave it stale: a frozen state
             end                         -- reads as a failing check that is not failing
-            if melHb and ML.Reach > 0 and active and (now - lastSwing) >= ML.Cooldown then
+            -- The scan runs whenever a melee is active, not only when the swing is
+            -- off cooldown, because the chase has to keep closing between swings.
+            local canSwing = (now - lastSwing) >= ML.Cooldown
+            if melHb and ML.Reach > 0 and active then
                 local okp, origin = pcall(function() return melHb.Position end)
                 local cam = workspace.CurrentCamera
                 local cf
@@ -2868,6 +2946,7 @@ task.spawn(function()
                     -- Nearest in-arc candidate, and its surface distance. The range
                     -- test happens after, so prediction can be applied to it.
                     local bestPart, bestSurf
+                    local chasePart, chaseSurf, chasePos
                     local function consider(part)
                         local ok, pos = pcall(function() return part.Position end)
                         if not ok or not pos then return end
@@ -2880,6 +2959,11 @@ task.spawn(function()
                         local oks, sz = pcall(function() return part.Size end)
                         if oks and sz then radius = math.max(sz.X, sz.Z) * 0.5 end
                         local surf = m - radius
+                        -- chase candidates are tracked out to a much greater range
+                        -- than swing candidates, so record them before the cutoff
+                        if surf <= ML.ChaseMax and (not chaseSurf or surf < chaseSurf) then
+                            chasePart, chaseSurf, chasePos = part, surf, pos
+                        end
                         if surf > limit + MEL_LOOKAHEAD then return end
                         if not bestSurf or surf < bestSurf then
                             bestPart, bestSurf = part, surf
@@ -2928,18 +3012,117 @@ task.spawn(function()
                         end
                         ML.Closing = -melTrackRate
                         if ML.Predict then
-                            -- where it will be when the blade actually arrives
-                            effective = bestSurf + melTrackRate * ML.Windup
+                            -- Where it will be when the blade actually arrives. The
+                            -- horizon is capped to the chase burst's remaining time:
+                            -- the closing rate only holds while the dash is pushing,
+                            -- so predicting a full windup ahead of a 90 studs/s burst
+                            -- would swing ~13 studs early at thin air.
+                            local horizon = ML.Windup
+                            if now < ML.chaseUntil then
+                                horizon = math.min(horizon, ML.chaseUntil - now)
+                            end
+                            effective = bestSurf + melTrackRate * horizon
                             if effective < 0 then effective = 0 end
                         end
                     end
                     hit = (effective ~= nil) and (effective <= limit)
 
-                    if hit and mouse1click then
+                    -- ---- chase ----
+                    -- Track the chase target's velocity by differentiating its position.
+                    -- Velocity is unsupported in Matcha, and the swing's closing-rate
+                    -- tracker is a scalar, which cannot say WHERE to dash - only whether
+                    -- the gap is shrinking. A moving target therefore needs its own
+                    -- vector here, or the burst lands where the target used to be. With a
+                    -- knife's small hitbox, "used to be" is a clean miss.
+                    if chasePart and chasePos then
+                        if ML.chaseTrackPart ~= chasePart then
+                            ML.chaseTrackPart, ML.chaseTrackPos = chasePart, chasePos
+                            ML.chaseTrackAt, ML.chaseVel = now, Vector3.new(0, 0, 0)
+                        else
+                            local dt = now - (ML.chaseTrackAt or now)
+                            if dt >= 0.05 and ML.chaseTrackPos then
+                                local raw = (chasePos - ML.chaseTrackPos) * (1 / dt)
+                                local old = ML.chaseVel or Vector3.new(0, 0, 0)
+                                ML.chaseVel = old * 0.5 + raw * 0.5   -- same smoothing as the swing tracker
+                                ML.chaseTrackPos, ML.chaseTrackAt = chasePos, now
+                            end
+                        end
+                    end
+                    if ML.Chase then
+                        local stopAt = ML.ChaseClose or 1.5
+                        local hrp
+                        local okr, P = pcall(function() return svcPlayers() end)
+                        local lp = (okr and P) and P.LocalPlayer or nil
+                        local ch = lp and lp.Character
+                        if ch then hrp = ch:FindFirstChild("HumanoidRootPart") end
+                        if not hrp then
+                            ML.ChaseState = "no character"
+                        elseif not chasePart then
+                            ML.ChaseState = "nothing to chase"
+                        elseif chaseSurf and chaseSurf <= stopAt then
+                            -- already there: stop pushing so the swing is not overshot
+                            ML.chaseUntil = 0
+                            ML.ChaseState = "in reach"
+                        else
+                            if now >= ML.chaseUntil and (now - ML.chaseLast) >= ML.ChaseCD then
+                                -- burst just long enough to cover the gap
+                                local travel = math.max(chaseSurf - stopAt, 0)
+                                local dur = travel / math.max(ML.ChaseSpeed, 1)
+                                if dur > 0.6 then dur = 0.6 end
+                                ML.chaseUntil = now + dur
+                                ML.chaseLast = now
+                            end
+                            if now < ML.chaseUntil then
+                                -- re-aimed every tick, so a target that moves mid-dash
+                                -- is still followed rather than dashed past
+                                local okp2, hp = pcall(function() return hrp.Position end)
+                                if okp2 and hp and chasePos then
+                                    -- Interception, not pursuit: solve for how long the
+                                    -- burst takes to reach the target, then aim where the
+                                    -- target will be by then. Two refinements are plenty
+                                    -- since this re-runs every tick and converges.
+                                    local aim = chasePos
+                                    local vel = ML.chaseVel
+                                    if ML.ChaseLead and vel and vel.Magnitude > 0.5 then
+                                        local t = math.max(chaseSurf, 0) / math.max(ML.ChaseSpeed, 1)
+                                        for _ = 1, 2 do
+                                            local pred = chasePos + vel * t
+                                            local flatd = Vector3.new(pred.X - hp.X, 0, pred.Z - hp.Z)
+                                            t = flatd.Magnitude / math.max(ML.ChaseSpeed, 1)
+                                            if t > 1.5 then t = 1.5 end
+                                        end
+                                        aim = chasePos + vel * t
+                                        ML.ChaseLeadStuds = (vel * t).Magnitude
+                                    else
+                                        ML.ChaseLeadStuds = 0
+                                    end
+                                    local dir = aim - hp
+                                    local flat = Vector3.new(dir.X, 0, dir.Z)
+                                    if flat.Magnitude > 0.01 then
+                                        flat = flat / flat.Magnitude
+                                        pcall(function()
+                                            hrp.AssemblyLinearVelocity = flat * ML.ChaseSpeed
+                                        end)
+                                        ML.ChaseState = string.format("closing %.0f studs, leading %.1f",
+                                            chaseSurf, ML.ChaseLeadStuds or 0)
+                                    end
+                                end
+                            else
+                                ML.ChaseState = string.format("cooldown (%.0f studs away)", chaseSurf)
+                            end
+                        end
+                    else
+                        ML.chaseUntil = 0
+                        ML.ChaseState = "off"
+                    end
+
+                    if hit and canSwing and mouse1click then
                         pcall(function() mouse1click() end)
                         lastSwing = now
                         ML.State = "swinging"
                         melKeepSprint()
+                    elseif hit and not canSwing then
+                        ML.State = "cooldown"       -- in reach, waiting on the timer
                     else
                         ML.State = hit and "no mouse1click" or "nothing in reach"
                     end
@@ -2979,6 +3162,7 @@ task.spawn(function()
                 melPredInfo:SetText(string.format("closing at %.1f studs/s  ->  swings %.2f studs early",
                     ML.Closing or 0, math.max(0, (ML.Closing or 0) * ML.Windup)))
             end
+            melChaseInfo:SetText(ML.Chase and tostring(ML.ChaseState or "-") or "off")
         end)
         task.wait(0.4)
     end
@@ -3684,9 +3868,10 @@ _G.ITEMESP.ui.sec:Slider("Distance", 100, 5, 10, 300, " m", function(v) _G.ITEME
 _G.ITEMESP.ui.info = _G.ITEMESP.ui.sec:Label("-")
 
 _G.ITEMESP.ui.catSec = _G.ITEMESP.ui.sub:Section("Categories", "Full")
-_G.ITEMESP.ui.catSec:Label("Only named items can be sorted properly, so anything")
-_G.ITEMESP.ui.catSec:Label("past about 15 studs shows as Firearms, Melees or Other")
-_G.ITEMESP.ui.catSec:Label("until you get close enough for the game to name it.")
+_G.ITEMESP.ui.catSec:Label("Firearms and Melees are read reliably from the model.")
+_G.ITEMESP.ui.catSec:Label("Some items name their own mesh, which sorts them too.")
+_G.ITEMESP.ui.catSec:Label("The rest land in Other - ammo, bags and clothing mostly")
+_G.ITEMESP.ui.catSec:Label("look identical from outside, so they cannot be split.")
 for _, cat in ipairs(_G.ITEMESP.order) do
     if _G.ITEMESP.Cats[cat] == nil then _G.ITEMESP.Cats[cat] = true end
     _G.ITEMESP.ui.catSec:Toggle(cat, true, function(v) _G.ITEMESP.Cats[cat] = v end)
@@ -3707,8 +3892,10 @@ _G.ITEMESP.catWords = {
     { "Melees",       { "knife", "machete", "axe", "hatchet", "bat", "crowbar", "hammer", "shovel", "wrench", "sword" } },
     { "Firearms",     { "rifle", "pistol", "shotgun", "smg", "carbine", "revolver", "sniper", "snubnose" } },
 }
-_G.ITEMESP.catOf = function(label, kind, exact)
-    if exact and type(label) == "string" then
+_G.ITEMESP.catOf = function(label, kind)
+    -- applies to any label, including the mesh-derived ones: a mesh called
+    -- "Energy Drink Yellow" sorts to Consumables the same as a real name would
+    if type(label) == "string" then
         local low = string.lower(label)
         for _, pair in ipairs(_G.ITEMESP.catWords) do
             for _, w in ipairs(pair[2]) do
@@ -3762,58 +3949,6 @@ _G.ITEMESP.hintOf = function(m)
         end
     end
     return "generic", "Item"
-end
-
--- multiset of part sizes, the fingerprint used to tie a name to an object. Base is
--- skipped: every ground model has one and it is always the same size, so it would
--- score a point for every candidate equally.
-_G.ITEMESP.sizesOf = function(root)
-    local out, n = {}, 0
-    local ok, desc = pcall(function() return root:GetDescendants() end)
-    if not ok or not desc then return out end
-    for _, p in ipairs(desc) do
-        if p.Name ~= "Base" then
-            local oks, s = pcall(function() return p.Size end)
-            if oks and s then
-                local okf, key = pcall(function()
-                    return string.format("%.3f,%.3f,%.3f", s.X, s.Y, s.Z)
-                end)
-                -- 0,0,0 turns up on unloaded parts and matches everything, so drop it
-                if okf and key ~= "0.000,0.000,0.000" then
-                    out[key] = (out[key] or 0) + 1
-                    n = n + 1
-                end
-            end
-        end
-    end
-    out.__n = n
-    return out
-end
-
--- the game's own list of ground loot near you, exact names, live while shut
-_G.ITEMESP.uiNames = function()
-    local out = {}
-    local ok, content = pcall(function()
-        return game:GetService("Players").LocalPlayer.PlayerGui.MainMenu.Content.Loot
-                   .Main.Vicinity.ScrollingFrame.Ground.ContentsFrame.Content
-    end)
-    if ok and content then
-        local okk, kids = pcall(function() return content:GetChildren() end)
-        if okk and kids then
-            for _, c in ipairs(kids) do
-                if c.ClassName == "ImageButton" then
-                    -- the entry embeds a copy of the item's model; its part sizes are
-                    -- what ties this name to a specific object in the world
-                    local okw, wm = pcall(function() return c.Item.WorldModel end)
-                    out[#out + 1] = {
-                        name  = c.Name,
-                        sizes = (okw and wm) and _G.ITEMESP.sizesOf(wm) or {},
-                    }
-                end
-            end
-        end
-    end
-    return out
 end
 
 -- Finding the nodes means checking the name of every map element, and there can be
@@ -3889,7 +4024,7 @@ _G.ITEMESP.assign = function(now, cp)
     local live = IT.Live
     if not live or #live == 0 then IT.Named = 0 return end
     for _, e in ipairs(live) do
-        e.label, e.exact = e.hint, nil
+        e.label = e.hint
         local okp, p = pcall(function() return e.part.Position end)
         if okp and p then
             local okd, dd = pcall(function() return (p - cp).Magnitude end)
@@ -3897,7 +4032,7 @@ _G.ITEMESP.assign = function(now, cp)
         else
             e.d = 1e9
         end
-        e.cat = IT.catOf(e.label, e.kind, false)
+        e.cat = IT.catOf(e.label, e.kind)
     end
     IT.Named = 0
 end
@@ -3942,8 +4077,8 @@ task.spawn(function()
                             local col = IT.col[cat] or IT.col.Other
                             o.dot.Position = pt; o.dot.Color = col; o.dot.Visible = true
                             if IT.Names then
-                                o.name.Text = string.format("%s  %d%s%s", e.label, metres(d),
-                                    E.DistanceUnit, e.exact and "" or " ?")
+                                o.name.Text = string.format("%s  %d%s", e.label, metres(d),
+                                    E.DistanceUnit)
                                 o.name.Position = Vector2.new(pt.X, pt.Y - 13)
                                 o.name.Color = col
                                 o.name.Visible = true
@@ -3955,8 +4090,9 @@ task.spawn(function()
                 end
             end
             pcall(function()
-                IT.ui.info:SetText(string.format("%d on the ground%s | %d named exactly | %d shown",
-                    #IT.Live, IT.scanning and " (scanning...)" or "", IT.Named or 0, n))
+                IT.Shown = n
+                IT.ui.info:SetText(string.format("%d on the ground%s | %d shown",
+                    #IT.Live, IT.scanning and " (scanning...)" or "", n))
             end)
         end
         for i = n + 1, IT.POOL do
