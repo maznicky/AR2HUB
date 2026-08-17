@@ -25,6 +25,36 @@ if GEN > 1 then
     task.wait(0.2)   -- let the retiring loops notice before we respawn them
 end
 
+-- ---------------- Drawing registry ----------------
+-- Each load builds 22 pools of Drawings across 32 loops, and each loop removes its
+-- own on the way out - but only when it next ticks, and only if it gets there. A loop
+-- killed mid-sweep, or one still inside a long wait, never cleans up, and its
+-- Drawings stay on the renderer forever. Twenty reloads in a session is enough of
+-- that to matter, and it fits crashes that arrive with no obvious trigger.
+--
+-- So every Drawing is registered as it is created, and a reload wipes the previous
+-- generation's set outright rather than trusting each loop to tidy up after itself.
+-- Drawing.new is wrapped once, globally, and the wrapper survives reloads.
+_G.AR2HUB_DRAWINGS = _G.AR2HUB_DRAWINGS or {}
+if GEN > 1 then
+    local n = 0
+    for _, d in ipairs(_G.AR2HUB_DRAWINGS) do
+        if pcall(function() d.Visible = false end) then n = n + 1 end
+        pcall(function() d:Remove() end)
+    end
+    print(string.format("[AR2 Hub] cleared %d drawings from the previous load", n))
+end
+_G.AR2HUB_DRAWINGS = {}
+if Drawing and not _G.AR2HUB_DRAWWRAP then
+    _G.AR2HUB_DRAWWRAP = true
+    local realNew = Drawing.new
+    Drawing.new = function(...)
+        local obj = realNew(...)
+        if obj then table.insert(_G.AR2HUB_DRAWINGS, obj) end
+        return obj
+    end
+end
+
 -- INS-ui captures game:GetService("Players") ONCE, at library load, and reads
 -- the mouse only through LocalPlayer:GetMouse() - there is no UserInputService
 -- fallback and no retry. If the handle is nil at that instant the menu renders
@@ -50,7 +80,42 @@ do
     end
 end
 
-local Lib = loadstring(game:HttpGet("https://raw.githubusercontent.com/neaxusxgod-png/INS-ui/main/uilib.min.lua"))() or INSui
+-- The UI library is fetched fresh on every load, and every reload is another request.
+-- Seventeen reloads in one session earned a "429: Too Many Requests" from GitHub,
+-- which loadstring then tried to parse as Luau ("Expected identifier ... got '429'"),
+-- leaving Lib nil and no menu at all - after the re-run guard had already retired the
+-- working instance. So: keep a copy on disk, and fall back to it whenever the fetch
+-- returns anything that is not the library.
+local LIB_CACHE = "insui_cache.lua"
+-- jsDelivr mirrors the same file from the same repo but rate-limits separately, so it
+-- keeps working when raw.githubusercontent starts answering 429.
+local LIB_URLS = {
+    "https://raw.githubusercontent.com/neaxusxgod-png/INS-ui/main/uilib.min.lua",
+    "https://cdn.jsdelivr.net/gh/neaxusxgod-png/INS-ui@main/uilib.min.lua",
+}
+local libSrc
+do
+    local function usable(s)
+        -- a rate-limit page is still a successful HTTP fetch, so check the content
+        return type(s) == "string" and #s > 5000 and not string.find(s, "^%s*%d%d%d:")
+    end
+    for _, u in ipairs(LIB_URLS) do
+        local okh, body = pcall(function() return game:HttpGet(u) end)
+        if okh and usable(body) then
+            libSrc = body
+            pcall(function() writefile(LIB_CACHE, body) end)
+            break
+        end
+    end
+    if not libSrc then
+        local okc, cached = pcall(function() return readfile(LIB_CACHE) end)
+        if okc and usable(cached) then
+            libSrc = cached
+            warn("[AR2 Hub] every mirror failed, using the cached copy")
+        end
+    end
+end
+local Lib = (libSrc and loadstring(libSrc)()) or INSui
 
 -- ---------------- portability shims ----------------
 local function getCamera()
@@ -743,7 +808,12 @@ local function myCharRoot()
     if not cam then return nil end
     local cpos = cam.Position
     local best, bestD = nil, math.huge
-    for _, c in ipairs(workspace.Characters:GetChildren()) do
+    -- workspace.Characters goes nil during respawns and streaming gaps. Unguarded,
+    -- this threw "attempt to index nil with 'GetChildren'" during a load and aborted
+    -- the whole chunk partway, leaving half the script missing with no obvious sign.
+    local chars = workspace:FindFirstChild("Characters")
+    if not chars then return nil end
+    for _, c in ipairs(chars:GetChildren()) do
         local a = anchor(c)
         if a then
             local d = (a.Position - cpos).Magnitude
@@ -756,7 +826,10 @@ end
 local function resolveSite(cat, rec)
     local def = E.Categories[cat]
     local names, count = {}, 0
-    for _, z in ipairs(workspace.Zombies:GetChildren()) do
+    -- same nil-during-streaming guard as myCharRoot; returns a count, not a list
+    local zf = workspace:FindFirstChild("Zombies")
+    if not zf then return 0 end
+    for _, z in ipairs(zf:GetChildren()) do
         local ln = string.lower(z.Name)
         if npcMatch(ln, def) or sharedMatch(ln) then
             local a = anchor(z)
@@ -2640,7 +2713,7 @@ ML.Enabled   = false
 ML.KeyMode   = "Hold"                      -- "Hold" | "Toggle" | "Always"
 ML.Armed     = ML.Armed == true            -- used by Toggle mode
 ML.Key       = ML.Key or "v"
-ML.Players   = ML.Players == true
+ML.Players   = (ML.Players ~= false)       -- on by default now
 ML.Zombies   = (ML.Zombies ~= false)
 ML.Cooldown  = ML.Cooldown or 0.6
 ML.FrontOnly = (ML.FrontOnly ~= false)     -- ignore targets behind you
@@ -2682,42 +2755,31 @@ local melTrackPart, melTrackSurf, melTrackRate, melTrackAt = nil, 0, 0, 0
 local melMiss = 0              -- consecutive empty Equipped reads, see melResolve
 local melLastOk = nil          -- when the weapon last resolved cleanly
 
+-- Trimmed UI. Cooldown, key grace, sprint keeping and swing prediction all still run
+-- with the values proven during testing - only their sliders are gone, because they
+-- were tuned once and never wanted again. The behaviour is unchanged; there is just
+-- less to read past.
 local melSec  = melsub:Section("Auto Melee", "Full")
 local melInfo = melSec:Label("no melee equipped")
-local melTgt  = melsub:Section("Targets", "Left")
-local melTune = melsub:Section("Timing & Reach", "Right")
-local melPred = melsub:Section("Swing Prediction", "Full")
+local melTgt  = melsub:Section("Targets", "Full")
 
 melSec:Toggle("Auto Melee", false, function(v) ML.Enabled = v end,
     "Swings automatically when something you have selected is inside the weapon's own reach and in front of you.")
-melSec:Dropdown("Key Mode", "Hold", {"Hold", "Toggle", "Always"}, false,
+melSec:Dropdown("Key Mode", "Hold", {"Hold", "Toggle"}, false,
     function(v) ML.KeyMode = dropStr(v, "Hold") end,
-    "Hold: only swings while you hold the key. Toggle: tap the key to switch it on, tap again for off. Always: no key needed, swings at anything in range.")
+    "Hold: only swings while you hold the trigger. Toggle: tap once for on, again for off.")
 melSec:Dropdown("Trigger", "Key", { "Key", "Mouse 4", "Mouse 5", "Right Mouse" }, false,
     function(v) ML.Trigger = dropStr(v, "Key") end,
     "What actually fires it. A mouse button is strongly preferred: measured on this machine, V registered on only 3% of reads while W and shift were held, because a keyboard cannot report every key at once. Mouse buttons do not go through that matrix.")
 melKeyHandle = melSec:Keybind("Melee Key", "v", function(k) ML.Key = k end,
     "Only used when Trigger is set to Key.")
 
+melTgt:Toggle("Target Players", true, function(v) ML.Players = v end,
+    "Whitelisted players are never swung at, whatever this says.")
 melTgt:Toggle("Target Zombies", true, function(v) ML.Zombies = v end)
-melTgt:Toggle("Target Players", false, function(v) ML.Players = v end)
 melTgt:Toggle("Only Hit What's In Front Of You", true, function(v) ML.FrontOnly = v end,
     "On: ignores anything behind or beside you, because a real swing only reaches forward. Off: swings at anything close, even behind you.")
-
-melTune:Slider("Cooldown", 0.6, 0.05, 0.1, 2.0, " s", function(v) ML.Cooldown = v end,
-    "Minimum gap between swings. The weapon's real cooldown is not readable, so tune this by feel; too fast just wastes clicks.")
-melTune:Slider("Key Hold Grace", 0.25, 0.05, 0.05, 1.0, " s", function(v) ML.KeyGrace = v end,
-    "How long a held key stays counted after the last successful read. Keyboards drop keys when several are held at once, and this bridges the gaps. Raise it if auto melee stutters while running; lower it if it keeps swinging after you let go.")
-melTune:Toggle("Keep Sprint When Swinging", true, function(v) ML.KeepSprint = v end,
-    "Swinging drops you to a walk. This re-presses shift straight after the swing, exactly as you would by hand, so you keep running. Works for your own clicks as well as auto swings.")
-melTune:Slider("Sprint Re-press Delay", 0.02, 0.01, 0.01, 0.4, " s", function(v) ML.SprintDelay = v end,
-    "How long to wait after the swing before re-pressing shift. Too early and the swing cancels it again; too late and you walk for a moment.")
-
-melPred:Toggle("Predict Swing", true, function(v) ML.Predict = v end,
-    "Damage lands at the far point of the swing, not when it starts. This swings early by the windup time so the blade arrives as the target reaches you, instead of hitting where it used to be.")
-melPred:Slider("Swing Windup", 0.15, 0.01, 0, 0.6, " s", function(v) ML.Windup = v end,
-    "Time between the swing starting and the damage frame. Raise it if fast targets still slip past; lower it if it swings at thin air.")
-local melPredInfo = melPred:Label("closing: -")
+local melPredInfo = melTgt:Label("closing: -")
 
 -- ---- chase ----
 -- Closes the gap with a velocity burst aimed at the target, then lets the existing
@@ -4266,6 +4328,930 @@ task.spawn(function()
     for i = 1, IT.POOL do
         pcall(function() pool[i].dot:Remove() end)
         pcall(function() pool[i].name:Remove() end)
+    end
+end)
+end
+-- ==================== Vehicle Mods (Combat > Vehicle Mods) ====================
+-- Measured on an ambulance with the player sitting in it:
+--   * writing AssemblyLinearVelocity to the vehicle's Base part MOVED it 16.88 studs,
+--     and read back exactly what was written
+--   * 0.13 studs of drift over the next 2 seconds with no further writes, so the
+--     server accepts the displacement rather than correcting it
+--   * vertical at 22 studs/s did nothing at all - the suspension absorbs it - but 60
+--     lifted the vehicle 19.3 studs, so flight needs to clear that floor
+--   * Config and Config.Physics decompile with their structure but no numbers, so
+--     there is no MaxSpeed constant to edit; velocity is the whole mechanism
+--   * there is NO velocity ceiling. Writing 600 once read back as 425 and I called
+--     that a clamp - it was a snapshot taken 0.05s into the burst while the value was
+--     still ramping. A proper 6 second run at 1000 recorded a peak of 1108 studs/s
+--     measured from actual position change, velocity reading back at 1035, and
+--     covered 2344 studs with the vehicle intact. Trust displacement over a property
+--     read taken mid-acceleration
+-- The vehicle itself is what moves here. The character is never touched.
+--
+-- This is the loudest thing in the script by a distance: a car doing 120 studs/s or
+-- leaving the ground is visible to everyone, not just to the server.
+do
+_G.VEHMOD = _G.VEHMOD or {}
+_G.VEHMOD.Boost      = false
+_G.VEHMOD.Fly        = false
+_G.VEHMOD.BoostSpeed = 70              -- forced, matches the slider drawn below
+_G.VEHMOD.Ramp       = 0
+-- Flight survival, measured: a gentle flight lived, a hard one exploded mid-air at 6
+-- seconds, then a 6 second run at 1000 studs/s lived and covered 2344 studs. So
+-- duration alone does not decide it - one 6 second flight died and another did not.
+-- Whatever the trigger is, it is server side and not readable here. The limit stays
+-- as an opt-out safety net rather than a rule, since it clearly is not one.
+_G.VEHMOD.FlyLimit   = true
+_G.VEHMOD.FlyMax     = 6                           -- seconds of continuous flight
+-- Flying drains ENGINE HEALTH, which is what actually destroys the vehicle. Traced on
+-- a Jeep: 0.224 0.209 0.203 0.186 0.175 0.164 0.148 0.142 0.136 0.131 0.120, then it
+-- died mid-air at 404 studs after 5.4 airborne seconds. That Jeep started at 22%, so
+-- it had almost nothing to spend - which is why earlier runs looked random. A gentle
+-- flight survived and a hard one exploded not because of speed or height, but because
+-- of how much engine each vehicle had left. Watch the engine, not the clock.
+_G.VEHMOD.EngineGuard = true
+_G.VEHMOD.EngineMin   = 0.05                       -- hard floor; the trip estimate does the rest
+_G.VEHMOD.EngineNow   = nil
+_G.VEHMOD.entryAt     = 0
+_G.VEHMOD.flyStart   = nil
+_G.VEHMOD.flyLock    = 0
+_G.VEHMOD.AutoRight  = true            -- lift a rolled vehicle back onto its wheels
+_G.VEHMOD.RightLift  = _G.VEHMOD.RightLift or 65
+_G.VEHMOD.rightUntil = 0
+_G.VEHMOD.rightLast  = 0
+_G.VEHMOD.FlySpeed   = _G.VEHMOD.FlySpeed or 70
+_G.VEHMOD.Range      = 15
+_G.VEHMOD.Trigger    = dropStr(_G.VEHMOD.Trigger, "Mouse 4")
+_G.VEHMOD.State      = "off"
+_G.VEHMOD.TRIG = { ["Mouse 4"] = 0x05, ["Mouse 5"] = 0x06, ["Right Mouse"] = 0x02, ["Space"] = 0x20 }
+
+_G.VEHMOD.ui = {}
+_G.VEHMOD.ui.sub = combattab:Sub("Vehicle Mods", "compass")
+_G.VEHMOD.ui.sec = _G.VEHMOD.ui.sub:Section("Drive", "Full")
+_G.VEHMOD.ui.sec:Label("Moves the VEHICLE, not you. Time in the air is the cost:")
+_G.VEHMOD.ui.sec:Label("the engine starts depleting about a second after takeoff")
+_G.VEHMOD.ui.sec:Label("and drains roughly 2% per second until you are back down.")
+_G.VEHMOD.ui.sec:Label("That damage never comes back, so stay low and land often.")
+_G.VEHMOD.ui.sec:Toggle("Fly", false, function(v) _G.VEHMOD.Fly = v end,
+    "While the trigger is held, the vehicle goes wherever the camera points, including upward.")
+_G.VEHMOD.ui.sec:Slider("Fly Speed", 400, 10, 50, 1200, " studs/s", function(v) _G.VEHMOD.FlySpeed = v end,
+    "Below about 50 the suspension eats the lift entirely. There is no upper ceiling - 1000 measured a peak of 1108 studs/s - and faster means less time airborne, which means less engine spent.")
+_G.VEHMOD.ui.sec:Dropdown("Trigger", "Mouse 4", { "Mouse 4", "Mouse 5", "Right Mouse", "Space", "Key" }, false,
+    function(v) _G.VEHMOD.Trigger = dropStr(v, "Mouse 4") end,
+    "What holds the flight on. Mouse buttons are the reliable choice: keyboards drop keys while W and shift are held, which is exactly the state you are in while driving. Pick Key to use the bind below instead.")
+_G.VEHMOD.ui.key = _G.VEHMOD.ui.sec:Keybind("Fly Key", "g", function(k) _G.VEHMOD.Key = k end,
+    "Only used when Trigger is set to Key.")
+_G.VEHMOD.ui.sec:Toggle("Auto Right", true, function(v) _G.VEHMOD.AutoRight = v end,
+    "Lifts the vehicle when it rolls, which drops it back onto its wheels. Angular velocity cannot be written in this game, so a vertical shove is the only way to undo a flip.")
+_G.VEHMOD.ui.sec:Toggle("Protect Engine", true, function(v) _G.VEHMOD.EngineGuard = v end,
+    "Refuses trips the vehicle cannot survive, and lands early if the engine runs out mid-flight.")
+_G.VEHMOD.ui.info = _G.VEHMOD.ui.sec:Label("off")
+-- ---- autopilot ----
+-- Flies the vehicle to a saved waypoint on its own: climb, cruise, descend, stop.
+--
+-- The landing is the part that needs the waypoint. There is no way to ask this game
+-- how high the ground is anywhere - workspace:Raycast is bound but always returns nil
+-- - so a destination picked off a map would have no known ground level and the
+-- descent would either stop in mid-air or drive into a hillside. A waypoint saved
+-- from where you are STANDING carries its own ground height, which is exactly the
+-- number the descent needs.
+_G.VEHMOD.AP = _G.VEHMOD.AP or {}
+_G.VEHMOD.AP.on      = false
+_G.VEHMOD.AP.phase   = "idle"
+_G.VEHMOD.AP.target  = nil
+_G.VEHMOD.AP.Height  = 140            -- cruise altitude above the waypoint
+_G.VEHMOD.AP.Speed   = 1200           -- cruise ceiling; the braking curve picks the rest
+-- Descent rate. This was 35, which sounds gentle and is actually the most expensive
+-- part of a trip: 250 studs down at 35 studs/s is 7 seconds in the air, against 1.3 to
+-- climb the same distance at 220. At the measured drain that is roughly 12% of engine
+-- spent sinking, and it killed a tractor mid-descent. Engine cost follows time in the
+-- air, so a slow descent is not the safe option - it is the one that strands you.
+_G.VEHMOD.AP.Descent = 350            -- max descent rate
+_G.VEHMOD.AP.Radius  = 12             -- horizontal arrival tolerance
+-- Absolute altitude floor for cruising. Height alone is measured from the DESTINATION,
+-- so a trip to somewhere low crossed low - a run to a coastal target at Y=17 cruised at
+-- 157 and went straight through ground that Beaufort sits on at 194. Phasing through
+-- terrain at speed is also what got the account kicked, so this is a safety floor as
+-- much as a routing one: the highest recorded destination is 194.
+_G.VEHMOD.AP.MinAlt  = 280
+_G.VEHMOD.AP.Brake   = 900            -- studs/s^2 it can shed on the run-in
+_G.VEHMOD.AP.LandDecel  = 150         -- how hard the descent flares out near the ground
+_G.VEHMOD.AP.TouchSpeed = 8           -- vertical speed it aims to actually touch down at
+-- Vertical speed is where multi-leg trips bleed engine: every leg pays a climb AND a
+-- descent, so a three leg run spends about 13 seconds going up and down before any
+-- horizontal distance is covered - roughly 30% of engine at the measured 2.3%/s. The
+-- climb used to be hardcoded at 220.
+_G.VEHMOD.AP.Climb = 500
+
+_G.VEHMOD.ui.apSec = _G.VEHMOD.ui.sub:Section("Autopilot", "Full")
+_G.VEHMOD.ui.apSec:Label("Flies the vehicle to a destination and lands it. Long trips")
+_G.VEHMOD.ui.apSec:Label("may still need manual stops: the engine depletes the whole")
+_G.VEHMOD.ui.apSec:Label("time you are airborne, and arriving somewhere the map has")
+_G.VEHMOD.ui.apSec:Label("not streamed in yet drops the vehicle through the ground.")
+_G.VEHMOD.ui.apSec:Slider("Travel Height", 280, 10, 60, 800, " studs", function(v)
+    _G.VEHMOD.AP.MinAlt = v
+    _G.VEHMOD.AP.Height = math.max(60, v - 140)
+end, "How high it crosses. Enough to clear terrain, but every stud is climbed and descended again, and that is engine.")
+_G.VEHMOD.ui.apSec:Slider("Travel Speed", 1200, 50, 100, 2500, " studs/s", function(v)
+    _G.VEHMOD.AP.Speed = v
+    _G.VEHMOD.AP.Brake = v          -- braking tracks speed: this ratio landed well in testing
+    _G.VEHMOD.AP.Climb = math.max(200, v * 0.4)
+    _G.VEHMOD.AP.Descent = math.max(150, v * 0.3)
+end, "Sets the whole flight profile - cruise, braking, climb and descent together. Faster is cheaper: engine follows time in the air, not distance.")
+_G.VEHMOD.ui.apInfo = _G.VEHMOD.ui.apSec:Label("idle")
+
+-- ---- named destinations ----
+-- Positions recorded by standing on the spot, so each carries its own ground height -
+-- the only way the descent knows where to stop, since this game cannot measure ground.
+-- Grouped by island. Routing is deliberately direct: engine damage is permanent, so an
+-- automatic stop saves nothing, and the player is better placed to judge when the map
+-- needs time to stream in than any rule here.
+_G.VEHMOD.POI = {
+  -- Halsey Island
+    { name = "Ashland",               island = "Halsey",   pos = Vector3.new(-388, 25, 2351) },
+    { name = "Ashland Suburbs",       island = "Halsey",   pos = Vector3.new(-1734, 84, 1709) },
+    { name = "Regional Airport",      island = "Halsey",   pos = Vector3.new(-2522, 23, 4086) },
+    { name = "Lumber Yard",           island = "Halsey",   pos = Vector3.new(-4283, 128, 1338) },
+    { name = "Huron",                 island = "Halsey",   pos = Vector3.new(-5533, 33, 2506) },
+    { name = "Military Relay",        island = "Halsey",   pos = Vector3.new(-4773, 133, 1845) },
+    { name = "University",            island = "Halsey",   pos = Vector3.new(-3160, 92, 1770) },
+    { name = "Ranger Station",        island = "Halsey",   pos = Vector3.new(-5315, 126, 650) },
+    { name = "Observatory",           island = "Halsey",   pos = Vector3.new(-5761, 160, -285) },
+    { name = "Fishing Camp",          island = "Halsey",   pos = Vector3.new(-6811, 17, -868) },
+    { name = "Beaufort",              island = "Halsey",   pos = Vector3.new(-4848, 194, -390) },
+    { name = "Water Treatment Plant", island = "Halsey",   pos = Vector3.new(-4665, 26, -2095) },
+    { name = "Radio Station",         island = "Halsey",   pos = Vector3.new(-3086, 152, 147) },
+    { name = "Fairview",              island = "Halsey",   pos = Vector3.new(-2629, 32, -1799) },
+    { name = "Lighthouse",            island = "Halsey",   pos = Vector3.new(-221, 61, 3454) },
+  -- Faris Island
+    { name = "Destroyer Shipwreck",   island = "Faris",    pos = Vector3.new(-1736, 81, -2929) },
+    { name = "Military Prison",       island = "Faris",    pos = Vector3.new(-848, 9, -3294) },
+    { name = "Casino",                island = "Faris",    pos = Vector3.new(885, 31, -3987) },
+    { name = "Magnolia",              island = "Faris",    pos = Vector3.new(2507, 21, -3364) },
+    { name = "JROTC Camp",            island = "Faris",    pos = Vector3.new(1486, 68, -2696) },
+    { name = "Naval Air Station",     island = "Faris",    pos = Vector3.new(634, 23, -1369) },
+    { name = "Truck Stop",            island = "Faris",    pos = Vector3.new(677, 32, -252) },
+    { name = "Junkyard",              island = "Faris",    pos = Vector3.new(-472, 70, -282) },
+  -- Mackinaw Island
+    { name = "Lockport",              island = "Mackinaw", pos = Vector3.new(1166, 21, 2747) },
+    { name = "Eden",                  island = "Mackinaw", pos = Vector3.new(3026, 47, 1354) },
+    { name = "Geothermal Power Plant", island = "Mackinaw", pos = Vector3.new(3695, 51, 530) },
+    { name = "Mansion",               island = "Mackinaw", pos = Vector3.new(3865, 20, -2755) },
+    { name = "Cargo Shipwreck",       island = "Mackinaw", pos = Vector3.new(4598, 16, -319) },
+    { name = "Coastal Bunkers",       island = "Mackinaw", pos = Vector3.new(5421, 42, 1523) },
+    { name = "Mortar",                island = "Mackinaw", pos = Vector3.new(5106, 59, 2640) },
+    { name = "Mines",                 island = "Mackinaw", pos = Vector3.new(4058, 38, 2614) },
+    { name = "Smuggler Airstrip",     island = "Mackinaw", pos = Vector3.new(5297, 57, 3471) },
+}
+
+-- direct, always: manual stops replaced automatic hops
+_G.VEHMOD.routeTo = function(from, target) return { target } end
+_G.VEHMOD.flyTo = function(target)
+    local VM = _G.VEHMOD
+    local okr, P = pcall(function() return svcPlayers() end)
+    local lp = (okr and P) and P.LocalPlayer or nil
+    local ch = lp and lp.Character
+    local hrp = ch and ch:FindFirstChild("HumanoidRootPart") or nil
+    local from
+    if hrp then
+        local okp, p = pcall(function() return hrp.Position end)
+        from = okp and p or nil
+    end
+    if not from then return end
+    -- Lock the vehicle HERE, while standing still, rather than letting the flight loop
+    -- hunt for one at 30 Hz. Pressing a destination with no vehicle in reach used to
+    -- start a search that repeated every tick and took the client down with it.
+    local base, why = VM.baseNear(from, 0)
+    if not base then
+        pcall(function() Lib:Notify("no vehicle in reach - get in one first", 4) end)
+        VM.AP.on, VM.AP.phase = false, tostring(why)
+        return
+    end
+    VM.AP.base = base
+    VM.EngineNow = VM.engineOf(base) or VM.EngineNow   -- current vehicle, not the last one
+    local legs = VM.routeTo(from, target)
+    -- Estimate what the trip costs before committing to it. Per leg: climb, cross,
+    -- descend - the cross being distance/speed plus the time to shed that speed.
+    local est, prev = 0, from
+    for _, p in ipairs(legs) do
+        local d = (Vector3.new(p.X, 0, p.Z) - Vector3.new(prev.X, 0, prev.Z)).Magnitude
+        local v = math.min(VM.AP.Speed, math.sqrt(2 * VM.AP.Brake * math.max(d, 1)))
+        est = est + (d / v) + (v / (2 * VM.AP.Brake))
+                  + (VM.AP.Height / math.max(VM.AP.Climb or 500, 1))
+                  + (VM.AP.Height / math.max(VM.AP.Descent, 1))
+        prev = p
+    end
+    VM.AP.estTime = est
+    local L = _G.FLIGHTLOG
+    local cost = L and L.rate and (L.rate * est) or nil
+    VM.AP.estCost = cost
+    if VM.EngineGuard and VM.EngineNow then
+        -- hard floor only: below this nothing is worth attempting
+        if VM.EngineNow < (VM.EngineMin or 0.05) then
+            pcall(function()
+                Lib:Notify(string.format("engine at %.0f%% - too low to fly", VM.EngineNow * 100), 4)
+            end)
+            VM.AP.on, VM.AP.phase = false, "engine too low"
+            return
+        end
+        -- otherwise judge the trip, not the number: warn when the estimate does not fit
+        if cost and cost > (VM.EngineNow - 0.02) then
+            pcall(function()
+                Lib:Notify(string.format("trip needs about %.0f%% engine, you have %.0f%% - it may not make it",
+                    cost * 100, VM.EngineNow * 100), 5)
+            end)
+        end
+    end
+    VM.AP.legs = legs
+    VM.AP.leg = 1
+    VM.AP.target = VM.AP.legs[1]
+    VM.AP.early, VM.AP.lastHoriz = nil, nil
+    VM.AP.on = true
+    VM.AP.phase = "climb"
+    pcall(function()
+        Lib:Notify(string.format("flying: %d leg%s", #VM.AP.legs, (#VM.AP.legs == 1) and "" or "s"), 3)
+    end)
+end
+
+for _, poi in ipairs(_G.VEHMOD.POI) do
+    _G.VEHMOD.ui.poiSec:Button(poi.name, function() _G.VEHMOD.flyTo(poi.pos) end,
+        string.format("%.0f, %.0f, %.0f", poi.pos.X, poi.pos.Y, poi.pos.Z))
+end
+
+-- Finds the vehicle you are in via the ESP cache rather than walking the Vehicles
+-- folder: enumerating all 79 of them alongside the ESP's own sweep is what took
+-- Matcha down during this investigation.
+-- Result is cached briefly. This walks all ~79 cached vehicles reading a position
+-- from each, about 4 ms, and Auto Right was calling it every tick for as long as
+-- Boost or Fly was enabled - 80 ms of every second spent re-answering the same
+-- question. Everything here runs alongside several ESP sweeps, so that mattered.
+-- Engine condition, read straight off the vehicle rather than through the ESP cache.
+-- VM.EngineNow used to be refreshed only inside the flight loops, so between trips it
+-- held the LAST vehicle's reading - a fresh 68% Mustang was judged as the 15% wreck
+-- that preceded it, which would refuse or abort flights it could easily complete.
+_G.VEHMOD.engineOf = function(base)
+    if not base then return nil end
+    local model = base.Parent
+    local inter = model and model:FindFirstChild("Interaction")
+    local ref = inter and inter:FindFirstChild("Repair Engine")
+    if not ref then return nil end
+    local ok, h = pcall(function() return ref:GetAttribute("Health") end)
+    if ok and type(h) == "table" and type(h.y) == "number" then return h.y end
+    return nil
+end
+
+_G.VEHMOD.baseNear = function(myPos, maxAge)
+    local VM = _G.VEHMOD
+    local now = tick()
+    if VM.nearAt and (now - VM.nearAt) < (maxAge or 1.0) and VM.nearBase then
+        local okv = pcall(function() return VM.nearBase.Position end)
+        if okv then return VM.nearBase, VM.nearWhy end
+    end
+    -- FAILURE backoff. A miss used to re-scan on the very next call, so autopilot with
+    -- no vehicle locked asked 30 times a second. The scan measured 4 ms on a healthy
+    -- client, but under load each lookup inflates the same way every other read does,
+    -- and it starved the client to a fifth of a frame per second - health hit its 0.05
+    -- floor and the game stopped responding. A failed search must cost almost nothing
+    -- to repeat, so it simply is not repeated for a while.
+    if VM.nearFailAt and (now - VM.nearFailAt) < 2.0 and not VM.nearBase then
+        return nil, VM.nearWhy or "no vehicle within reach"
+    end
+    VM.nearAt = now
+    local cache = _G.VEHESP and _G.VEHESP.Cache
+    if not cache or #cache == 0 then
+        -- Fall back to reading the Vehicles folder directly. Using the ESP's cache is
+        -- cheaper, but depending on it meant every Vehicle Mods feature silently did
+        -- nothing whenever Vehicle ESP happened to be switched off - autopilot just sat
+        -- in "no vehicle" after a button press with no visible reason. A feature should
+        -- not fail because an unrelated toggle is off.
+        local vf = workspace:FindFirstChild("Vehicles")
+        if not vf then return nil, "no Vehicles folder" end
+        local fb, fbd, fbn
+        for _, v in ipairs(vf:GetChildren()) do
+            local b = v:FindFirstChild("Base")
+            if b then
+                local okp, p = pcall(function() return b.Position end)
+                if okp and p then
+                    local okd, d = pcall(function() return (p - myPos).Magnitude end)
+                    if okd and d <= VM.Range and (not fbd or d < fbd) then
+                        fb, fbd, fbn = b, d, v.Name
+                    end
+                end
+            end
+        end
+        VM.nearBase, VM.nearWhy = fb, fb and fbn or "no vehicle within reach"
+        VM.nearFailAt = (not fb) and now or nil
+        return fb, VM.nearWhy
+    end
+    local best, bd
+    for _, e in ipairs(cache) do
+        local okp, p = pcall(function() return e.part.Position end)
+        if okp and p then
+            local okd, d = pcall(function() return (p - myPos).Magnitude end)
+            if okd and (not bd or d < bd) then best, bd = e, d end
+        end
+    end
+    if not best or bd > _G.VEHMOD.Range then
+        VM.nearBase, VM.nearWhy = nil, "no vehicle within reach"
+        return nil, VM.nearWhy
+    end
+    local model = best.part.Parent
+    local base = model and model:FindFirstChild("Base")
+    VM.nearBase = base
+    VM.nearWhy = base and best.name or "no Base part"
+    return base, VM.nearWhy
+end
+
+-- ---- flight log ----
+-- Answers the three questions that matter for planning a trip, and does it inside the
+-- script rather than through an external recorder, because every recorder I ran from
+-- outside either got cut off mid-run or contributed to a crash.
+--
+--   how far before damage   - distance and air time when engine health FIRST drops
+--   how fast is possible    - peak speed measured from position change, not the
+--                             velocity property, which reads mid-ramp values
+--   does ground time reset  - time spent grounded before each flight is recorded
+--                             alongside how long that flight lasted before damage,
+--                             so the two can be compared across runs
+--
+-- Engine health is a fraction of a maximum that differs per vehicle, so the drop
+-- SIZE is not comparable between vehicles - the timing of the first drop is.
+_G.FLIGHTLOG = _G.FLIGHTLOG or { runs = {} }
+_G.VEHMOD.ui.logSec = _G.VEHMOD.ui.sub:Section("Flight Log", "Full")
+_G.VEHMOD.ui.logA = _G.VEHMOD.ui.logSec:Label("grounded")
+_G.VEHMOD.ui.logB = _G.VEHMOD.ui.logSec:Label("-")
+_G.VEHMOD.ui.logC = _G.VEHMOD.ui.logSec:Label("no damage recorded yet")
+_G.VEHMOD.ui.logSec:Button("Reset Log", function()
+    _G.FLIGHTLOG.runs = {}
+    _G.FLIGHTLOG.first = nil
+    pcall(function() Lib:Notify("flight log cleared", 2) end)
+end, "Clears the recorded runs. The current flight keeps going.")
+_G.VEHMOD.ui.logSec:Button("Print Log", function()
+    local L = _G.FLIGHTLOG
+    print("---- AR2 Hub flight log ----")
+    print(string.format("%d run%s recorded", #L.runs, (#L.runs == 1) and "" or "s"))
+    for i, r in ipairs(L.runs) do
+        print(string.format("%2d. grounded %5.1fs | flew %5.1fs, %6.0f studs, peak %4.0f | tilted %4.1fs, worst level %.2f | %s",
+            i, r.groundBefore or -1, r.air or -1, r.dist or -1, r.peak or -1,
+            r.tilted or -1, r.minLevel or -1,
+            r.dmgAir and string.format("DAMAGE at %.1fs, level %.2f (tilted %.1fs by then)",
+                                       r.dmgAir, r.dmgLevel or -1, r.dmgTilted or -1)
+                     or "no damage"))
+    end
+end, "Dumps every recorded run to the console, one line each.")
+
+task.spawn(function()
+    local VM = _G.VEHMOD
+    local L = _G.FLIGHTLOG
+    local run, lastPos, lastT, groundAt, lastEng = nil, nil, tick(), tick(), nil
+    while _G.AR2HUB_GEN == GEN do
+        local okr, P = pcall(function() return svcPlayers() end)
+        local lp = (okr and P) and P.LocalPlayer or nil
+        local ch = lp and lp.Character
+        local hrp = ch and ch:FindFirstChild("HumanoidRootPart") or nil
+        local myPos
+        if hrp then
+            local okp, p = pcall(function() return hrp.Position end)
+            myPos = okp and p or nil
+        end
+        -- long cache: the log is a passive observer and must never drive a search
+        local base = myPos and VM.baseNear(myPos, 3.0) or nil
+        if base then
+            local okp, pos = pcall(function() return base.Position end)
+            -- read it here too, on a timer, so the log and the guards agree even when
+            -- no flight loop is running
+            local nowE = tick()
+            if nowE - (VM.engAt or 0) > 0.5 then
+                VM.engAt = nowE
+                VM.EngineNow = VM.engineOf(base) or VM.EngineNow
+            end
+            local eng = VM.EngineNow
+            if okp and pos then
+                local now = tick()
+                -- ground reference: the lowest recent altitude counts as ground, so
+                -- "airborne" means well above wherever this vehicle was sitting
+                if not run then
+                    run = { groundY = pos.Y, air = 0, dist = 0, peak = 0,
+                            eng0 = eng, groundBefore = now - groundAt,
+                            minLevel = 1, tilted = 0 }
+                end
+                -- Orientation, to test whether flight damage is really the same
+                -- "vehicle is not upright" rule that drains it on the ground. The
+                -- Jeep exploded at 12% engine rather than 0%, so the explosion is a
+                -- separate trigger from the drain - and nothing here controls
+                -- rotation, since angular velocity cannot be written, so a flying
+                -- vehicle is free to tumble.
+                local okc, vcf = pcall(function() return base.CFrame end)
+                local level = (okc and vcf) and vcf.UpVector.Y or 1
+                if level < run.minLevel then run.minLevel = level end
+                local airborne = (pos.Y - run.groundY) > 10
+                local dt = now - lastT
+                if lastPos and dt > 0 then
+                    local seg = (pos - lastPos).Magnitude
+                    local sp = seg / dt
+                    if airborne then
+                        run.air = run.air + dt
+                        run.dist = run.dist + seg
+                        if sp > run.peak then run.peak = sp end
+                        if level < 0.9 then run.tilted = run.tilted + dt end
+                    end
+                end
+                -- first engine drop of this flight is the number being hunted
+                if eng and lastEng and eng < lastEng - 0.0005 and airborne and not run.dmgAir then
+                    run.dmgAir, run.dmgDist = run.air, run.dist
+                    -- the number that decides it: was the vehicle upright when the
+                    -- engine first took damage, or already tumbling?
+                    run.dmgLevel, run.dmgTilted = level, run.tilted
+                    L.first = L.first or { air = run.air, dist = run.dist,
+                                           ground = run.groundBefore, peak = run.peak }
+                end
+                if eng then lastEng = eng end
+                if not airborne then
+                    if run.air > 1.5 then
+                        -- A real flight just ended: file it, and learn the drain rate
+                        -- from it. A flat "don't fly below 15%" threshold is the wrong
+                        -- test - a 4,380 stud hop was completed on a 15% engine because
+                        -- it took two seconds, while a slow trip at 40% could strand
+                        -- you. Cost is time multiplied by this rate.
+                        if run.eng0 and eng and run.air > 1 then
+                            local spent = run.eng0 - eng
+                            if spent > 0 then
+                                local r = spent / run.air
+                                L.rate = L.rate and (L.rate * 0.6 + r * 0.4) or r
+                            end
+                        end
+                        L.runs[#L.runs + 1] = run
+                        run = nil
+                        groundAt = now
+                    else
+                        run.groundY = math.min(run.groundY, pos.Y)
+                        run.groundBefore = now - groundAt
+                    end
+                end
+                lastPos, lastT = pos, now
+                VM.logLive = run
+            end
+        else
+            groundAt = groundAt or tick()
+        end
+        task.wait(0.2)
+    end
+end)
+
+task.spawn(function()
+    while _G.AR2HUB_GEN == GEN do
+        pcall(function()
+            local VM, L = _G.VEHMOD, _G.FLIGHTLOG
+            local r = VM.logLive
+            if r then
+                _G.VEHMOD.ui.logA:SetText(string.format(
+                    "%s | air %.1fs | %.0f studs | peak %.0f | level %.2f (tilted %.1fs)",
+                    (r.air > 0.2) and "AIRBORNE" or "grounded", r.air, r.dist, r.peak,
+                    r.minLevel or 1, r.tilted or 0))
+                _G.VEHMOD.ui.logB:SetText(string.format("engine %s -> %s | grounded %.1fs before takeoff",
+                    r.eng0 and string.format("%.0f%%", r.eng0 * 100) or "?",
+                    VM.EngineNow and string.format("%.0f%%", VM.EngineNow * 100) or "?",
+                    r.groundBefore or 0))
+            else
+                _G.VEHMOD.ui.logA:SetText("no vehicle nearby")
+                _G.VEHMOD.ui.logB:SetText("-")
+            end
+            local rateTxt = L.rate and string.format(" | drain %.1f%%/s", L.rate * 100) or ""
+            if L.first then
+                _G.VEHMOD.ui.logC:SetText(string.format(
+                    "first damage: %.1fs airborne, %.0f studs (after %.1fs grounded)%s | %d runs",
+                    L.first.air, L.first.dist, L.first.ground or -1, rateTxt, #L.runs))
+            else
+                _G.VEHMOD.ui.logC:SetText(string.format("no damage yet%s | %d runs", rateTxt, #L.runs))
+            end
+        end)
+        task.wait(0.4)
+    end
+end)
+
+-- autopilot: owns the vehicle while engaged, so the manual loop stands down
+task.spawn(function()
+    local VM = _G.VEHMOD
+    while _G.AR2HUB_GEN == GEN do
+        local AP = VM.AP
+        if AP.on and AP.target then
+            local okr, P = pcall(function() return svcPlayers() end)
+            local lp = (okr and P) and P.LocalPlayer or nil
+            local ch = lp and lp.Character
+            local hrp = ch and ch:FindFirstChild("HumanoidRootPart") or nil
+            local myPos
+            if hrp then
+                local okp, p = pcall(function() return hrp.Position end)
+                myPos = okp and p or nil
+            end
+            -- Lock onto the vehicle once, at engage, and keep the reference.
+            -- Re-deriving it every tick compares YOUR position against each vehicle's,
+            -- and those two reads are taken moments apart - at 900 studs/s the vehicle
+            -- moves ~20 studs in that gap, so the nearest-within-15-studs test failed
+            -- and autopilot dropped the vehicle mid-flight. Traced: phase went straight
+            -- from climb to "no vehicle" as soon as speed picked up, and it fell out of
+            -- the sky while the altitude hold was working perfectly.
+            local base = AP.base
+            if base then
+                local okv = pcall(function() return base.Position end)
+                if not okv then base, AP.base = nil, nil end
+            end
+            if not base and myPos then
+                base = VM.baseNear(myPos)
+                AP.base = base
+            end
+            if not base then
+                AP.phase = "no vehicle"
+            else
+                local okp, pos = pcall(function() return base.Position end)
+                if okp and pos then
+                    -- engine reading, same cache lookup the manual path uses
+                    local nowE = tick()
+                    if nowE - (VM.entryAt or 0) > 1.0 then
+                        VM.entryAt = nowE
+                        VM.entry = nil
+                        local mdl = base.Parent
+                        for _, e in ipairs((_G.VEHESP and _G.VEHESP.Cache) or {}) do
+                            if e.part and e.part.Parent == mdl then VM.entry = e break end
+                        end
+                    end
+                    VM.EngineNow = (VM.entry and VM.entry.parts) and VM.entry.parts.engine or nil
+                    AP.tickAt = tick()
+                    -- Stuck detection. Climb and descend both push in one direction
+                    -- until an altitude is reached, with nothing to say "this is not
+                    -- happening". Landing on a roof left it hovering at 128 studs
+                    -- writing downward velocity forever, and pushing up against
+                    -- something solid produced the same thing on the ground - the
+                    -- vehicle shaking in place with no way out of the phase.
+                    if AP.stuckY and math.abs(pos.Y - AP.stuckY) < 1.5 then
+                        AP.stuckFor = (AP.stuckFor or 0) + 0.03
+                    else
+                            AP.stuckY, AP.stuckFor = pos.Y, 0
+                    end
+                    local flat = Vector3.new(AP.target.X - pos.X, 0, AP.target.Z - pos.Z)
+                    local horiz = flat.Magnitude
+                    local cruiseY = math.max(AP.target.Y + AP.Height, AP.MinAlt or 280)
+                    local vel
+                    if AP.phase == "climb" then
+                        -- get above cruise height before crossing, so nothing is hit
+                        if pos.Y >= cruiseY - 5 then
+                            AP.phase = "cruise"
+                        elseif (AP.stuckFor or 0) > 2.5 then
+                            -- cannot get any higher: something is above or holding it,
+                            -- so cross at whatever height it managed rather than
+                            -- grinding upward against it
+                            AP.phase = "cruise"
+                            AP.stuckFor = 0
+                        else
+                            vel = Vector3.new(0, AP.Climb or 500, 0)
+                        end
+                    elseif AP.phase == "cruise" then
+                        -- engine is the fuel of this whole thing: if it is nearly gone,
+                        -- put down now rather than arriving as wreckage
+                        if VM.EngineGuard and VM.EngineNow and VM.EngineNow < VM.EngineMin then
+                            AP.phase = "descend"
+                            AP.early = true
+                            -- land HERE, not at the target: the descent only corrects
+                            -- horizontally at 25 studs/s, so chasing a distant waypoint
+                            -- while aborting looks like hovering and creeping forward
+                            AP.target = Vector3.new(pos.X, AP.target.Y, pos.Z)
+                            AP.legs, AP.leg = nil, nil
+                        elseif horiz <= AP.Radius then
+                            AP.phase = "descend"
+                        else
+                            local dir = flat / horiz
+                            -- Altitude hold. Writing the whole velocity each tick means
+                            -- Y goes to zero once it reaches height - and gravity then
+                            -- has the full gap between writes to work, about 9.8 studs/s
+                            -- of downward velocity every 50ms, so it sank out of the sky
+                            -- while the correction chased it. The bias cancels that gap,
+                            -- and the gain is enough to actually climb back.
+                            local dy = cruiseY - pos.Y
+                            if dy > 60 then dy = 60 elseif dy < -60 then dy = -60 end
+                            local lift = dy * 4 + 12          -- 12 = what gravity steals between ticks
+
+                            -- Braking curve, not a taper. The speed that can still be
+                            -- shed in the distance left is sqrt(2 * decel * remaining),
+                            -- so it runs at full speed until the last possible moment
+                            -- and then sheds it - which is what gets you there soonest
+                            -- AND stopped. A linear taper either crawls the last third
+                            -- or arrives too fast to stop.
+                            local remain = math.max(horiz - AP.Radius * 0.5, 0)
+                            local sp = math.min(AP.Speed, math.sqrt(2 * (AP.Brake or 300) * remain))
+
+                            -- and never step past the target inside one tick: at 400
+                            -- studs/s a tick covers 20 studs, which is how it was
+                            -- skipping straight over a 12 stud arrival radius
+                            local dt = tick() - (AP.tickAt or (tick() - 0.05))
+                            if dt < 0.02 then dt = 0.02 elseif dt > 0.2 then dt = 0.2 end
+                            if sp * dt > horiz then sp = horiz / dt end
+
+                            -- overshoot guard: if the gap starts growing while closing
+                            -- in, it has gone past, so stop dead and let descend take it
+                            if AP.lastHoriz and horiz > AP.lastHoriz and horiz < 120 then
+                                sp = 0
+                                AP.phase = "descend"
+                            end
+                            AP.lastHoriz = horiz
+                            -- if it has dropped badly, climbing matters more than speed:
+                            -- carrying full throttle while low is how it ends up meeting
+                            -- terrain instead of crossing it
+                            if dy > 25 then sp = sp * 0.5 end
+                            vel = dir * sp + Vector3.new(0, lift, 0)
+                        end
+                    elseif AP.phase == "descend" then
+                        local above = pos.Y - AP.target.Y
+                        -- Contact detection. The waypoint's height is only correct if it
+                        -- was recorded standing on that exact spot, and arriving a few
+                        -- studs off means real ground can be higher - so descending "to
+                        -- the number" drives the car into it. If the altitude stops
+                        -- falling while a descent is commanded, that IS contact, and
+                        -- continuing to push down is what turns a landing into damage.
+                        if above > 6 and (AP.stuckFor or 0) > 0.5 then
+                            local okv, cv = pcall(function() return base.AssemblyLinearVelocity end)
+                            if okv and cv and cv.Y > -3 then
+                                above = 0
+                                AP.landedHigh = true
+                            end
+                        end
+                        if above > 6 and (AP.stuckFor or 0) > 2.5 then
+                            above = 0
+                            AP.landedHigh = true
+                        end
+                        if above <= 6 then
+                            pcall(function()
+                                base.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+                            end)
+                            AP.stuckY, AP.stuckFor = nil, 0
+                            if AP.legs and AP.leg and AP.leg < #AP.legs then
+                                -- sit still so the next area can stream in, then go on
+                                AP.phase = "waiting"
+                                task.wait(AP.Pause or 3)
+                                AP.leg = AP.leg + 1
+                                AP.target = AP.legs[AP.leg]
+                                AP.lastHoriz, AP.early = nil, nil
+                                AP.phase = "climb"
+                            else
+                                AP.phase = "done"
+                                AP.on = false
+                            end
+                        else
+                            -- slow the closer it gets: a soft arrival is the whole
+                            -- point, since impact is what damages the vehicle
+                            -- Flare, not a linear taper. Touchdown speed is what does
+                            -- impact damage - the car was seen catching fire on arrival,
+                            -- which is the ordinary damage path, and trips cost anywhere
+                            -- from 4% to 10% depending on how hard it lands. The speed
+                            -- that can still be shed in the height remaining is
+                            -- sqrt(2*decel*above), so it falls fast while high and is
+                            -- genuinely slow at the moment of contact, which a linear
+                            -- taper to a 14 studs/s floor never was.
+                            local rate = math.min(AP.Descent,
+                                                  math.sqrt(2 * (AP.LandDecel or 60) * math.max(above, 0)))
+                            if rate < (AP.TouchSpeed or 8) then rate = AP.TouchSpeed or 8 end
+                            local corr = Vector3.new(0, 0, 0)
+                            if horiz > 2 then corr = (flat / horiz) * math.min(horiz * 1.5, 25) end
+                            vel = corr + Vector3.new(0, -rate, 0)
+                        end
+                    end
+                    if vel then
+                        pcall(function() base.AssemblyLinearVelocity = vel end)
+                    end
+                    AP.dist, AP.alt = horiz, pos.Y - AP.target.Y
+                end
+            end
+            VM.APActive = AP.on
+            task.wait(0.03)      -- faster than the manual loop: less gravity per gap
+            continue
+        end
+        VM.APActive = false
+        task.wait(0.2)
+    end
+end)
+
+task.spawn(function()
+    local VM = _G.VEHMOD
+    while _G.AR2HUB_GEN == GEN do
+        if (VM.Boost or VM.Fly) and not VM.APActive then
+            local held = false
+            local vk = VM.TRIG[tostring(VM.Trigger)]
+            if vk and iskeypressed then
+                local ok, d = pcall(function() return iskeypressed(vk) end)
+                held = (ok and d) and true or false
+            end
+            local okr, P = pcall(function() return svcPlayers() end)
+            local lp = (okr and P) and P.LocalPlayer or nil
+            local ch = lp and lp.Character
+            local hrp = ch and ch:FindFirstChild("HumanoidRootPart") or nil
+            local myPos
+            if hrp then
+                local okp, p = pcall(function() return hrp.Position end)
+                myPos = okp and p or nil
+            end
+            -- Righting runs whether or not the trigger is held: a vehicle on its roof
+            -- is exactly when you cannot be holding anything useful.
+            if myPos and VM.AutoRight then
+                local rbase = VM.baseNear(myPos)
+                if rbase then
+                    local okc, rcf = pcall(function() return rbase.CFrame end)
+                    local ry = (okc and rcf) and rcf.UpVector.Y or 1
+                    -- A slope is not a flip. 45 degrees of hill still reads 0.71 and a
+                    -- steep bank around 0.5, so the old 0.45 threshold fired on terrain.
+                    -- A vehicle actually on its side or roof sits near zero or negative,
+                    -- and it STAYS there - a slope is transient as you drive over it.
+                    -- So: a much lower threshold, and it has to hold for most of a
+                    -- second before anything is done about it.
+                    local nowT = tick()
+                    if ry < 0.25 then
+                        VM.tiltSince = VM.tiltSince or nowT
+                    else
+                        VM.tiltSince = nil
+                    end
+                    if VM.tiltSince and (nowT - VM.tiltSince) > 0.7
+                       and nowT >= VM.rightUntil and (nowT - VM.rightLast) > 2.0 then
+                        VM.rightUntil, VM.rightLast = nowT + 0.45, nowT
+                        VM.tiltSince = nil
+                    end
+                    if nowT < VM.rightUntil then
+                        pcall(function()
+                            local cur = rbase.AssemblyLinearVelocity
+                            rbase.AssemblyLinearVelocity =
+                                Vector3.new(cur.X * 0.5, VM.RightLift, cur.Z * 0.5)
+                        end)
+                        VM.State = string.format("righting (level %.2f)", ry)
+                        task.wait(0.05)
+                        continue
+                    end
+                end
+            end
+            if not myPos then
+                VM.State = "no character"
+            elseif not held then
+                VM.Ramp = 0            -- start from a standstill on the next press
+                VM.flyStart = nil      -- releasing resets the flight clock
+                VM.State = "ready - hold " .. tostring(VM.Trigger)
+            else
+                local base, why = VM.baseNear(myPos)
+                if not base then
+                    VM.State = tostring(why)
+                else
+                    local cam = workspace.CurrentCamera
+                    local cf
+                    if cam then
+                        local okc, c = pcall(function() return cam.CFrame end)
+                        if okc then cf = c end
+                    end
+                    -- The vehicle's own orientation, which is what stops it rolling:
+                    -- pushing along the camera's axis shoves a grounded car sideways
+                    -- while the wheels still grip, and it torques over and explodes.
+                    -- Angular velocity cannot be damped - the write is rejected - so
+                    -- the only levers are direction, ramping, and knowing when to stop.
+                    local vcf
+                    local okvc, c2 = pcall(function() return base.CFrame end)
+                    if okvc then vcf = c2 end
+                    local upY = vcf and vcf.UpVector.Y or 1
+                    if cf then
+                        local lv = cf.LookVector
+                        local vel
+                        if VM.Fly then
+                            local nowF = tick()
+                            -- engine health, resolved through the ESP's cache entry for
+                            -- this vehicle; refreshed on a timer since it means walking
+                            -- the cache to find the matching model
+                            if nowF - (VM.entryAt or 0) > 1.0 then
+                                VM.entryAt = nowF
+                                VM.entry = nil
+                                local mdl = base.Parent
+                                for _, e in ipairs((_G.VEHESP and _G.VEHESP.Cache) or {}) do
+                                    if e.part and e.part.Parent == mdl then VM.entry = e break end
+                                end
+                            end
+                            VM.EngineNow = (VM.entry and VM.entry.parts) and VM.entry.parts.engine or nil
+                            if VM.EngineGuard and VM.EngineNow and VM.EngineNow < VM.EngineMin then
+                                VM.flyStart = nil
+                                VM.State = string.format("engine at %.0f%% - too low to fly",
+                                    VM.EngineNow * 100)
+                                task.wait(0.05)
+                                continue
+                            end
+                            if VM.FlyLimit then
+                                if nowF < VM.flyLock then
+                                    VM.flyStart = nil
+                                    VM.State = string.format("flight cooling down (%.1fs)", VM.flyLock - nowF)
+                                    task.wait(0.05)
+                                    continue
+                                end
+                                VM.flyStart = VM.flyStart or nowF
+                                if (nowF - VM.flyStart) > VM.FlyMax then
+                                    -- cut it before the thing that killed the last one
+                                    VM.flyLock, VM.flyStart = nowF + 1.5, nil
+                                    VM.State = "flight limit reached - cooling down"
+                                    task.wait(0.05)
+                                    continue
+                                end
+                            end
+                            -- full 3D: look up and it climbs, which is the whole point
+                            vel = lv * VM.FlySpeed
+                        elseif upY < 0.90 then
+                            -- already leaning: pushing now is what turns a lean into a
+                            -- roll, so back off and let it settle
+                            VM.Ramp = 0
+                            VM.State = string.format("%s tilting - easing off", tostring(why))
+                        else
+                            -- drive along the VEHICLE's axis, signed by which way you
+                            -- are facing, so it goes forwards or reverses rather than
+                            -- being shoved across its own wheels
+                            local vfwd = vcf and Vector3.new(vcf.LookVector.X, 0, vcf.LookVector.Z) or nil
+                            local camflat = Vector3.new(lv.X, 0, lv.Z)
+                            if vfwd and vfwd.Magnitude > 0.01 and camflat.Magnitude > 0.01 then
+                                vfwd = vfwd / vfwd.Magnitude
+                                camflat = camflat / camflat.Magnitude
+                                local sign = (vfwd:Dot(camflat) < 0) and -1 or 1
+                                -- ramp instead of snapping to full speed: a standing
+                                -- start straight to 120 is itself enough to flip it
+                                VM.Ramp = math.min((VM.Ramp or 0) + VM.BoostSpeed * 0.12, VM.BoostSpeed)
+
+                                -- How fast the vehicle is rotating, from its own facing
+                                -- between ticks. Rewriting velocity along the new
+                                -- forward each tick is what rolls it in a turn, so the
+                                -- harder it is turning, the less speed it gets - the
+                                -- same trade a real car makes for grip.
+                                local nowT = tick()
+                                local yawRate = 0
+                                if VM.LastFwd and VM.LastFwdAt then
+                                    local dt2 = nowT - VM.LastFwdAt
+                                    if dt2 > 0.01 then
+                                        local dot = VM.LastFwd:Dot(vfwd)
+                                        if dot > 1 then dot = 1 elseif dot < -1 then dot = -1 end
+                                        yawRate = math.acos(dot) / dt2
+                                    end
+                                end
+                                VM.LastFwd, VM.LastFwdAt = vfwd, nowT
+                                VM.Yaw = yawRate
+                                local turnCut = 1 / (1 + yawRate * 1.5)
+                                local target = vfwd * (VM.Ramp * turnCut * sign)
+
+                                -- Clamp how much of the change is SIDEWAYS. Speeding up
+                                -- or slowing along the current heading is harmless; it
+                                -- is the perpendicular jolt that tips a tall vehicle.
+                                local okv, cur = pcall(function() return base.AssemblyLinearVelocity end)
+                                local keepY = (okv and cur) and cur.Y or 0
+                                local curFlat = (okv and cur) and Vector3.new(cur.X, 0, cur.Z) or Vector3.new(0, 0, 0)
+                                local delta = target - curFlat
+                                if curFlat.Magnitude > 1 then
+                                    local dir = curFlat / curFlat.Magnitude
+                                    local alongMag = delta:Dot(dir)
+                                    local along = dir * alongMag
+                                    local perp = delta - along
+                                    local maxPerp = 6          -- studs/s of sideways change per tick
+                                    if perp.Magnitude > maxPerp then
+                                        perp = (perp / perp.Magnitude) * maxPerp
+                                    end
+                                    target = curFlat + along + perp
+                                end
+                                vel = target + Vector3.new(0, keepY, 0)
+                            end
+                        end
+                        if vel then
+                            pcall(function() base.AssemblyLinearVelocity = vel end)
+                            VM.State = string.format("%s %s at %.0f studs/s (level %.2f, turn %.1f%s)",
+                                VM.Fly and "flying" or "driving", tostring(why),
+                                vel.Magnitude, upY, VM.Yaw or 0,
+                                VM.EngineNow and string.format(", engine %.0f%%", VM.EngineNow * 100) or "")
+                        end
+                    end
+                end
+            end
+        else
+            VM.State = "off"
+        end
+        task.wait(0.05)
+    end
+end)
+
+task.spawn(function()
+    while _G.AR2HUB_GEN == GEN do
+        pcall(function()
+            _G.VEHMOD.ui.info:SetText(tostring(_G.VEHMOD.State or "-"))
+            local AP = _G.VEHMOD.AP
+            local txt
+            if not AP.target then
+                txt = "no waypoint saved"
+            elseif AP.on then
+                txt = string.format("%s%s | %.0f studs out, %.0f up%s%s",
+                    tostring(AP.phase),
+                    (AP.legs and #AP.legs > 1) and string.format(" (leg %d/%d)", AP.leg or 1, #AP.legs) or "",
+                    AP.dist or -1, AP.alt or -1,
+                    _G.VEHMOD.EngineNow and string.format(" | engine %.0f%%", _G.VEHMOD.EngineNow * 100) or "",
+                    AP.early and " | LANDING EARLY, engine low" or "")
+            else
+                txt = string.format("waypoint ready (%.0f, %.0f, %.0f)",
+                    AP.target.X, AP.target.Y, AP.target.Z)
+            end
+            _G.VEHMOD.ui.apInfo:SetText(txt)
+        end)
+        task.wait(0.3)
     end
 end)
 end
