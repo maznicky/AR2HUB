@@ -8,25 +8,47 @@ Credits to @inspecttor for the UI.
 loadstring(game:HttpGet("https://raw.githubusercontent.com/maznicky/AR2HUB/main/Script"))()
 ```
 
-Safe to run more than once. A reload retires the previous instance instead of
-stacking a second copy of every loop, and the Gun Mods cache survives it.
-
 Open the menu with **P** (changeable in its Settings).
 
 ---
+
+## Known Issues & things I want to improve
+
+### Issues
+"Players" sometimes isn't detected upon loading causing matcha to crash,
+(I don't know if that's Matcha or the game)
+Matcha crashes if you've got too much ESP on.
+Map ESP works fine, it's just the keybinds having issues
+
+### Things I'll improve
+Event spawns, too much are unknown
+Melee dash requires skill, it isn't perfect but there's room for improvement
+(especially with the prediction)
+Vehicle Flying (Currently working on, but there are limits I need to tackle)
+
+### Things that aren't possible due to Matchas limits but works elsewhere
+Undetected Hitbox Expander
+Undetected Silent Aim
+Vehicle auto-flip
+Anti-vehicle explode
+Manipulating vehicles part status'
+Freezing Hydration & Energy depletion
+Changeable bullet travel speed
+Changeable fire-rate
+Instant reload
+Working Noclip
+More specific Item ESP
 
 ## Visuals
 
 ### Events
 In very early testing so events may be inaccurate with their status'.
-Has most map events, if I've missed any DM me.
 
 Green = unlooted, gray = unknown, red = looted (looted sites are wiped from
-view). Sites are only called looted inside the trust range; beyond it they stay
-unknown rather than guessing.
+view).
 
 ### Players
-A live box per player: name, distance, and their Primary / Secondary / Melee
+A list of players including their name, distance, and their Primary / Secondary / Melee
 with attachments.
 
 **Marked Players** - click a player's box to mark them:
@@ -38,9 +60,7 @@ with attachments.
 
 `Clear All Marks` wipes both lists. Marks also carry over to the map dots.
 
-**Player Corpse ESP** lists dead players. Red = the body still has gear on it,
-gray = already stripped, and the label says how many items are left. There's a
-toggle for showing only the ones worth walking to.
+**Player Corpse ESP** lists dead players.
 
 ### Zombies
 Zombies are classified by what they actually carry
@@ -62,8 +82,6 @@ M4A1Mod1 is the "Operator" M4A1.
 **Items In World** lists every distinct gun and bag currently out there with
 special filters you can select.
 
-The label shows the zombie type, its distance, and the notable item it carries.
-
 ### Vehicles
 ESP for every vehicle is colored by **wheel condition**, which is what tells you
 how drivable the vehicle is:
@@ -79,10 +97,6 @@ Boats are always green - they have no wheels to lose. Gray means no reading yet.
 Types are grouped and all start disabled.
 `Toggle All Types` selects or clears everything. Any vehicle type not
 in the built-in list gets a toggle added automatically under **Other**.
-
-The **Details** panel lists in-range vehicles of the types you have enabled,
-nearest first, with engine, body, fuel tank, fuel and glass condition. Those are
-informational only and never affect the ESP color.
 
 ### Map
 Draws dots onto the real in-game map - open it with **M** as normal.
