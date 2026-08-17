@@ -4530,6 +4530,11 @@ _G.VEHMOD.ui.ramInfo = _G.VEHMOD.ui.ramSec:Label("off")
 -- Nearest thing worth hitting. Zombie roots come from the ESP cache when it is running
 -- and from a throttled scan when it is not, because resolving ~80 roots costs about
 -- 56 ms and must never sit on a per-tick path.
+-- Returns the target PART, not a position, and is called on a timer rather than every
+-- tick. Searching walks ~85 zombie roots reading a position from each: about 4 ms on a
+-- healthy client, which is exactly the sort of cost that becomes hundreds of
+-- milliseconds once the client is behind. Run at 20 Hz it froze the game every time
+-- the ram key was pressed. Between searches the loop reads one position - the target's.
 _G.VEHMOD.ramTarget = function(from)
     local VM = _G.VEHMOD
     local best, bd
@@ -4537,7 +4542,7 @@ _G.VEHMOD.ramTarget = function(from)
         local okp, p = pcall(function() return part.Position end)
         if not okp or not p then return end
         local okd, d = pcall(function() return (p - from).Magnitude end)
-        if okd and d <= VM.RamRange and (not bd or d < bd) then best, bd = p, d end
+        if okd and d <= VM.RamRange and (not bd or d < bd) then best, bd = part, d end
     end
     if VM.RamPlayers then
         local okr, P = pcall(function() return svcPlayers() end)
@@ -4558,20 +4563,34 @@ _G.VEHMOD.ramTarget = function(from)
         if live and #live > 0 then
             for _, e in ipairs(live) do if e.part then consider(e.part) end end
         else
-            local now = tick()
-            if (now - (VM.ramZAt or 0)) > 2.0 then
-                VM.ramZAt = now
-                local zf = workspace:FindFirstChild("Zombies")
-                local out = {}
-                if zf then
-                    for _, z in ipairs(zf:GetChildren()) do
-                        local r = z:FindFirstChild("HumanoidRootPart")
-                        if r then out[#out + 1] = r end
-                    end
+            -- Incremental, because resolving ~85 roots in one go is a 60 ms burst of
+            -- FindFirstChild at 0.71 ms each, and that burst is what stalls the client
+            -- the moment the ram key is pressed. A few per call spreads the same work
+            -- out and the list is complete within a second, which is soon enough.
+            VM.ramZ = VM.ramZ or {}
+            if not VM.ramZQ then
+                local now = tick()
+                if (now - (VM.ramZAt or 0)) > 2.0 then
+                    VM.ramZAt = now
+                    local zf = workspace:FindFirstChild("Zombies")
+                    VM.ramZQ = zf and zf:GetChildren() or {}
+                    VM.ramZI, VM.ramZOut = 1, {}
                 end
-                VM.ramZ = out
             end
-            for _, r in ipairs(VM.ramZ or {}) do consider(r) end
+            if VM.ramZQ then
+                local done = 0
+                while VM.ramZI <= #VM.ramZQ and done < 8 do
+                    local z = VM.ramZQ[VM.ramZI]
+                    VM.ramZI = VM.ramZI + 1
+                    done = done + 1
+                    local r = z and z:FindFirstChild("HumanoidRootPart")
+                    if r then VM.ramZOut[#VM.ramZOut + 1] = r end
+                end
+                if VM.ramZI > #VM.ramZQ then
+                    VM.ramZ, VM.ramZQ = VM.ramZOut, nil
+                end
+            end
+            for _, r in ipairs(VM.ramZ) do consider(r) end
         end
     end
     return best, bd
@@ -4595,6 +4614,7 @@ task.spawn(function()
                 held = (ok and d) and true or false
             end
             if not held then
+                VM.ramPart, VM.ramPickAt = nil, 0     -- fresh target on the next press
                 VM.RamState = "ready - hold " .. tostring(VM.RamTrigger)
             else
                 local okr, P = pcall(function() return svcPlayers() end)
@@ -4611,7 +4631,17 @@ task.spawn(function()
                     VM.RamState = "no vehicle"
                 else
                     local okb, bp = pcall(function() return base.Position end)
-                    local tp, td = myPos and VM.ramTarget(myPos) or nil, nil
+                    -- re-pick on a timer; track the chosen one every tick
+                    local nowR = tick()
+                    if not VM.ramPart or (nowR - (VM.ramPickAt or 0)) > 0.35 then
+                        VM.ramPickAt = nowR
+                        VM.ramPart = myPos and VM.ramTarget(myPos) or nil
+                    end
+                    local tp
+                    if VM.ramPart then
+                        local okt, p = pcall(function() return VM.ramPart.Position end)
+                        if okt and p then tp = p else VM.ramPart = nil end
+                    end
                     if not tp then
                         VM.RamState = "nothing in range"
                     elseif okb and bp then
