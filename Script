@@ -4427,7 +4427,7 @@ _G.VEHMOD.AP.Speed   = 1200           -- cruise ceiling; the braking curve picks
 -- climb the same distance at 220. At the measured drain that is roughly 12% of engine
 -- spent sinking, and it killed a tractor mid-descent. Engine cost follows time in the
 -- air, so a slow descent is not the safe option - it is the one that strands you.
-_G.VEHMOD.AP.Descent = 350            -- max descent rate
+_G.VEHMOD.AP.Descent = 360            -- travel speed * 0.3, matching the slider
 _G.VEHMOD.AP.Radius  = 12             -- horizontal arrival tolerance
 -- Absolute altitude floor for cruising. Height alone is measured from the DESTINATION,
 -- so a trip to somewhere low crossed low - a run to a coastal target at Y=17 cruised at
@@ -4435,14 +4435,16 @@ _G.VEHMOD.AP.Radius  = 12             -- horizontal arrival tolerance
 -- terrain at speed is also what got the account kicked, so this is a safety floor as
 -- much as a routing one: the highest recorded destination is 194.
 _G.VEHMOD.AP.MinAlt  = 280
-_G.VEHMOD.AP.Brake   = 900            -- studs/s^2 it can shed on the run-in
+-- Braking is kept equal to travel speed: that ratio landed cleanly in testing, and it
+-- means one slider controls the whole profile instead of four that interact.
+_G.VEHMOD.AP.Brake   = 1200           -- studs/s^2 it can shed on the run-in
 _G.VEHMOD.AP.LandDecel  = 150         -- how hard the descent flares out near the ground
 _G.VEHMOD.AP.TouchSpeed = 8           -- vertical speed it aims to actually touch down at
 -- Vertical speed is where multi-leg trips bleed engine: every leg pays a climb AND a
 -- descent, so a three leg run spends about 13 seconds going up and down before any
 -- horizontal distance is covered - roughly 30% of engine at the measured 2.3%/s. The
 -- climb used to be hardcoded at 220.
-_G.VEHMOD.AP.Climb = 500
+_G.VEHMOD.AP.Climb = 480      -- travel speed * 0.4, matching the slider
 
 _G.VEHMOD.ui.apSec = _G.VEHMOD.ui.sub:Section("Autopilot", "Full")
 _G.VEHMOD.ui.apSec:Label("Flies the vehicle to a destination and lands it. Long trips")
@@ -4574,9 +4576,17 @@ _G.VEHMOD.flyTo = function(target)
     end)
 end
 
-for _, poi in ipairs(_G.VEHMOD.POI) do
-    _G.VEHMOD.ui.poiSec:Button(poi.name, function() _G.VEHMOD.flyTo(poi.pos) end,
-        string.format("%.0f, %.0f, %.0f", poi.pos.X, poi.pos.Y, poi.pos.Z))
+-- one section per island, in the order the map reads
+_G.VEHMOD.ui.islands = {}
+for _, isl in ipairs({ "Halsey", "Faris", "Mackinaw" }) do
+    local sec = _G.VEHMOD.ui.sub:Section(isl .. " Island", "Full")
+    _G.VEHMOD.ui.islands[isl] = sec
+    for _, poi in ipairs(_G.VEHMOD.POI) do
+        if poi.island == isl then
+            sec:Button(poi.name, function() _G.VEHMOD.flyTo(poi.pos) end,
+                string.format("%.0f, %.0f, %.0f", poi.pos.X, poi.pos.Y, poi.pos.Z))
+        end
+    end
 end
 
 -- Finds the vehicle you are in via the ESP cache rather than walking the Vehicles
@@ -5036,7 +5046,20 @@ task.spawn(function()
         if (VM.Boost or VM.Fly) and not VM.APActive then
             local held = false
             local vk = VM.TRIG[tostring(VM.Trigger)]
-            if vk and iskeypressed then
+            if not vk and tostring(VM.Trigger) == "Key" then
+                -- the bound key, resolved the same way the melee trigger does it: the
+                -- library handle first, then the raw virtual-key code
+                if VM.ui.key then
+                    local okh, v = pcall(function() return VM.ui.key:IsActivated() end)
+                    if okh and v then held = true end
+                end
+                local k = string.lower(tostring(VM.Key or "g"))
+                if #k == 1 then
+                    local b = string.byte(string.upper(k))
+                    if b >= 48 and b <= 90 then vk = b end
+                end
+            end
+            if not held and vk and iskeypressed then
                 local ok, d = pcall(function() return iskeypressed(vk) end)
                 held = (ok and d) and true or false
             end
