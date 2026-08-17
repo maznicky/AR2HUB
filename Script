@@ -115,7 +115,28 @@ do
         end
     end
 end
-local Lib = (libSrc and loadstring(libSrc)()) or INSui
+-- The library has TWO shapes in the wild. The older minified build returns its table;
+-- the newer one (LIB_NAME="INSUI") returns nil and publishes a global instead - and
+-- names it INSUI, not INSui, so the old fallback found nothing and every UI call died
+-- on a nil Lib. Take the return value if there is one, otherwise whichever global
+-- actually carries the API.
+local Lib
+do
+    local ret
+    if libSrc then
+        local okr, r = pcall(loadstring(libSrc))
+        ret = okr and r or nil
+    end
+    local function usable(t) return type(t) == "table" and type(t.CreateWindow) == "function" end
+    if usable(ret) then
+        Lib = ret
+    else
+        for _, name in ipairs({ "INSUI", "INSui", "insui" }) do
+            local g = _G[name] or rawget(getfenv(), name)
+            if usable(g) then Lib = g break end
+        end
+    end
+end
 
 -- ---------------- portability shims ----------------
 local function getCamera()
