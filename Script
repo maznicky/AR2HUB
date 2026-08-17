@@ -2791,7 +2791,7 @@ ML.FrontOnly = (ML.FrontOnly ~= false)     -- ignore targets behind you
 ML.KeepSprint = (ML.KeepSprint ~= false)   -- re-press shift after a swing
 ML.SprintDelay = 0.02                      -- measured as the value that works
 ML.KeyGrace  = ML.KeyGrace or 0.25         -- hold-mode latch, see melKeyHeld
-ML.Trigger   = dropStr(ML.Trigger, "Key")  -- "Key" | "Mouse 4" | "Mouse 5" | "Right Mouse"
+ML.Trigger   = "Key"                       -- forced, same reason  -- "Key" | "Mouse 4" | "Mouse 5" | "Right Mouse"
 ML.Predict   = (ML.Predict ~= false)       -- swing early so the hit lands on time
 ML.Windup    = ML.Windup or 0.15           -- swing start -> damage frame, seconds
 ML.Closing   = 0                           -- studs/sec the target is closing at
@@ -2839,9 +2839,9 @@ melSec:Toggle("Auto Melee", false, function(v) ML.Enabled = v end,
 melSec:Dropdown("Key Mode", "Hold", {"Hold", "Toggle"}, false,
     function(v) ML.KeyMode = dropStr(v, "Hold") end,
     "Hold: only swings while you hold the trigger. Toggle: tap once for on, again for off.")
-melSec:Dropdown("Trigger", "Key", { "Key", "Mouse 4", "Mouse 5", "Right Mouse" }, false,
+melSec:Dropdown("Trigger", "Key", { "Key", "Right Mouse" }, false,
     function(v) ML.Trigger = dropStr(v, "Key") end,
-    "What actually fires it. A mouse button is strongly preferred: measured on this machine, V registered on only 3% of reads while W and shift were held, because a keyboard cannot report every key at once. Mouse buttons do not go through that matrix.")
+    "What actually fires it. Mouse 4 and Mouse 5 are gone from this list: the executor reads them as never pressed, measured 0 of 86 samples while held. Keys can also drop while W and shift are held - V managed only 3% - so the hold latch bridges those gaps.")
 melKeyHandle = melSec:Keybind("Melee Key", "v", function(k) ML.Key = k end,
     "Only used when Trigger is set to Key.")
 
@@ -4461,7 +4461,7 @@ _G.VEHMOD.rightUntil = 0
 _G.VEHMOD.rightLast  = 0
 _G.VEHMOD.FlySpeed   = _G.VEHMOD.FlySpeed or 70
 _G.VEHMOD.Range      = 15
-_G.VEHMOD.Trigger    = dropStr(_G.VEHMOD.Trigger, "Mouse 4")
+_G.VEHMOD.Trigger    = "Key"   -- forced, same reason
 _G.VEHMOD.State      = "off"
 _G.VEHMOD.TRIG = { ["Mouse 4"] = 0x05, ["Mouse 5"] = 0x06, ["Right Mouse"] = 0x02, ["Space"] = 0x20 }
 
@@ -4476,8 +4476,8 @@ _G.VEHMOD.ui.sec:Toggle("Fly", false, function(v) _G.VEHMOD.Fly = v end,
     "While the trigger is held, the vehicle goes wherever the camera points, including upward.")
 _G.VEHMOD.ui.sec:Slider("Fly Speed", 400, 10, 50, 1200, " studs/s", function(v) _G.VEHMOD.FlySpeed = v end,
     "Below about 50 the suspension eats the lift entirely. There is no upper ceiling - 1000 measured a peak of 1108 studs/s - and faster means less time airborne, which means less engine spent.")
-_G.VEHMOD.ui.sec:Dropdown("Trigger", "Mouse 4", { "Mouse 4", "Mouse 5", "Right Mouse", "Space", "Key" }, false,
-    function(v) _G.VEHMOD.Trigger = dropStr(v, "Mouse 4") end,
+_G.VEHMOD.ui.sec:Dropdown("Trigger", "Key", { "Key", "Right Mouse", "Space" }, false,
+    function(v) _G.VEHMOD.Trigger = dropStr(v, "Key") end,
     "What holds the flight on. Mouse buttons are the reliable choice: keyboards drop keys while W and shift are held, which is exactly the state you are in while driving. Pick Key to use the bind below instead.")
 _G.VEHMOD.ui.key = _G.VEHMOD.ui.sec:Keybind("Fly Key", "g", function(k) _G.VEHMOD.Key = k end,
     "Only used when Trigger is set to Key.")
@@ -4502,7 +4502,12 @@ _G.VEHMOD.RamPlayers = false
 _G.VEHMOD.RamZombies = true
 _G.VEHMOD.RamRange   = 250
 _G.VEHMOD.RamSpeed   = 220
-_G.VEHMOD.RamTrigger = dropStr(_G.VEHMOD.RamTrigger, "Mouse 5")
+-- NOT a mouse side button. Measured on this machine: iskeypressed reported Mouse 5 as
+-- held on 0 of 86 samples while it was physically held down, and Mouse 4 the same.
+-- Matcha cannot see those buttons, so a feature bound to one simply never runs - Ram
+-- sat at "ready" through an entire test while its trigger was held the whole time.
+_G.VEHMOD.RamTrigger = "Key"   -- forced, not carried over: a stale "Mouse 5" is unreadable
+_G.VEHMOD.RamKey     = _G.VEHMOD.RamKey or "r"
 _G.VEHMOD.RamState   = "off"
 _G.VEHMOD.ramZAt     = 0
 
@@ -4523,8 +4528,11 @@ _G.VEHMOD.ui.ramSec:Slider("Range", 250, 10, 30, 800, " studs", function(v) _G.V
     "How far away it will pick a target from.")
 _G.VEHMOD.ui.ramSec:Slider("Ram Speed", 220, 10, 40, 1200, " studs/s", function(v) _G.VEHMOD.RamSpeed = v end,
     "How hard it drives at them. Ground mode keeps this flat, so speed here is all horizontal.")
-_G.VEHMOD.ui.ramSec:Dropdown("Trigger", "Mouse 5", { "Mouse 4", "Mouse 5", "Right Mouse", "Space", "Key" }, false,
-    function(v) _G.VEHMOD.RamTrigger = dropStr(v, "Mouse 5") end)
+_G.VEHMOD.ui.ramSec:Dropdown("Trigger", "Key", { "Key", "Right Mouse", "Space" }, false,
+    function(v) _G.VEHMOD.RamTrigger = dropStr(v, "Key") end,
+    "Mouse 4 and Mouse 5 are deliberately not offered: this executor cannot read them at all, measured at 0 of 86 samples while held, so anything bound to them never fires.")
+_G.VEHMOD.ui.ramKey = _G.VEHMOD.ui.ramSec:Keybind("Ram Key", "r", function(k) _G.VEHMOD.RamKey = k end,
+    "Used when Trigger is set to Key.")
 _G.VEHMOD.ui.ramInfo = _G.VEHMOD.ui.ramSec:Label("off")
 
 -- Nearest thing worth hitting. Zombie roots come from the ESP cache when it is running
@@ -4603,13 +4611,17 @@ task.spawn(function()
             local held = false
             local vk = VM.TRIG[tostring(VM.RamTrigger)]
             if not vk and tostring(VM.RamTrigger) == "Key" then
-                local k = string.lower(tostring(VM.Key or "g"))
+                if VM.ui.ramKey then
+                    local okh, v = pcall(function() return VM.ui.ramKey:IsActivated() end)
+                    if okh and v then held = true end
+                end
+                local k = string.lower(tostring(VM.RamKey or "r"))
                 if #k == 1 then
                     local b = string.byte(string.upper(k))
                     if b >= 48 and b <= 90 then vk = b end
                 end
             end
-            if vk and iskeypressed then
+            if not held and vk and iskeypressed then
                 local ok, d = pcall(function() return iskeypressed(vk) end)
                 held = (ok and d) and true or false
             end
