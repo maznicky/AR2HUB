@@ -2109,7 +2109,9 @@ task.spawn(function()
             -- staggered condition work: a couple of vehicles per tick, so the
             -- 0.72 ms lookup and 0.12 ms-per-wheel reads never land together
             local done = 0
-            while done < VEH_PERTICK and #list > 0 do
+            -- scaled by scheduler health: see the note at the bottom of the file
+            local budget = math.max(1, math.floor(VEH_PERTICK * (_G.AR2HUB_HEALTH or 1)))
+            while done < budget and #list > 0 do
                 if cursor > #list then cursor = 1 end
                 local e = list[cursor]
                 cursor = cursor + 1
@@ -2445,8 +2447,11 @@ local function zombSweepStep(now)
         zQueue = zf and zf:GetChildren() or {}
         zOut, zIdx = {}, 1
     end
+    -- scaled by scheduler health: see the note at the bottom of the file
+    local budget = math.floor(ZOMB_PERTICK * (_G.AR2HUB_HEALTH or 1))
+    if budget < 1 then budget = 1 end
     local done = 0
-    while zIdx <= #zQueue and done < ZOMB_PERTICK do
+    while zIdx <= #zQueue and done < budget do
         local z = zQueue[zIdx]
         zIdx = zIdx + 1
         done = done + 1
@@ -2627,7 +2632,12 @@ end)
 _G.MELEE = _G.MELEE or {}
 local ML = _G.MELEE
 ML.Enabled   = false
-ML.KeyMode   = dropStr(ML.KeyMode, "Hold") -- "Hold" | "Toggle" | "Always"
+-- Forced, not carried over: dropStr(ML.KeyMode, "Hold") keeps whatever the previous
+-- run left in _G, so a session that ended on "Always" came back as "Always" while the
+-- dropdown drew "Hold". Same trap as the map's own-dot toggle. Always is a debugging
+-- mode - left on by accident it dashes you at anything within chase range, walls
+-- included - so it has to be chosen deliberately every time.
+ML.KeyMode   = "Hold"                      -- "Hold" | "Toggle" | "Always"
 ML.Armed     = ML.Armed == true            -- used by Toggle mode
 ML.Key       = ML.Key or "v"
 ML.Players   = ML.Players == true
@@ -2645,7 +2655,7 @@ ML.Weapon    = nil
 ML.Reach     = 0
 -- chase: dash at the target so the swing lands as you arrive
 ML.Chase      = false
-ML.ChaseMax   = ML.ChaseMax or 45          -- furthest gap worth dashing across
+ML.ChaseMax   = 15                         -- furthest gap worth dashing across
 ML.ChaseSpeed = ML.ChaseSpeed or 90        -- studs/sec during the chase burst
 ML.ChaseCD    = ML.ChaseCD or 1.2          -- seconds between chases
 ML.ChaseLead  = (ML.ChaseLead ~= false)    -- aim where the target will be
@@ -2669,6 +2679,8 @@ local MEL_ARC_FRONT = 70       -- degrees counted as "in front of you"
 local MEL_ARC_ANY   = 180
 local melKeyHandle
 local melTrackPart, melTrackSurf, melTrackRate, melTrackAt = nil, 0, 0, 0
+local melMiss = 0              -- consecutive empty Equipped reads, see melResolve
+local melLastOk = nil          -- when the weapon last resolved cleanly
 
 local melSec  = melsub:Section("Auto Melee", "Full")
 local melInfo = melSec:Label("no melee equipped")
@@ -2723,8 +2735,8 @@ melChase:Label("Dash in Character, so the server sees it - the most")
 melChase:Label("visible thing this tab does.")
 melChase:Toggle("Dash To Target", false, function(v) ML.Chase = v end,
     "Only fires while Auto Melee is active and something is in front of you, past your reach but inside the chase distance.")
-melChase:Slider("Chase Distance", 45, 5, 10, 120, " studs", function(v) ML.ChaseMax = v end,
-    "The furthest gap it will dash across. Bigger values cross more ground in one obvious burst.")
+melChase:Slider("Chase Distance", 15, 5, 10, 120, " studs", function(v) ML.ChaseMax = v end,
+    "The furthest gap it will dash across. 15 keeps it to targets in the room with you - at 45 it fired at zombies 33 studs away, through walls, and never reached them. Bigger values cross more ground in one obvious burst.")
 melChase:Slider("Chase Speed", 90, 5, 30, 250, " studs/s", function(v) ML.ChaseSpeed = v end,
     "How fast the burst travels. Faster closes sooner but overshoots more easily, and is more conspicuous.")
 melChase:Slider("Chase Cooldown", 1.2, 0.1, 0.2, 4, " s", function(v) ML.ChaseCD = v end,
@@ -2843,18 +2855,82 @@ local function melResolve(now)
     local lp = P and P.LocalPlayer
     local ch = lp and lp.Character
     local eqd = ch and ch:FindFirstChild("Equipped")
-    local w = eqd and eqd:GetChildren()[1]
-    if not w then
-        melHb, melHbSize, ML.Weapon, ML.Reach = nil, nil, nil, 0
-        return
+    -- Re-resolve BY NAME first. GetChildren on Equipped returns an empty list on most
+    -- reads (measured: 1 child, then 0, then 0, knife equipped throughout), while
+    -- FindFirstChild has been reliable everywhere in this script. GetChildren is only
+    -- needed to discover the name in the first place, or after a weapon swap.
+    local w, hb
+    if ML.Weapon and eqd then
+        w = eqd:FindFirstChild(ML.Weapon)
+        hb = w and w:FindFirstChild("Hitbox") or nil
     end
-    local hb = w:FindFirstChild("Hitbox")
     if not hb then
-        -- held item with no Hitbox is not a melee weapon at all (a bandage, a
-        -- gun, a map), so report nothing rather than "reach 0.00"
-        melHb, melHbSize, ML.Weapon, ML.Reach = nil, nil, nil, 0
+        local kids = eqd and eqd:GetChildren() or nil
+        w = kids and kids[1] or nil
+        hb = w and w:FindFirstChild("Hitbox") or nil
+    end
+    if not hb and ch then
+        -- Last resort, and the only path that never touches Equipped:GetChildren.
+        -- After a reload there is no cached name to look up, so if that one call is
+        -- flaking the weapon can never be discovered at all - which is exactly how a
+        -- fresh load ended up permanently stuck on "no melee equipped".
+        local okd, desc = pcall(function() return ch:GetDescendants() end)
+        if okd and desc then
+            for _, d in ipairs(desc) do
+                if d.Name == "Hitbox" then
+                    local okp, par = pcall(function() return d.Parent end)
+                    if okp and par then
+                        local okg, gp = pcall(function() return par.Parent.Name end)
+                        if okg and gp == "Equipped" then
+                            w, hb = par, d
+                            break
+                        end
+                    end
+                end
+            end
+        end
+    end
+    if not hb then
+        -- Matcha's GetChildren on Equipped intermittently returns an EMPTY list.
+        -- Measured on the same folder half a second apart, with a Pocket Knife
+        -- equipped the whole time: 1 child, then 0, then 0. Treating that as "no
+        -- melee" wiped the weapon and gated off every swing and chase, which is
+        -- exactly the "no melee equipped" that made auto melee look dead.
+        --
+        -- An empty read is missing information, not proof. So the cached hitbox is
+        -- kept as long as it still reads AND still hangs under Equipped - that is
+        -- positive evidence the weapon is there, rather than an absence of evidence.
+        if melHb then
+            local oks, s = pcall(function() return melHb.Size end)
+            local okp, pn = pcall(function() return melHb.Parent.Parent.Name end)
+            -- The ancestor check only DISQUALIFIES: acting on it when it reads nil
+            -- would just reintroduce the same flake in a different place. It has to
+            -- succeed and disagree before the weapon is considered gone.
+            if okp and type(pn) == "string" and pn ~= "Equipped" then
+                melHb, melHbSize, ML.Weapon, ML.Reach = nil, nil, nil, 0
+                melMiss = 0
+                return
+            end
+            if oks and s then
+                melHbSize = s
+                ML.Reach = math.max(s.X, s.Y, s.Z)
+                melMiss = 0
+                return
+            end
+        end
+        -- Reach is a NUMBER, and a number cannot go stale the way an instance read
+        -- can. Once it is known, the weapon stays considered equipped until the reads
+        -- have been failing for a good while - the swing does not need the hitbox
+        -- instance at all, only its length and somewhere to measure from.
+        melMiss = (melMiss or 0) + 1
+        if melLastOk and (tick() - melLastOk) < 5 then return end
+        if melMiss >= 8 then
+            melHb, melHbSize, ML.Weapon, ML.Reach = nil, nil, nil, 0
+        end
         return
     end
+    melMiss = 0
+    melLastOk = tick()
     ML.Weapon = w.Name
     melHb = hb
     local ok, sz = pcall(function() return hb.Size end)
@@ -2878,7 +2954,7 @@ local function melZombieStep(now)
         melZOut, melZIdx = {}, 1
     end
     local done = 0
-    while melZIdx <= #melZQueue and done < 3 do
+    while melZIdx <= #melZQueue and done < math.max(1, math.floor(3 * (_G.AR2HUB_HEALTH or 1))) do
         local z = melZQueue[melZIdx]
         melZIdx = melZIdx + 1
         done = done + 1
@@ -2909,11 +2985,15 @@ task.spawn(function()
             -- evaluated ONCE per tick: in Toggle mode this edge-detects the key,
             -- so calling it twice would flip the state twice on a single press
             local active = melKeyHeld()
-            if not melHb then
+            if ML.Reach <= 0 then
                 ML.State = "no melee equipped"
             elseif not active then
-                ML.State = (ML.KeyMode == "Toggle") and ("off - tap " .. string.upper(tostring(ML.Key)))
-                           or ("waiting for " .. string.upper(tostring(ML.Key)))
+                -- name whatever actually fires it, not always the key: with Trigger set
+                -- to a mouse button, "waiting for V" is simply wrong
+                local trigName = (ML.Trigger and ML.Trigger ~= "Key")
+                                 and tostring(ML.Trigger) or string.upper(tostring(ML.Key))
+                ML.State = (ML.KeyMode == "Toggle") and ("off - tap " .. trigName)
+                           or ("waiting for " .. trigName)
             elseif (now - lastSwing) < ML.Cooldown then
                 ML.State = "cooldown"
             else
@@ -2922,8 +3002,23 @@ task.spawn(function()
             -- The scan runs whenever a melee is active, not only when the swing is
             -- off cooldown, because the chase has to keep closing between swings.
             local canSwing = (now - lastSwing) >= ML.Cooldown
-            if melHb and ML.Reach > 0 and active then
-                local okp, origin = pcall(function() return melHb.Position end)
+            -- Gated on the reach VALUE, not the hitbox instance. The hitbox is the
+            -- better origin - it is where the swing comes from - but its reads flake,
+            -- and losing it should cost a little accuracy, not the whole feature.
+            if ML.Reach > 0 and active then
+                local okp, origin = false, nil
+                if melHb then okp, origin = pcall(function() return melHb.Position end) end
+                local usedRoot = false
+                if not okp or not origin then
+                    local okr2, P2 = pcall(function() return svcPlayers() end)
+                    local lp2 = (okr2 and P2) and P2.LocalPlayer or nil
+                    local ch2 = lp2 and lp2.Character
+                    local r2 = ch2 and ch2:FindFirstChild("HumanoidRootPart") or nil
+                    if r2 then
+                        okp, origin = pcall(function() return r2.Position end)
+                        usedRoot = okp and origin ~= nil
+                    end
+                end
                 local cam = workspace.CurrentCamera
                 local cf
                 if cam then
@@ -2932,7 +3027,9 @@ task.spawn(function()
                 end                         -- truncates, leaving cf nil forever
                 if okp and origin and cf then
                     local look = cf.LookVector
-                    local limit = ML.Reach + MEL_PAD
+                    -- The hitbox sits in your hand, slightly ahead of your centre, so
+                    -- measuring from the root part instead needs a little more slack.
+                    local limit = ML.Reach + MEL_PAD + (usedRoot and 0.6 or 0)
                     local arcCos = math.cos(math.rad(
                         ML.FrontOnly and MEL_ARC_FRONT or MEL_ARC_ANY))
                     local hit = false
@@ -3050,27 +3147,72 @@ task.spawn(function()
                     end
                     if ML.Chase then
                         local stopAt = ML.ChaseClose or 1.5
+                        local prevTick = ML.chaseTickAt    -- read before overwriting, or
+                        ML.chaseTickAt = now               -- dt is always zero
                         local hrp
                         local okr, P = pcall(function() return svcPlayers() end)
                         local lp = (okr and P) and P.LocalPlayer or nil
                         local ch = lp and lp.Character
                         if ch then hrp = ch:FindFirstChild("HumanoidRootPart") end
+                        -- How fast THEY are coming to you, along the line between you.
+                        -- ML.Closing cannot be used for this: it is the mutual rate, so
+                        -- your own dash inflates it, which tripped the hold-off below,
+                        -- which stopped the dash, which collapsed the rate again. The
+                        -- trace showed exactly that oscillation - hold off at 9 studs,
+                        -- drift back out to 11, re-dash, repeat.
+                        local theirApproach = 0
+                        local myPos
+                        if hrp then
+                            local okh, hp0 = pcall(function() return hrp.Position end)
+                            myPos = okh and hp0 or nil
+                        end
+                        if myPos and chasePos and ML.chaseVel then
+                            local toMe = Vector3.new(myPos.X - chasePos.X, 0, myPos.Z - chasePos.Z)
+                            local m = toMe.Magnitude
+                            if m > 0.01 then
+                                theirApproach = (ML.chaseVel.X * toMe.X + ML.chaseVel.Z * toMe.Z) / m
+                            end
+                        end
                         if not hrp then
                             ML.ChaseState = "no character"
                         elseif not chasePart then
                             ML.ChaseState = "nothing to chase"
                         elseif chaseSurf and chaseSurf <= stopAt then
-                            -- already there: stop pushing so the swing is not overshot
+                            -- Arrived. Stopping the velocity writes is not enough - the
+                            -- momentum carries you straight past, which is how you end
+                            -- up behind the target stabbing air. So brake once, killing
+                            -- the horizontal component and leaving gravity alone.
+                            if ML.chaseUntil > 0 then
+                                local okv, v = pcall(function() return hrp.AssemblyLinearVelocity end)
+                                if okv and v then
+                                    pcall(function()
+                                        hrp.AssemblyLinearVelocity = Vector3.new(0, v.Y, 0)
+                                    end)
+                                end
+                            end
                             ML.chaseUntil = 0
                             ML.ChaseState = "in reach"
+                        elseif theirApproach > 2
+                               and (chaseSurf - stopAt) / theirApproach < 0.35 then
+                            -- They are already running at you and will be in reach within
+                            -- the windup. Dashing into a target that is closing on you is
+                            -- what causes the meet-in-the-middle overshoot, so let them
+                            -- come and let the swing prediction do its job.
+                            ML.chaseUntil = 0
+                            ML.ChaseState = string.format("letting them close (%.0f studs, they run %.0f/s)",
+                                chaseSurf, theirApproach)
                         else
                             if now >= ML.chaseUntil and (now - ML.chaseLast) >= ML.ChaseCD then
-                                -- burst just long enough to cover the gap
+                                -- Deadline is only a safety cap now. The burst actually
+                                -- ends when the per-tick check below says the gap is gone,
+                                -- because a gap measured once is wrong the moment either
+                                -- of you moves.
                                 local travel = math.max(chaseSurf - stopAt, 0)
-                                local dur = travel / math.max(ML.ChaseSpeed, 1)
+                                local dur = travel / math.max(ML.ChaseSpeed, 1) + 0.1
                                 if dur > 0.6 then dur = 0.6 end
                                 ML.chaseUntil = now + dur
                                 ML.chaseLast = now
+                                ML.Chases = (ML.Chases or 0) + 1
                             end
                             if now < ML.chaseUntil then
                                 -- re-aimed every tick, so a target that moves mid-dash
@@ -3100,11 +3242,24 @@ task.spawn(function()
                                     local flat = Vector3.new(dir.X, 0, dir.Z)
                                     if flat.Magnitude > 0.01 then
                                         flat = flat / flat.Magnitude
+                                        -- Speed is clamped to what the remaining gap can
+                                        -- absorb this tick. At 90 studs/s a tick covers
+                                        -- 2.7 studs, and the stop distance is 1.5, so a
+                                        -- full-speed final tick lands past the target no
+                                        -- matter how good the aim was.
+                                        local dt = now - (prevTick or (now - 0.03))
+                                        if dt < 0.02 then dt = 0.02 elseif dt > 0.1 then dt = 0.1 end
+                                        local remaining = math.max(chaseSurf - stopAt, 0)
+                                        local speed = ML.ChaseSpeed
+                                        if speed * dt > remaining then
+                                            speed = remaining / dt
+                                        end
                                         pcall(function()
-                                            hrp.AssemblyLinearVelocity = flat * ML.ChaseSpeed
+                                            hrp.AssemblyLinearVelocity = flat * speed
                                         end)
-                                        ML.ChaseState = string.format("closing %.0f studs, leading %.1f",
-                                            chaseSurf, ML.ChaseLeadStuds or 0)
+                                        ML.ChaseState = string.format(
+                                            "closing %.0f studs, leading %.1f, at %.0f studs/s",
+                                            chaseSurf, ML.ChaseLeadStuds or 0, speed)
                                     end
                                 end
                             else
@@ -3119,6 +3274,9 @@ task.spawn(function()
                     if hit and canSwing and mouse1click then
                         pcall(function() mouse1click() end)
                         lastSwing = now
+                        -- counted here rather than sampled: the "swinging" state lasts
+                        -- one 0.03s tick, so any sampler slower than that undercounts it
+                        ML.Swings = (ML.Swings or 0) + 1
                         ML.State = "swinging"
                         melKeepSprint()
                     elseif hit and not canSwing then
@@ -3138,7 +3296,7 @@ end)
 task.spawn(function()
     local was = false
     while _G.AR2HUB_GEN == GEN do
-        if ML.KeepSprint and melHb then
+        if ML.KeepSprint and ML.Reach > 0 then
             local ok, down = pcall(function() return iskeypressed(0x01) end)
             down = (ok and down) and true or false
             if down and not was then melKeepSprint() end
@@ -3159,8 +3317,9 @@ task.spawn(function()
             else
                 melInfo:SetText(string.format("%s - reach %.2f studs%s", ML.Weapon, ML.Reach,
                     (ML.Enabled and ML.State) and ("  |  " .. ML.State) or ""))
-                melPredInfo:SetText(string.format("closing at %.1f studs/s  ->  swings %.2f studs early",
-                    ML.Closing or 0, math.max(0, (ML.Closing or 0) * ML.Windup)))
+                melPredInfo:SetText(string.format("closing %.1f studs/s | swings %.2f early | %d swings, %d chases",
+                    ML.Closing or 0, math.max(0, (ML.Closing or 0) * ML.Windup),
+                    ML.Swings or 0, ML.Chases or 0))
             end
             melChaseInfo:SetText(ML.Chase and tostring(ML.ChaseState or "-") or "off")
         end)
@@ -3973,8 +4132,11 @@ _G.ITEMESP.step = function(now)
         if not okk or not kids then return end
         IT.kids, IT.cursor, IT.buffer, IT.scanning = kids, 1, {}, true
     end
+    -- scaled by scheduler health: see the note at the bottom of the file
+    local budget = math.floor(IT.PERTICK * (_G.AR2HUB_HEALTH or 1))
+    if budget < 5 then budget = 5 end
     local done = 0
-    while IT.cursor <= #IT.kids and done < IT.PERTICK do
+    while IT.cursor <= #IT.kids and done < budget do
         local e = IT.kids[IT.cursor]
         IT.cursor = IT.cursor + 1
         done = done + 1
@@ -4107,6 +4269,36 @@ task.spawn(function()
     end
 end)
 end
+-- ==================== Scheduler health ====================
+-- Every heavy sweep in this script is budgeted per tick, but the budgets were each
+-- chosen in isolation. Together they can outrun the client: reads that cost 0.05 ms
+-- on a healthy client were measured at 7 ms under contention, which makes every
+-- budget 140x too large at exactly the moment it needs to be smaller. That spiral
+-- has taken Matcha down twice - once from a scan loop of mine, once from turning on
+-- one ESP too many.
+--
+-- So the sweeps ask this how healthy the scheduler is and scale their budgets by it.
+-- It measures nothing but its own lateness: a loop asking for 0.05 s that gets 0.5 s
+-- reports 0.1, and every sweep then does a tenth of the work until it recovers.
+_G.AR2HUB_HEALTH = 1
+task.spawn(function()
+    local last = tick()
+    while _G.AR2HUB_GEN == GEN do
+        task.wait(0.05)
+        local now = tick()
+        local dt = now - last
+        last = now
+        local ratio = 0.05 / math.max(dt, 0.001)
+        if ratio > 1 then ratio = 1 end
+        -- fall fast, recover slowly: dropping work quickly is what breaks the spiral
+        local prev = _G.AR2HUB_HEALTH or 1
+        local blend = (ratio < prev) and 0.6 or 0.1
+        local v = prev * (1 - blend) + ratio * blend
+        if v < 0.05 then v = 0.05 elseif v > 1 then v = 1 end
+        _G.AR2HUB_HEALTH = v
+    end
+end)
+
 -- ==================== Settings tab ====================
 -- INS-ui ships its own Settings tab. Enabling it gives Theme, Appearance,
 -- Interface (which already contains the "Menu key" bind that opens/closes this
@@ -4168,6 +4360,8 @@ setDiag:Button("Log environment report", function()
     print("iskeypressed     : " .. type(iskeypressed))
     print("memory_write     : " .. type(memory_write))
     print("ESP markers      : " .. tostring(_G.ESP_COUNT))
+    print("scheduler health : " .. string.format("%.2f", _G.AR2HUB_HEALTH or -1)
+          .. "  (1.00 = keeping up; sweeps scale down below that)")
     print("combat prepared  : " .. tostring(_G.COMBAT and _G.COMBAT.Prepared))
     print("combat cache     : " .. tostring(_G.COMBAT and _G.COMBAT.Cache and #_G.COMBAT.Cache))
     print("aimbot enabled   : " .. tostring(_G.AIMBOT and _G.AIMBOT.Enabled))
