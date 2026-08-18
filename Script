@@ -2621,7 +2621,7 @@ local function zombSweepStep(now)
     end
 end
 
-task.spawn(function()
+AR2SPAWN("zombie esp", function()
     local pool = {}
     for i = 1, ZOMB_POOL do
         local ring = Drawing.new("Circle")
@@ -3761,7 +3761,7 @@ MV.root = function()
 end
 
 -- dash
-task.spawn(function()
+AR2SPAWN("dash", function()
     local was = false
     while _G.AR2HUB_GEN == GEN do
         if MV.DashOn then
@@ -3818,7 +3818,7 @@ task.spawn(function()
 end)
 
 -- infinite jump: an upward velocity write each time Space is held past the gap
-task.spawn(function()
+AR2SPAWN("infinite jump", function()
     while _G.AR2HUB_GEN == GEN do
         if MV.JumpOn then
             local held = false
@@ -4565,6 +4565,10 @@ _G.VEHMOD.RamSpeed   = 220
 _G.VEHMOD.RamTrigger = "Key"   -- forced, not carried over: a stale "Mouse 5" is unreadable
 _G.VEHMOD.RamKey     = _G.VEHMOD.RamKey or "r"
 _G.VEHMOD.RamState   = "off"
+_G.VEHMOD.RamHeight  = 90         -- how far above the target Air mode climbs before diving
+_G.VEHMOD.RamGrip    = 45         -- downforce in Ground mode, studs/s held into the terrain
+_G.VEHMOD.RamNose    = 9          -- how far short of the target the chassis centre aims
+_G.VEHMOD.ramPhase   = nil
 _G.VEHMOD.ramZAt     = 0
 
 _G.VEHMOD.ui.ramSec = _G.VEHMOD.ui.sub:Section("Ram", "Full")
@@ -4572,7 +4576,18 @@ _G.VEHMOD.ui.ramSec:Label("Drives the vehicle at whatever you are hunting. Groun
 _G.VEHMOD.ui.ramSec:Label("mode costs no engine at all - it never leaves the floor -")
 _G.VEHMOD.ui.ramSec:Label("while Air goes over obstacles and spends the usual 2%/s.")
 _G.VEHMOD.ui.ramSec:Label("Whitelisted players are never targeted.")
-_G.VEHMOD.ui.ramSec:Toggle("Ram", false, function(v) _G.VEHMOD.Ram = v end,
+_G.VEHMOD.ui.ramSec:Button("Print Ram Timing", function()
+    local t = _G.VEHMOD.ramT or {}
+    print("---- worst ram phase timings (ms) ----")
+    for _, k in ipairs({ "character", "vehicle lookup", "target search", "velocity write" }) do
+        print(string.format("   %-16s %.1f ms", k, t[k] or 0))
+    end
+    print("   (reset by toggling Ram off and on)")
+end, "Dumps the slowest each phase of the ram loop has ever been. Press this right after a stall - whichever number is large is the cause.")
+_G.VEHMOD.ui.ramSec:Toggle("Ram", false, function(v)
+        _G.VEHMOD.Ram = v
+        _G.VEHMOD.ramT = {}          -- fresh timings each time it is armed
+    end,
     "Hold the trigger to steer the vehicle into the nearest target.")
 _G.VEHMOD.ui.ramSec:Dropdown("Mode", "Ground", { "Ground", "Air" }, false,
     function(v) _G.VEHMOD.RamMode = dropStr(v, "Ground") end,
@@ -4582,6 +4597,12 @@ _G.VEHMOD.ui.ramSec:Toggle("Target Players", false, function(v) _G.VEHMOD.RamPla
     "Whitelisted players are skipped whatever this says.")
 _G.VEHMOD.ui.ramSec:Slider("Range", 250, 10, 30, 800, " studs", function(v) _G.VEHMOD.RamRange = v end,
     "How far away it will pick a target from.")
+_G.VEHMOD.ui.ramSec:Slider("Nose Offset", 9, 1, 0, 30, " studs", function(v) _G.VEHMOD.RamNose = v end,
+    "How far short of the target the chassis centre aims, so the FRONT hits rather than the target ending up under the middle of the vehicle. Roughly half your vehicle's length: bigger for a truck, smaller for a quad. Zero aims dead centre.")
+_G.VEHMOD.ui.ramSec:Slider("Ground Grip", 45, 5, 0, 200, " studs/s", function(v) _G.VEHMOD.RamGrip = v end,
+    "Ground mode only: how hard it is held into the terrain. It also cancels any upward motion, so bumps do not launch it - being airborne is what costs engine and rolls the vehicle. Raise it if it still skips over rough ground.")
+_G.VEHMOD.ui.ramSec:Slider("Dive Height", 90, 5, 20, 400, " studs", function(v) _G.VEHMOD.RamHeight = v end,
+    "Air mode only: how far above the target it climbs before dropping on them. Higher hits harder and costs more engine, since the climb is time in the air.")
 _G.VEHMOD.ui.ramSec:Slider("Ram Speed", 220, 10, 40, 1200, " studs/s", function(v) _G.VEHMOD.RamSpeed = v end,
     "How hard it drives at them. Ground mode keeps this flat, so speed here is all horizontal.")
 _G.VEHMOD.ui.ramSec:Dropdown("Trigger", "Key", { "Key", "Right Mouse", "Space" }, false,
@@ -4608,6 +4629,9 @@ _G.VEHMOD.ramTarget = function(from)
         local okd, d = pcall(function() return (p - from).Magnitude end)
         if okd and d <= VM.RamRange and (not bd or d < bd) then best, bd = part, d end
     end
+    -- A dead zombie's root can linger in the caches, and reads against it are slow
+    -- rather than failing, so the list is rebuilt outright every few seconds.
+    if not VM.ramZAt or (tick() - VM.ramZAt) > 4 then VM.ramZ, VM.ramZQ = nil, nil end
     if VM.RamPlayers then
         local okr, P = pcall(function() return svcPlayers() end)
         local lp = (okr and P) and P.LocalPlayer or nil
@@ -4683,8 +4707,20 @@ task.spawn(function()
             end
             if not held then
                 VM.ramPart, VM.ramPickAt = nil, 0     -- fresh target on the next press
+                VM.ramPhase = nil                     -- and a fresh climb, not a stale dive
+                VM.ramBase = nil                      -- and re-find the vehicle you are in
                 VM.RamState = "ready - hold " .. tostring(VM.RamTrigger)
             else
+                -- Self-timing, because four rounds of reasoning about this loop have
+                -- each been wrong. Every phase is measured and the worst is kept, so a
+                -- stall can be attributed instead of guessed at.
+                VM.ramT = VM.ramT or {}
+                local tPhase = tick()
+                local function mark(name)
+                    local ms = (tick() - tPhase) * 1000
+                    if ms > (VM.ramT[name] or 0) then VM.ramT[name] = ms end
+                    tPhase = tick()
+                end
                 local okr, P = pcall(function() return svcPlayers() end)
                 local lp = (okr and P) and P.LocalPlayer or nil
                 local ch = lp and lp.Character
@@ -4694,7 +4730,27 @@ task.spawn(function()
                     local okp, p = pcall(function() return hrp.Position end)
                     myPos = okp and p or nil
                 end
-                local base = myPos and VM.baseNear(myPos) or nil
+                mark("character")
+                -- Lock the vehicle for as long as the trigger is held, the way autopilot
+                -- does. baseNear measured 6.4 ms per call even on its supposedly cached
+                -- path - almost the cost of a full scan - and calling that every tick at
+                -- 20 Hz spent about an eighth of the client answering a question whose
+                -- answer does not change while you are sitting in the thing.
+                local base = VM.ramBase
+                if base then
+                    -- a destroyed part can still answer Position, so check it is still
+                    -- parented to something rather than trusting the read to fail
+                    local okv, p = pcall(function() return base.Position end)
+                    local okpar, par = pcall(function() return base.Parent end)
+                    if not okv or not p or not okpar or not par then
+                        base, VM.ramBase = nil, nil
+                    end
+                end
+                if not base and myPos then
+                    base = VM.baseNear(myPos, 0)
+                    VM.ramBase = base
+                end
+                mark("vehicle lookup")
                 if not base then
                     VM.RamState = "no vehicle"
                 else
@@ -4704,6 +4760,7 @@ task.spawn(function()
                     if not VM.ramPart or (nowR - (VM.ramPickAt or 0)) > 0.35 then
                         VM.ramPickAt = nowR
                         VM.ramPart = myPos and VM.ramTarget(myPos) or nil
+                        mark("target search")
                     end
                     local tp
                     if VM.ramPart then
@@ -4713,24 +4770,64 @@ task.spawn(function()
                     if not tp then
                         VM.RamState = "nothing in range"
                     elseif okb and bp then
+                        -- Aim the FRONT at them, not the middle. Everything here steers
+                        -- the chassis centre, so driving straight at a target parks it
+                        -- underneath the car - and the front is what actually does the
+                        -- damage. The vehicle cannot be rotated (angular velocity writes
+                        -- are rejected), so instead the centre is aimed at a point short
+                        -- of the target by half a car length, along the line of travel.
                         local dir = tp - bp
                         local flat = Vector3.new(dir.X, 0, dir.Z)
                         local dist = flat.Magnitude
+                        if dist > 0.01 then
+                            local nose = math.min(VM.RamNose or 9, dist * 0.8)
+                            local unit = flat / dist
+                            tp = tp - Vector3.new(unit.X, 0, unit.Z) * nose
+                            dir = tp - bp
+                            flat = Vector3.new(dir.X, 0, dir.Z)
+                            dist = flat.Magnitude
+                        end
                         if dist > 0.5 then
                             flat = flat / dist
                             local vel
                             if VM.RamMode == "Air" then
-                                -- lift enough to clear obstacles, aimed slightly above
-                                local up = math.max(0, (tp.Y + 6) - bp.Y)
-                                vel = flat * VM.RamSpeed + Vector3.new(0, math.min(up * 3, 200), 0)
+                                -- Two phases, not one. Driving at them while lifting a
+                                -- little just arrives flat and slow. Climb clear of them
+                                -- first, then come down ON them - the drop adds to the
+                                -- impact instead of fighting it.
+                                local above = bp.Y - tp.Y
+                                if VM.ramPhase ~= "dive" and above < (VM.RamHeight or 90) then
+                                    VM.ramPhase = "climb"
+                                    -- straight up, with just enough lean to stay over them
+                                    local lean = flat * math.min(dist * 0.5, VM.RamSpeed * 0.35)
+                                    vel = lean + Vector3.new(0, VM.RamSpeed, 0)
+                                    VM.RamState = string.format("climbing %.0f/%.0f studs above target",
+                                        math.max(above, 0), VM.RamHeight or 90)
+                                else
+                                    VM.ramPhase = "dive"
+                                    -- full 3D at them: mostly downward from up here
+                                    local d3 = tp - bp
+                                    local m3 = d3.Magnitude
+                                    if m3 > 0.5 then
+                                        vel = (d3 / m3) * VM.RamSpeed
+                                    end
+                                    VM.RamState = string.format("diving, %.0f studs to target", m3)
+                                end
                             else
-                                -- keep whatever vertical it had: pushing down pins it,
-                                -- pushing up starts costing engine
+                                -- Hold it DOWN, do not just preserve what it had.
+                                -- Preserving vertical velocity meant every bump at 220
+                                -- studs/s launched it a little, and any time off the
+                                -- ground is engine drain plus a chance to roll. So:
+                                -- cancel whatever upward motion exists and add downforce
+                                -- on top, which pins it to the terrain instead of
+                                -- skipping across it.
                                 local okv, cur = pcall(function() return base.AssemblyLinearVelocity end)
-                                local keepY = (okv and cur) and cur.Y or 0
-                                vel = flat * VM.RamSpeed + Vector3.new(0, keepY, 0)
+                                local down = -(VM.RamGrip or 45)
+                                if okv and cur and cur.Y > 0 then down = down - cur.Y end
+                                vel = flat * VM.RamSpeed + Vector3.new(0, down, 0)
                             end
                             pcall(function() base.AssemblyLinearVelocity = vel end)
+                            mark("velocity write")
                             VM.RamState = string.format("%s ram, %.0f studs out at %.0f studs/s",
                                 tostring(VM.RamMode), dist, VM.RamSpeed)
                         else
@@ -4953,6 +5050,16 @@ end
 _G.VEHMOD.baseNear = function(myPos, maxAge)
     local VM = _G.VEHMOD
     local now = tick()
+    -- Hard expiry. Dying and getting into a different vehicle leaves every cached
+    -- reference pointing at something that no longer exists, and reads against dead
+    -- instances do not fail cleanly here - they get slow. Pressing ram after a death
+    -- stalled for about thirty seconds, which is what a scan over a list of corpses
+    -- costs. Nothing cached is allowed to outlive this window.
+    if not VM.hardAt or (now - VM.hardAt) > 5 then
+        VM.hardAt = now
+        VM.nearBase, VM.nearAt, VM.nearFailAt = nil, nil, nil
+        VM.ramBase, VM.ramPart, VM.ramZ = nil, nil, nil
+    end
     if VM.nearAt and (now - VM.nearAt) < (maxAge or 1.0) and VM.nearBase then
         local okv = pcall(function() return VM.nearBase.Position end)
         if okv then return VM.nearBase, VM.nearWhy end
@@ -5050,7 +5157,7 @@ _G.VEHMOD.ui.logSec:Button("Print Log", function()
     end
 end, "Dumps every recorded run to the console, one line each.")
 
-task.spawn(function()
+AR2SPAWN("ram", function()
     local VM = _G.VEHMOD
     local L = _G.FLIGHTLOG
     local run, lastPos, lastT, groundAt, lastEng = nil, nil, tick(), tick(), nil
@@ -5148,7 +5255,7 @@ task.spawn(function()
     end
 end)
 
-task.spawn(function()
+AR2SPAWN("autopilot", function()
     while _G.AR2HUB_GEN == GEN do
         pcall(function()
             local VM, L = _G.VEHMOD, _G.FLIGHTLOG
@@ -5180,7 +5287,7 @@ task.spawn(function()
 end)
 
 -- autopilot: owns the vehicle while engaged, so the manual loop stands down
-task.spawn(function()
+AR2SPAWN("vehicle drive", function()
     local VM = _G.VEHMOD
     while _G.AR2HUB_GEN == GEN do
         local AP = VM.AP
