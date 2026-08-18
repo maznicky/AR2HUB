@@ -17,27 +17,47 @@ Open the menu with **P** (changeable in its Settings).
 ### Issues
 "Players" sometimes isn't detected upon loading causing matcha to crash,
 (I don't know if that's Matcha or the game)
-Matcha crashes if you've got too much ESP on.
 Map ESP works fine, it's just the keybinds having issues
+
+**Mouse 4 and Mouse 5 cannot be used for anything.** Matcha reads them as never
+pressed - 0 out of 86 samples while physically held - so any feature bound to
+them silently never fires. They aren't offered in the trigger lists any more.
+
+**Keys drop while you're driving.** Holding W and shift stops the keyboard
+reporting a third key: V managed 3% of reads, R managed 0%. That's the keyboard,
+not the script. Auto Melee bridges the gaps with a hold latch; Ram doesn't, so
+Ram is unreliable while driving.
+
+**Too much ESP at once still costs frames.** Zombie ESP used to spend 36% of the
+client on its own (it projected every tracked zombie every frame, ~94 of them).
+That's fixed - it now picks the nearest handful a few times a second and draws
+only those - but Ground Items is still the heaviest thing in the script.
 
 ### Things I'll improve
 Event spawns, too much are unknown
 Melee dash requires skill, it isn't perfect but there's room for improvement
 (especially with the prediction)
 Vehicle Flying (Currently working on, but there are limits I need to tackle)
+Landing softness for autopilot - the setting didn't do what it should
+Whether ground time resets the engine drain (tested: engine damage never comes
+back, but I haven't proven the drain rate itself doesn't reset)
 
 ### Things that aren't possible due to Matchas limits but works elsewhere
 Undetected Hitbox Expander
 Undetected Silent Aim
-Vehicle auto-flip
+Vehicle auto-flip (angular velocity can't be written - the write is rejected)
 Anti-vehicle explode
-Manipulating vehicles part status'
+Manipulating vehicles part status' (SetAttribute is silently ignored, and
+Anchored isn't a property Matcha knows)
+Vehicle repair (the repair prompts need fireproximityprompt, which is missing)
 Freezing Hydration & Energy depletion
 Changeable bullet travel speed
 Changeable fire-rate
 Instant reload
 Working Noclip
 More specific Item ESP
+
+---
 
 ## Visuals
 
@@ -55,7 +75,7 @@ with attachments.
 
 | mark | effect |
 |------|--------|
-| Whitelist | ignored completely - the aimbot and auto melee will not touch them |
+| Whitelist | ignored completely - the aimbot, auto melee and ram will not touch them |
 | Prioritise | red ESP so you can pick them out of a crowd |
 
 `Clear All Marks` wipes both lists. Marks also carry over to the map dots.
@@ -82,6 +102,9 @@ M4A1Mod1 is the "Operator" M4A1.
 **Items In World** lists every distinct gun and bag currently out there with
 special filters you can select.
 
+Distance defaults to 120 m and only the nearest 24 get markers. Both of those
+are deliberate - see the performance note in Issues.
+
 ### Vehicles
 ESP for every vehicle is colored by **wheel condition**, which is what tells you
 how drivable the vehicle is:
@@ -100,6 +123,8 @@ in the built-in list gets a toggle added automatically under **Other**.
 
 ### Map
 Draws dots onto the real in-game map - open it with **M** as normal.
+**This is the only feature that needs Hybrid mode**, because it reads the game's
+own map interface to know where to draw.
 
 Players, zombies and vehicles each toggle separately, and all start off. Players
 keep their mark colour (prioritised show red), and zombies and vehicles keep the
@@ -109,7 +134,7 @@ Zombie and vehicle dots reuse those tabs' caches, so their ESP needs to be on
 for the map to have anything to draw.
 
 Everything is positioned relative to your own marker, so panning and zooming the
-map are handled for you. Two extras worth knowing:
+map are handled for you. Three extras worth knowing:
 
 - **Show My Own Dot** - off by default, it just sits on top of your real marker.
 - **Map Is Open (override)** - for when the map opens without the script
@@ -117,25 +142,20 @@ map are handled for you. Two extras worth knowing:
 - **Scale Trim** - only needed if dots drift from where things really are.
 
 ### Loot
-
-**Loot ESP** marks searchable objects - drawers, lockers, cabinets, boxes, bags -
-and the kind of loot each one can roll. Each is a *chance* of loot, not a
-promise: what's actually inside doesn't exist until you open it, so whether a
-given box has anything in it can't be shown. Most objects roll several tables and
-only the categories you've enabled get named.
-
-Firearms, Ammo, Medical, Backpacks, Utility, Blueprint, MeleeWeapons and Vests
-start on. Consumables, Clothing, Hats, Belts, Accessories and VehicleParts start
-off - soda cans and student shirts are most of the map and would bury everything
-else.
-
 **Ground Items** marks items actually lying on the floor, including anything
-dropped by a player. These are real objects so the positions are exact.
+dropped by a player. These are real world objects, so the positions are exact.
 
-| label | meaning |
-|-------|---------|
-| green, exact name | close enough for the game to name it (roughly 10-15 studs) |
-| red / pink / white with a trailing `?` | further out - a guess from the item's shape: firearm, melee, or something else |
+Labels come from the item's own model, not its name. A gun reads "Firearm", a
+knife reads "Melee", and items whose mesh carries a real name (Lantern,
+Flashlight, Energy Drink Yellow) name themselves. The game gives no reliable way
+to tie a name to a specific object on the floor, so nothing pretends otherwise.
+
+Categories: Firearms, Ammo, Backpacks, Melees, Accessories, VehicleParts,
+Consumables, Other. Firearms and Melees are read reliably from the model; ammo,
+bags and clothing mostly look identical from outside and land in Other.
+
+Container/searchable-object ESP was removed - what's inside a container doesn't
+exist until you open it, so it could only ever show odds, not contents.
 
 ---
 
@@ -185,25 +205,93 @@ the whole session, including across respawns and weapon swaps.
 read from the melee you're currently holding - so a machete swings sooner than a
 pocket knife.
 
-- **Key Mode** - Hold, Toggle or Always. Default key is **V**.
-- **Targets** - zombies on, players off. Whitelisted players are never hit.
+- **Key Mode** - Hold or Toggle. Default key is **V**.
+- **Trigger** - Key or Right Mouse. Mouse 4/5 aren't offered; Matcha can't read
+  them.
+- **Targets** - players and zombies, both on. Whitelisted players are never hit.
 - **Only Hit What's In Front Of You** - ignores anything behind you.
-- **Cooldown** - how often it's allowed to swing.
-- **Keep Sprint When Swinging** - swinging normally drops you out of sprint, so
-  this presses it again straight after.
-- **Predict Swing** - damage doesn't land when the swing starts, it lands near
-  the end of the animation. This starts the swing early based on how fast the
-  target is closing on you, so runners get hit instead of missed.
+
+Cooldown, sprint keeping and swing prediction still run at the values that
+tested well; their sliders were removed to keep the tab readable.
+
+**Chase** dashes you at whatever you're about to swing at, so the hit lands as
+you arrive. It aims where the target *will* be, eases off if the body starts
+leaning, and won't dash into someone already running at you - meeting in the
+middle is what used to send you past them.
 
 Reach and cooldown themselves are the server's call, so nothing here makes your
 weapon longer or faster - it just times the swings better than a human can.
 
-### Movement
+---
+
+## Vehicle Mods
+
+Everything here moves the **vehicle**, not you, by writing its velocity. That's
+the one thing this game accepts: a chassis moved 17 studs with 0.13 studs of
+correction afterwards, so the server takes it.
+
+**Time in the air is what costs you.** The engine starts depleting about a
+second after takeoff and drains roughly 2% per second until you land. That
+damage never comes back. Distance and altitude are free - a 4,380 stud hop on a
+15% engine survived because it only took two seconds.
+
+### Drive
+- **Fly** - hold the trigger and the vehicle goes wherever the camera points.
+- **Fly Speed** - no ceiling worth worrying about; 1000 measured a peak of 1108
+  studs/s and covered 2,344 studs in a 6 second flight.
+- **Trigger / Fly Key** - Key (default **G**), Right Mouse or Space.
+- **Auto Right** - lifts a rolled vehicle back onto its wheels. Angular velocity
+  can't be written, so a vertical shove is the only way to undo a flip. It only
+  fires when the vehicle has been well past its side for most of a second, so
+  hills don't set it off.
+- **Protect Engine** - refuses trips the vehicle can't survive and lands early
+  if the engine runs out mid-flight.
+
+### Ram
+Drives the vehicle at whatever you're hunting.
+
+| mode | cost |
+|------|------|
+| Ground | never leaves the floor, so **no engine drain at all** |
+| Air | clears obstacles, spends the usual ~2%/s |
+
+Targets zombies by default, players optional, whitelisted players never.
+Trigger defaults to the **R** key - though see the note about keys dropping while
+you drive.
+
+### Autopilot
+Flies the vehicle to a destination and lands it: climb, cross, descend, stop.
+
+- **Travel Height** - how high it crosses (default 280, above every recorded
+  destination, so it clears terrain).
+- **Travel Speed** - sets the whole profile at once; braking tracks it.
+
+Long trips may still need **manual stops**, for two reasons: the engine drains
+the whole time you're airborne, and arriving somewhere the map hasn't streamed
+in yet drops the vehicle through the ground.
+
+**Destinations** are grouped by island - Halsey, Faris and Mackinaw - and each
+one was recorded by standing on the spot, which is how the landing knows what
+height to stop at. There's no way to measure ground height in this game, so a
+destination picked off a map wouldn't work.
+
+### Flight Log
+Records each flight: time airborne, distance, peak speed, engine before and
+after, how long you were grounded first, and where the engine first took damage.
+`Print Log` dumps every run to the console. It's there to answer how far you can
+get per engine point rather than guessing.
+
+---
+
+## Character
+
 **Dash** is a short burst in the direction you're facing, default **X**, with
 adjustable speed, duration and cooldown.
 
-Worth being aware: this is the most visible thing in the script, since the server
-does see you move. It's deliberately built as short bursts with a cooldown rather
+**Infinite Jump** - hold Space to keep jumping.
+
+Both are real movement the server sees, so they're the most visible things in
+the script. Dash is deliberately built as short bursts with a cooldown rather
 than constant speed.
 
 ---
@@ -218,7 +306,8 @@ Plus two script sections:
 - **AR2 Hub** - Panic (stops ESP and aimbot, releases input), Unload AR2 Hub,
   and the input watchdog toggle.
 - **Diagnostics** - live players/aim readout and a `Log environment report`
-  button that dumps the state worth checking when something stops working.
+  button that dumps the state worth checking when something stops working,
+  including scheduler health (1.00 = keeping up).
 
 ---
 
@@ -228,11 +317,15 @@ Plus two script sections:
 |-----|--------|
 | P   | Open / close the menu |
 | E   | Hold to aim (rebindable) |
-| V   | Auto melee (rebindable, Hold / Toggle / Always) |
+| V   | Auto melee (rebindable, Hold / Toggle) |
 | X   | Dash (rebindable) |
+| G   | Vehicle fly (rebindable) |
+| R   | Vehicle ram (rebindable) |
 | M   | The game's own map - Map ESP draws onto it |
 | F7  | Panic - kills the ESP and releases input |
 | F8  | Site Probe sweep (also runs automatically every 60 s) |
+
+Mouse 4 and Mouse 5 are not usable for any of these - Matcha can't see them.
 
 ---
 
@@ -242,8 +335,12 @@ Everything starts disabled; nothing scans until you toggle it on.
 
 Distances are shown in meters (studs / 2.75) to match Matchas.
 
-Map ESP and the exact names on ground items read the game's own interface, so
-those two need **Hybrid mode** on. Everything else works without it.
+**Hybrid mode is only needed for Map ESP.** Everything else - all the other ESPs,
+aimbot, gun mods, melee, vehicle mods - works without it.
 
 Matcha's Players handle can go stale mid-session (unless its the games anti-cheat i have no idea.)
 When it does, player-based features idle and recover on their own instead of erroring.
+
+The script keeps a scheduler health figure and throttles its own scanning when
+the client falls behind. If ESP updates go sluggish, that's it working - check
+Diagnostics.
