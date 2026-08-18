@@ -2468,13 +2468,20 @@ end)
 _G.ZOMBESP = _G.ZOMBESP or {}
 local ZE = _G.ZOMBESP
 ZE.Enabled = false
-ZE.MaxM    = ZE.MaxM or 250
+ZE.MaxM    = 120        -- forced: 250 m meant almost every zombie qualified every frame
 ZE.Show    = ZE.Show or {}      -- category -> true
 ZE.Live    = ZE.Live or {}      -- rendered list
 
-local ZOMB_POOL    = 80
+-- 80 markers was far more than is readable on screen, and because the loop only stops
+-- once the pool is full it meant projecting nearly every tracked zombie every frame:
+-- measured at 94 of 94 projected, 17.8 ms a pass, 36% of the client spent continuously.
+-- That was the largest single cost in the script, and the health guard could not touch
+-- it because it only ever throttled sweeps - so under load the one dominant cost was
+-- the one thing that never backed off.
+local ZOMB_POOL    = 24
 local ZOMB_PERTICK = 3          -- zombies classified per tick during a sweep
 local ZOMB_SWEEP   = 1.5        -- seconds between sweeps
+local ZOMB_LOOK    = 40         -- entries examined per pass, before health scaling
 
 local ZCOL = {
     special = C(245, 170,  70),  -- orange, same as the vehicle middle band
@@ -2501,7 +2508,7 @@ local zombToggles = {}
 
 local zombSec = zombietab:Section("Zombie ESP", "Full")
 zombSec:Toggle("Zombie ESP", false, function(v) ZE.Enabled = v end)
-zombSec:Slider("Distance", 250, 25, 0, 10000, " m", function(v) ZE.MaxM = v end,
+zombSec:Slider("Distance", 120, 25, 0, 10000, " m", function(v) ZE.MaxM = v end,
     "Zombies replicate map-wide, so a high value really does show the whole map - and there are around a hundred of them.")
 zombSec:Button("Toggle All Types", function()
     local anyOn = false
@@ -2638,16 +2645,58 @@ task.spawn(function()
 
     while _G.AR2HUB_GEN == GEN do
         local n = 0
+        -- The whole frame is wrapped. Any throw in here - a stale part, a bad read, a
+        -- sort that dislikes its input - used to end the ESP permanently and silently,
+        -- which reads as "the script crashed". A bad frame now costs one frame.
+        local frameOk, frameErr = pcall(function()
         if ZE.Enabled then
             local now = tick()
             zombSweepStep(now)
             local cp = camPos()
             if cp then
                 local maxStuds = ZE.MaxM * E.DistanceDivisor
-                local list = ZE.Live
-                for i = 1, #list do
+                -- Shortlist, rebuilt on a timer, drawn every frame.
+                --
+                -- Projecting all 94 tracked zombies every frame cost 36% of the client.
+                -- Rotating through a window of them fixed the cost but made markers
+                -- flicker, because a zombie drawn on one pass was skipped on the next
+                -- and its marker hidden. So: scan everything a few times a second to
+                -- decide WHICH are worth drawing, then draw that same set every frame.
+                -- Flat cost, stable markers.
+                if (now - (ZE.shortAt or 0)) > 0.3 or not ZE.short then
+                    ZE.shortAt = now
+                    local cand = {}
+                    for i = 1, #ZE.Live do
+                        local e = ZE.Live[i]
+                        if ZE.Show[e.cat] then
+                            local ok, pos = pcall(function() return e.part.Position end)
+                            if ok and pos then
+                                local okd, d = pcall(function() return (pos - cp).Magnitude end)
+                                -- d == d rejects NaN, which a bad read can produce and
+                                -- which makes table.sort throw "invalid order function"
+                                -- - and an error here kills this loop for good
+                                if okd and type(d) == "number" and d == d
+                                   and d < math.huge and d <= maxStuds then
+                                    cand[#cand + 1] = { e = e, d = d }
+                                end
+                            end
+                        end
+                    end
+                    -- sorting is wrapped as well: even with NaN filtered out, one throw
+                    -- here would take the whole ESP down until the script is reloaded.
+                    -- An unsorted shortlist just means the markers are not the nearest,
+                    -- which is a far better failure than no markers at all.
+                    pcall(function()
+                        table.sort(cand, function(a, b) return a.d < b.d end)
+                    end)
+                    local short = {}
+                    for i = 1, math.min(#cand, ZOMB_POOL) do short[i] = cand[i].e end
+                    ZE.short = short
+                end
+                local list = ZE.short or {}
+                for step = 1, #list do
                     if n >= ZOMB_POOL then break end
-                    local e = list[i]
+                    local e = list[step]
                     if ZE.Show[e.cat] then
                         -- The arithmetic is wrapped, not just the read: Matcha
                         -- falls back to FindFirstChild for unsupported properties,
@@ -2693,6 +2742,13 @@ task.spawn(function()
                         end
                     end
                 end
+            end
+        end
+        end)   -- frame pcall
+        if not frameOk then
+            ZE.frameErrs = (ZE.frameErrs or 0) + 1
+            if ZE.frameErrs <= 3 then
+                warn("[AR2 Hub] zombie ESP frame error: " .. tostring(frameErr))
             end
         end
         for i = n + 1, ZOMB_POOL do hide(pool[i]) end
