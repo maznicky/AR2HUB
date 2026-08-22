@@ -4557,7 +4557,10 @@ _G.VEHMOD.RamMode    = dropStr(_G.VEHMOD.RamMode, "Ground")
 _G.VEHMOD.RamPlayers = false
 _G.VEHMOD.RamZombies = true
 _G.VEHMOD.RamRange   = 250
-_G.VEHMOD.RamSpeed   = 220
+-- 100, not 220. Above roughly 150 studs/s the chassis moves further in one physics
+-- step than a player is wide, so the contact is never resolved and nobody takes a
+-- scratch. Every failed ram - the dives, the sweeps, the ground drags - was this.
+_G.VEHMOD.RamSpeed   = 100
 -- NOT a mouse side button. Measured on this machine: iskeypressed reported Mouse 5 as
 -- held on 0 of 86 samples while it was physically held down, and Mouse 4 the same.
 -- Matcha cannot see those buttons, so a feature bound to one simply never runs - Ram
@@ -4566,7 +4569,7 @@ _G.VEHMOD.RamTrigger = "Key"   -- forced, not carried over: a stale "Mouse 5" is
 _G.VEHMOD.RamKey     = _G.VEHMOD.RamKey or "r"
 _G.VEHMOD.RamState   = "off"
 _G.VEHMOD.RamHeight  = 90         -- how far above the target Air mode climbs before diving
-_G.VEHMOD.RamGrip    = 45         -- downforce in Ground mode, studs/s held into the terrain
+_G.VEHMOD.RamGrip    = 18         -- Ground mode: how hard lift is cancelled, studs/s
 _G.VEHMOD.RamNose    = 9          -- how far short of the target the chassis centre aims
 _G.VEHMOD.RamSweep   = 0.7        -- seconds per pass before reversing back through them
 -- Damage comes from the car being DRIVEN, not from velocity written onto its chassis.
@@ -4632,14 +4635,14 @@ _G.VEHMOD.ui.ramSec:Slider("Range", 250, 10, 30, 800, " studs", function(v) _G.V
     "How far away it will pick a target from.")
 _G.VEHMOD.ui.ramSec:Slider("Nose Offset", 9, 1, 0, 30, " studs", function(v) _G.VEHMOD.RamNose = v end,
     "How far short of the target the chassis centre aims, so the FRONT hits rather than the target ending up under the middle of the vehicle. Roughly half your vehicle's length: bigger for a truck, smaller for a quad. Zero aims dead centre.")
-_G.VEHMOD.ui.ramSec:Slider("Ground Grip", 45, 5, 0, 200, " studs/s", function(v) _G.VEHMOD.RamGrip = v end,
-    "Ground mode only: how hard it is held into the terrain. It also cancels any upward motion, so bumps do not launch it - being airborne is what costs engine and rolls the vehicle. Raise it if it still skips over rough ground.")
+_G.VEHMOD.ui.ramSec:Slider("Ground Grip", 18, 5, 0, 200, " studs/s", function(v) _G.VEHMOD.RamGrip = v end,
+    "Ground mode only: how hard bumps are pushed back down, and the fastest it is allowed to drop. It no longer drives into the floor constantly, which was quietly wrecking the engine - it only cancels lift. Raise it if it starts skipping over rough ground, lower it if the engine still suffers.")
 _G.VEHMOD.ui.ramSec:Slider("Sweep Time", 0.7, 0.1, 0.2, 3, " s", function(v) _G.VEHMOD.RamSweep = v end,
     "Air mode only: after the dive lands it drives through the target and reverses back, over and over, held onto the ground. This is how long each pass lasts before it reverses. Shorter saws at them in place; longer runs further past them each time.")
 _G.VEHMOD.ui.ramSec:Slider("Dive Height", 90, 5, 20, 400, " studs", function(v) _G.VEHMOD.RamHeight = v end,
     "Air mode only: how far above the target it climbs before dropping on them. Higher hits harder and costs more engine, since the climb is time in the air.")
-_G.VEHMOD.ui.ramSec:Slider("Ram Speed", 220, 10, 40, 1200, " studs/s", function(v) _G.VEHMOD.RamSpeed = v end,
-    "How hard it drives at them. Ground mode keeps this flat, so speed here is all horizontal.")
+_G.VEHMOD.ui.ramSec:Slider("Ram Speed", 100, 10, 40, 1200, " studs/s", function(v) _G.VEHMOD.RamSpeed = v end,
+    "How hard it drives at them. Around 100 is the sweet spot and the default for good reason: above roughly 150 the vehicle covers more ground per physics step than a person is wide, so it passes straight through them without a collision ever being registered. Fast looks more violent and does nothing at all.")
 _G.VEHMOD.ui.ramSec:Dropdown("Trigger", "Key", { "Key", "Right Mouse", "Space" }, false,
     function(v) _G.VEHMOD.RamTrigger = dropStr(v, "Key") end,
     "Mouse 4 and Mouse 5 are deliberately not offered: this executor cannot read them at all, measured at 0 of 86 samples while held, so anything bound to them never fires.")
@@ -4926,8 +4929,20 @@ task.spawn(function()
                                 -- on top, which pins it to the terrain instead of
                                 -- skipping across it.
                                 local okv, cur = pcall(function() return base.AssemblyLinearVelocity end)
-                                local down = -(VM.RamGrip or 45)
-                                if okv and cur and cur.Y > 0 then down = down - cur.Y end
+                                -- Only fight upward motion. Holding a constant downward
+                                -- speed means driving into the terrain every single tick,
+                                -- which is a continuous impact and eats the engine for
+                                -- nothing. Kill launches, otherwise let it fall naturally
+                                -- and just cap how hard it is allowed to land.
+                                local grip = VM.RamGrip or 18
+                                local down = -grip
+                                if okv and cur then
+                                    if cur.Y > 0 then
+                                        down = -(cur.Y + grip)      -- a bump is lifting it
+                                    else
+                                        down = math.max(cur.Y, -grip)  -- falling: don't add to it
+                                    end
+                                end
                                 vel = flat * VM.RamSpeed + Vector3.new(0, down, 0)
                             end
                             -- Drive mode sets no velocity at all - it left the state
