@@ -16,7 +16,7 @@ Open the menu with **P** (changeable in its Settings).
 
 ### Issues
 "Players" sometimes isn't detected upon loading causing matcha to crash,
-(I don't know if that's Matcha or the game)
+(I don't know if that's Matcha, me or the game)
 Map ESP works fine, it's just the keybinds having issues
 
 **Mouse 4 and Mouse 5 cannot be used for anything.** Matcha reads them as never
@@ -33,6 +33,14 @@ client on its own (it projected every tracked zombie every frame, ~94 of them).
 That's fixed - it now picks the nearest handful a few times a second and draws
 only those - but Ground Items is still the heaviest thing in the script.
 
+**Long flights make the game load slower.** Crossing the map faster than Roblox
+streams it leaves the loading permanently behind: buildings, trees and sound
+effects start appearing late, and it gets worse the longer the session runs
+rather than recovering. It's also why arriving somewhere too fast drops you
+through the ground. Rejoining resets it. This isn't a bug I can fix - anything
+that moves you faster than the game streams will do it - so shorter hops with a
+few seconds on the ground between them are the only real mitigation.
+
 ### Things I'll improve
 Event spawns, too much are unknown
 Melee dash requires skill, it isn't perfect but there's room for improvement
@@ -41,11 +49,16 @@ Vehicle Flying (Currently working on, but there are limits I need to tackle)
 Landing softness for autopilot - the setting didn't do what it should
 Whether ground time resets the engine drain (tested: engine damage never comes
 back, but I haven't proven the drain rate itself doesn't reset)
+Ram against **players** specifically - zombies die cleanly, players don't always
+take damage from the same setup, and I don't yet know whether that's purely the
+vehicle's hitbox or something server-side rejecting it
 
 ### Things that aren't possible due to Matchas limits but works elsewhere
 Undetected Hitbox Expander
 Undetected Silent Aim
-Vehicle auto-flip (angular velocity can't be written - the write is rejected)
+Properly rotating a vehicle upright (angular velocity can't be written - the
+write is rejected. Auto Flip works around it with a vertical shove, which isn't
+the same thing and doesn't always take)
 Anti-vehicle explode
 Manipulating vehicles part status' (SetAttribute is silently ignored, and
 Anchored isn't a property Matcha knows)
@@ -240,24 +253,46 @@ damage never comes back. Distance and altitude are free - a 4,380 stud hop on a
 - **Fly Speed** - no ceiling worth worrying about; 1000 measured a peak of 1108
   studs/s and covered 2,344 studs in a 6 second flight.
 - **Trigger / Fly Key** - Key (default **G**), Right Mouse or Space.
-- **Auto Right** - lifts a rolled vehicle back onto its wheels. Angular velocity
+- **Auto Flip** - lifts a rolled vehicle back onto its wheels. Angular velocity
   can't be written, so a vertical shove is the only way to undo a flip. It only
   fires when the vehicle has been well past its side for most of a second, so
   hills don't set it off.
-- **Protect Engine** - refuses trips the vehicle can't survive and lands early
-  if the engine runs out mid-flight.
+
+Engine protection is always on now rather than being a toggle - it refuses trips
+the vehicle can't survive and lands early if the engine runs out mid-flight.
+Turning it off only ever meant volunteering to lose the vehicle.
 
 ### Ram
-Drives the vehicle at whatever you're hunting.
+Drives the vehicle along the ground at whatever you're hunting. Never leaves the
+floor, so there's **no engine drain at all** - the only cost is the crash damage
+from the impacts themselves.
 
-| mode | cost |
-|------|------|
-| Ground | never leaves the floor, so **no engine drain at all** |
-| Air | clears obstacles, spends the usual ~2%/s |
+**How well this works depends on the vehicle far more than on any setting.** The
+hitbox shape and ride height decide whether contact registers at all. The rubber
+dinghy is the best I've found; other vehicles barely connect on identical
+settings. If something won't land a hit, change vehicle before touching sliders.
+
+Two things worth knowing, both learned the hard way:
+
+- **Speed above ~150 studs/s does nothing.** The vehicle covers more ground per
+  physics step than a person is wide, so it passes straight through them and no
+  collision is ever registered. 100 is the default for that reason - fast looks
+  more violent and does nothing at all. This was behind every ram that "worked"
+  but dealt no damage.
+- **Engine power is irrelevant.** A vehicle with no fuel left still ran zombies
+  over, so it's the velocity that damages, not the throttle.
+
+Settings are **Range**, **Ground Grip** (how hard bumps get pushed back down -
+around 60 is what actually connects) and **Ram Speed**. There used to be Ground
+and Air modes; Air climbed and dove and reliably did nothing, and Ground was
+this without the steering, so there's just the one mode now.
 
 Targets zombies by default, players optional, whitelisted players never.
 Trigger defaults to the **R** key - though see the note about keys dropping while
 you drive.
+
+Zombies die to a clean pass. Players are less consistent, and I haven't pinned
+down why yet - see Things I'll improve.
 
 ### Autopilot
 Flies the vehicle to a destination and lands it: climb, cross, descend, stop.
@@ -340,7 +375,6 @@ aimbot, gun mods, melee, vehicle mods - works without it.
 
 Matcha's Players handle can go stale mid-session (unless its the games anti-cheat i have no idea.)
 When it does, player-based features idle and recover on their own instead of erroring.
-
 The script keeps a scheduler health figure and throttles its own scanning when
 the client falls behind. If ESP updates go sluggish, that's it working - check
 Diagnostics.
