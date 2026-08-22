@@ -19,55 +19,49 @@ Open the menu with **P** (changeable in its Settings).
 (I don't know if that's Matcha, me or the game)
 Map ESP works fine, it's just the keybinds having issues
 
-**Mouse 4 and Mouse 5 cannot be used for anything.** Matcha reads them as never
-pressed - 0 out of 86 samples while physically held - so any feature bound to
-them silently never fires. They aren't offered in the trigger lists any more.
-
-**Keys drop while you're driving.** Holding W and shift stops the keyboard
-reporting a third key: V managed 3% of reads, R managed 0%. That's the keyboard,
-not the script. Auto Melee bridges the gaps with a hold latch; Ram doesn't, so
-Ram is unreliable while driving.
+**Keys drop while you're driving.** When you're holding your keybind for Ram
+it'll randomly stop but recovers in less than a second
 
 **Too much ESP at once still costs frames.** Zombie ESP used to spend 36% of the
-client on its own (it projected every tracked zombie every frame, ~94 of them).
+client on its own.
 That's fixed - it now picks the nearest handful a few times a second and draws
 only those - but Ground Items is still the heaviest thing in the script.
-
-**Long flights make the game load slower.** Crossing the map faster than Roblox
-streams it leaves the loading permanently behind: buildings, trees and sound
-effects start appearing late, and it gets worse the longer the session runs
-rather than recovering. It's also why arriving somewhere too fast drops you
-through the ground. Rejoining resets it. This isn't a bug I can fix - anything
-that moves you faster than the game streams will do it - so shorter hops with a
-few seconds on the ground between them are the only real mitigation.
 
 ### Things I'll improve
 Event spawns, too much are unknown
 Melee dash requires skill, it isn't perfect but there's room for improvement
 (especially with the prediction)
-Vehicle Flying (Currently working on, but there are limits I need to tackle)
-Landing softness for autopilot - the setting didn't do what it should
-Whether ground time resets the engine drain (tested: engine damage never comes
-back, but I haven't proven the drain rate itself doesn't reset)
+Vehicle Autopilot (Trying to figure out the best way to avoid engine damage)
 Ram against **players** specifically - zombies die cleanly, players don't always
 take damage from the same setup, and I don't yet know whether that's purely the
 vehicle's hitbox or something server-side rejecting it
 
 ### Things that aren't possible due to Matchas limits but works elsewhere
 Undetected Hitbox Expander
+
 Undetected Silent Aim
+
 Properly rotating a vehicle upright (angular velocity can't be written - the
 write is rejected. Auto Flip works around it with a vertical shove, which isn't
 the same thing and doesn't always take)
+
 Anti-vehicle explode
+
 Manipulating vehicles part status' (SetAttribute is silently ignored, and
 Anchored isn't a property Matcha knows)
+
 Vehicle repair (the repair prompts need fireproximityprompt, which is missing)
+
 Freezing Hydration & Energy depletion
+
 Changeable bullet travel speed
+
 Changeable fire-rate
+
 Instant reload
+
 Working Noclip
+
 More specific Item ESP
 
 ---
@@ -310,12 +304,6 @@ one was recorded by standing on the spot, which is how the landing knows what
 height to stop at. There's no way to measure ground height in this game, so a
 destination picked off a map wouldn't work.
 
-### Flight Log
-Records each flight: time airborne, distance, peak speed, engine before and
-after, how long you were grounded first, and where the engine first took damage.
-`Print Log` dumps every run to the console. It's there to answer how far you can
-get per engine point rather than guessing.
-
 ---
 
 ## Character
@@ -359,8 +347,6 @@ Plus two script sections:
 | M   | The game's own map - Map ESP draws onto it |
 | F7  | Panic - kills the ESP and releases input |
 | F8  | Site Probe sweep (also runs automatically every 60 s) |
-
-Mouse 4 and Mouse 5 are not usable for any of these - Matcha can't see them.
 
 ---
 
