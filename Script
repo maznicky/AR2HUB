@@ -4568,6 +4568,35 @@ _G.VEHMOD.RamState   = "off"
 _G.VEHMOD.RamHeight  = 90         -- how far above the target Air mode climbs before diving
 _G.VEHMOD.RamGrip    = 45         -- downforce in Ground mode, studs/s held into the terrain
 _G.VEHMOD.RamNose    = 9          -- how far short of the target the chassis centre aims
+_G.VEHMOD.RamSweep   = 0.7        -- seconds per pass before reversing back through them
+-- Damage comes from the car being DRIVEN, not from velocity written onto its chassis.
+-- Dives, sweeps and ground slides all move the vehicle convincingly and do nothing to
+-- anyone, because the game only counts a real engine-and-wheels impact. So this mode
+-- holds W and steers with A/D exactly as a player does.
+_G.VEHMOD.RamMode    = dropStr(_G.VEHMOD.RamMode, "Drive")
+_G.VEHMOD.RamSteer   = 12         -- degrees of slack before it bothers steering
+_G.VEHMOD.ramKeysDown = {}
+_G.VEHMOD.DRIVEVK = { W = 0x57, A = 0x41, S = 0x53, D = 0x44 }
+
+_G.VEHMOD.holdKey = function(name, want)
+    local VM = _G.VEHMOD
+    local vk = VM.DRIVEVK[name]
+    if not vk then return end
+    local down = VM.ramKeysDown[name] == true
+    if want and not down then
+        if keypress then pcall(function() keypress(vk) end) end
+        VM.ramKeysDown[name] = true
+    elseif (not want) and down then
+        if keyrelease then pcall(function() keyrelease(vk) end) end
+        VM.ramKeysDown[name] = false
+    end
+end
+
+_G.VEHMOD.releaseDriving = function()
+    for _, k in ipairs({ "W", "A", "S", "D" }) do _G.VEHMOD.holdKey(k, false) end
+end
+_G.VEHMOD.ramSweepAt = nil
+_G.VEHMOD.ramSweepDir = 1
 _G.VEHMOD.ramPhase   = nil
 _G.VEHMOD.ramZAt     = 0
 
@@ -4589,9 +4618,13 @@ _G.VEHMOD.ui.ramSec:Toggle("Ram", false, function(v)
         _G.VEHMOD.ramT = {}          -- fresh timings each time it is armed
     end,
     "Hold the trigger to steer the vehicle into the nearest target.")
-_G.VEHMOD.ui.ramSec:Dropdown("Mode", "Ground", { "Ground", "Air" }, false,
-    function(v) _G.VEHMOD.RamMode = dropStr(v, "Ground") end,
-    "Ground drags along the floor and costs no engine. Air flies at them, clearing obstacles, at the usual airborne cost.")
+_G.VEHMOD.ui.ramSec:Dropdown("Mode", "Drive", { "Drive", "Ground", "Air" }, false,
+    function(v) _G.VEHMOD.RamMode = dropStr(v, "Drive") end,
+    "Drive actually drives the car - it holds W and steers with A/D, so the game sees a real vehicle under power, which is what does damage. Ground and Air shove the chassis with velocity instead: they move you well but the game does not treat that as being run over.")
+
+_G.VEHMOD.ui.ramSec:Slider("Steering Slack", 4, 40, _G.VEHMOD.RamSteer or 12, false,
+    function(v) _G.VEHMOD.RamSteer = tonumber(v) or 12 end,
+    "Drive mode only. How many degrees off aim it tolerates before it steers. Lower is tighter but weaves at speed.")
 _G.VEHMOD.ui.ramSec:Toggle("Target Zombies", true, function(v) _G.VEHMOD.RamZombies = v end)
 _G.VEHMOD.ui.ramSec:Toggle("Target Players", false, function(v) _G.VEHMOD.RamPlayers = v end,
     "Whitelisted players are skipped whatever this says.")
@@ -4601,6 +4634,8 @@ _G.VEHMOD.ui.ramSec:Slider("Nose Offset", 9, 1, 0, 30, " studs", function(v) _G.
     "How far short of the target the chassis centre aims, so the FRONT hits rather than the target ending up under the middle of the vehicle. Roughly half your vehicle's length: bigger for a truck, smaller for a quad. Zero aims dead centre.")
 _G.VEHMOD.ui.ramSec:Slider("Ground Grip", 45, 5, 0, 200, " studs/s", function(v) _G.VEHMOD.RamGrip = v end,
     "Ground mode only: how hard it is held into the terrain. It also cancels any upward motion, so bumps do not launch it - being airborne is what costs engine and rolls the vehicle. Raise it if it still skips over rough ground.")
+_G.VEHMOD.ui.ramSec:Slider("Sweep Time", 0.7, 0.1, 0.2, 3, " s", function(v) _G.VEHMOD.RamSweep = v end,
+    "Air mode only: after the dive lands it drives through the target and reverses back, over and over, held onto the ground. This is how long each pass lasts before it reverses. Shorter saws at them in place; longer runs further past them each time.")
 _G.VEHMOD.ui.ramSec:Slider("Dive Height", 90, 5, 20, 400, " studs", function(v) _G.VEHMOD.RamHeight = v end,
     "Air mode only: how far above the target it climbs before dropping on them. Higher hits harder and costs more engine, since the climb is time in the air.")
 _G.VEHMOD.ui.ramSec:Slider("Ram Speed", 220, 10, 40, 1200, " studs/s", function(v) _G.VEHMOD.RamSpeed = v end,
@@ -4708,7 +4743,9 @@ task.spawn(function()
             if not held then
                 VM.ramPart, VM.ramPickAt = nil, 0     -- fresh target on the next press
                 VM.ramPhase = nil                     -- and a fresh climb, not a stale dive
+                VM.ramSweepAt, VM.ramSweepDir = nil, 1
                 VM.ramBase = nil                      -- and re-find the vehicle you are in
+                VM.releaseDriving()                   -- never leave the throttle stuck down
                 VM.RamState = "ready - hold " .. tostring(VM.RamTrigger)
             else
                 -- Self-timing, because four rounds of reasoning about this loop have
@@ -4776,6 +4813,10 @@ task.spawn(function()
                         -- damage. The vehicle cannot be rotated (angular velocity writes
                         -- are rejected), so instead the centre is aimed at a point short
                         -- of the target by half a car length, along the line of travel.
+                        -- Drive mode wants the true target, not the shortened one: it
+                        -- pushes the car forward under its own power, so the front
+                        -- reaches them first without any offset help.
+                        local trueTp = tp
                         local dir = tp - bp
                         local flat = Vector3.new(dir.X, 0, dir.Z)
                         local dist = flat.Magnitude
@@ -4790,20 +4831,59 @@ task.spawn(function()
                         if dist > 0.5 then
                             flat = flat / dist
                             local vel
-                            if VM.RamMode == "Air" then
+                            if VM.RamMode == "Drive" then
+                                -- Drive it like a player: accelerator down, steer with
+                                -- A/D until the nose points at them. No velocity is
+                                -- written at all, because that is precisely what the
+                                -- game does not count as running someone over.
+                                local okc2, vcf = pcall(function() return base.CFrame end)
+                                if okc2 and vcf then
+                                    local fwd = vcf.LookVector
+                                    local f2 = Vector3.new(fwd.X, 0, fwd.Z)
+                                    local td = trueTp - bp
+                                    local to = Vector3.new(td.X, 0, td.Z)
+                                    local tdist = to.Magnitude
+                                    if f2.Magnitude > 0.01 and tdist > 0.01 then
+                                        f2 = f2 / f2.Magnitude
+                                        to = to / tdist
+                                        local dot = f2.X * to.X + f2.Z * to.Z
+                                        if dot > 1 then dot = 1 elseif dot < -1 then dot = -1 end
+                                        local angle = math.deg(math.acos(dot))
+                                        -- which way to turn: sign of the cross product
+                                        local cross = f2.X * to.Z - f2.Z * to.X
+                                        local slack = VM.RamSteer or 12
+                                        VM.holdKey("A", angle > slack and cross < 0)
+                                        VM.holdKey("D", angle > slack and cross > 0)
+                                        -- reverse out if it is facing away, otherwise go
+                                        local backing = angle > 140 and tdist < 25
+                                        VM.holdKey("S", backing)
+                                        VM.holdKey("W", not backing)
+                                        VM.RamState = string.format(
+                                            "driving, %.0f studs, %.0f%s off aim%s",
+                                            tdist, angle, "\194\176",
+                                            backing and " (reversing)" or "")
+                                    end
+                                end
+                            elseif VM.RamMode == "Air" then
                                 -- Two phases, not one. Driving at them while lifting a
                                 -- little just arrives flat and slow. Climb clear of them
                                 -- first, then come down ON them - the drop adds to the
                                 -- impact instead of fighting it.
                                 local above = bp.Y - tp.Y
-                                if VM.ramPhase ~= "dive" and above < (VM.RamHeight or 90) then
+                                -- "sweep" has to be excluded here as well as "dive":
+                                -- once sweeping, the vehicle is by definition low, so a
+                                -- check that only skipped diving sent it straight back
+                                -- up - climb, dive, sweep, climb, which reads as the
+                                -- vehicle bouncing on the spot.
+                                if VM.ramPhase ~= "dive" and VM.ramPhase ~= "sweep"
+                                   and above < (VM.RamHeight or 90) then
                                     VM.ramPhase = "climb"
                                     -- straight up, with just enough lean to stay over them
                                     local lean = flat * math.min(dist * 0.5, VM.RamSpeed * 0.35)
                                     vel = lean + Vector3.new(0, VM.RamSpeed, 0)
                                     VM.RamState = string.format("climbing %.0f/%.0f studs above target",
                                         math.max(above, 0), VM.RamHeight or 90)
-                                else
+                                elseif VM.ramPhase ~= "sweep" and above > 12 then
                                     VM.ramPhase = "dive"
                                     -- full 3D at them: mostly downward from up here
                                     local d3 = tp - bp
@@ -4812,6 +4892,30 @@ task.spawn(function()
                                         vel = (d3 / m3) * VM.RamSpeed
                                     end
                                     VM.RamState = string.format("diving, %.0f studs to target", m3)
+                                else
+                                    -- Sweep. One dive is a single glancing contact, and
+                                    -- damage needs solid sustained contact with the
+                                    -- ground - so once down at their level, drive
+                                    -- THROUGH them and back again, held onto the floor,
+                                    -- rather than parking on top and doing nothing.
+                                    VM.ramPhase = "sweep"
+                                    local nowS = tick()
+                                    if not VM.ramSweepAt
+                                       or (nowS - VM.ramSweepAt) > (VM.RamSweep or 0.7) then
+                                        VM.ramSweepAt = nowS
+                                        VM.ramSweepDir = -(VM.ramSweepDir or -1)
+                                    end
+                                    local unit = (dist > 0.01) and (flat / dist)
+                                                 or Vector3.new(0, 0, 1)
+                                    local okv, cur = pcall(function()
+                                        return base.AssemblyLinearVelocity
+                                    end)
+                                    local down = -(VM.RamGrip or 45)
+                                    if okv and cur and cur.Y > 0 then down = down - cur.Y end
+                                    vel = unit * (VM.RamSpeed * (VM.ramSweepDir or 1))
+                                          + Vector3.new(0, down, 0)
+                                    VM.RamState = string.format("sweeping %s, %.0f studs out",
+                                        ((VM.ramSweepDir or 1) > 0) and "into" or "back through", dist)
                                 end
                             else
                                 -- Hold it DOWN, do not just preserve what it had.
@@ -4826,10 +4930,14 @@ task.spawn(function()
                                 if okv and cur and cur.Y > 0 then down = down - cur.Y end
                                 vel = flat * VM.RamSpeed + Vector3.new(0, down, 0)
                             end
-                            pcall(function() base.AssemblyLinearVelocity = vel end)
-                            mark("velocity write")
-                            VM.RamState = string.format("%s ram, %.0f studs out at %.0f studs/s",
-                                tostring(VM.RamMode), dist, VM.RamSpeed)
+                            -- Drive mode sets no velocity at all - it left the state
+                            -- text describing the steering, so do not stamp over it.
+                            if vel then
+                                pcall(function() base.AssemblyLinearVelocity = vel end)
+                                mark("velocity write")
+                                VM.RamState = string.format("%s ram, %.0f studs out at %.0f studs/s",
+                                    tostring(VM.RamMode), dist, VM.RamSpeed)
+                            end
                         else
                             VM.RamState = "on top of them"
                         end
@@ -4837,6 +4945,7 @@ task.spawn(function()
                 end
             end
         else
+            if VM.ramKeysDown and next(VM.ramKeysDown) then VM.releaseDriving() end
             VM.RamState = "off"
         end
         task.wait(0.05)
@@ -5755,6 +5864,60 @@ task.spawn(function()
     end
 end)
 
+-- ==================== stall recorder ====================
+-- Five explanations for the freezes have now been contradicted by measurement, so this
+-- stops theorising and records instead. It samples ten times a second and notices its
+-- OWN missing time: if a sample arrives a second late, the client stalled for that long
+-- and the samples either side say what was happening. Cheap by construction - it reads
+-- script state only, never the game.
+_G.STALLS = _G.STALLS or { events = {}, ring = {}, ri = 1 }
+task.spawn(function()
+    local S = _G.STALLS
+    local last = tick()
+    while _G.AR2HUB_GEN == GEN do
+        local now = tick()
+        local gap = now - last
+        local VM, ZE = _G.VEHMOD, _G.ZOMBESP
+        local snap = {
+            t = now,
+            h = _G.AR2HUB_HEALTH or -1,
+            ram = VM and tostring(VM.RamState) or "-",
+            drive = VM and tostring(VM.State) or "-",
+            ap = (VM and VM.AP) and tostring(VM.AP.phase) or "-",
+            zl = ZE and #(ZE.Live or {}) or -1,
+            veh = VM and tostring(VM.nearWhy) or "-",
+        }
+        S.ring[S.ri] = snap
+        S.ri = (S.ri % 60) + 1
+        -- a gap well past the 0.1s cadence is a stall, and worth keeping with context
+        if gap > 0.75 then
+            local before = {}
+            for i = 1, 6 do
+                local idx = ((S.ri - 1 - i - 1) % 60) + 1
+                if S.ring[idx] then table.insert(before, 1, S.ring[idx]) end
+            end
+            S.events[#S.events + 1] = { gap = gap, at = now, before = before, after = snap }
+            if #S.events > 12 then table.remove(S.events, 1) end
+        end
+        last = tick()
+        task.wait(0.1)
+    end
+end)
+
+_G.PRINTSTALLS = function()
+    local S = _G.STALLS
+    print(string.format("---- stalls recorded: %d ----", #S.events))
+    for i, e in ipairs(S.events) do
+        print(string.format("%d. froze for %.1fs", i, e.gap))
+        for _, b in ipairs(e.before) do
+            print(string.format("     -%.1fs  health %.2f | ram %-28s | drive %-22s | ap %-10s | zombies %d | veh %s",
+                e.at - b.t, b.h, b.ram, b.drive, b.ap, b.zl, b.veh))
+        end
+        print(string.format("     after   health %.2f | ram %s", e.after.h, e.after.ram))
+    end
+    if #S.events == 0 then print("   nothing yet - the client has not missed a beat since load") end
+end
+
 -- ==================== Settings tab ====================
 -- INS-ui ships its own Settings tab. Enabling it gives Theme, Appearance,
 -- Interface (which already contains the "Menu key" bind that opens/closes this
@@ -5805,6 +5968,8 @@ setSec:Toggle("Input watchdog", true, function(v) _G.UI_WATCHDOG = v end,
     "Watches for Matcha's Players handle going stale and hands input back if it does. Leave this on.")
 
 local setDiag = win:SettingsSection("Diagnostics", "Right")
+setDiag:Button("Print Stall Log", function() _G.PRINTSTALLS() end,
+    "Every freeze the client has had since load, with what the script was doing in the second before it. Press this after a stall.")
 local diagLbl = setDiag:Label("-")
 setDiag:Button("Log environment report", function()
     local P = svcPlayers()
