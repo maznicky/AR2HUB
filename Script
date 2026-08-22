@@ -4505,6 +4505,8 @@ _G.VEHMOD.FlyMax     = 6                           -- seconds of continuous flig
 -- it had almost nothing to spend - which is why earlier runs looked random. A gentle
 -- flight survived and a hard one exploded not because of speed or height, but because
 -- of how much engine each vehicle had left. Watch the engine, not the clock.
+-- No longer exposed as a toggle: it stays on. Turning it off only ever meant
+-- volunteering to lose the vehicle mid-flight, which nobody wants on purpose.
 _G.VEHMOD.EngineGuard = true
 _G.VEHMOD.EngineMin   = 0.05                       -- hard floor; the trip estimate does the rest
 _G.VEHMOD.EngineNow   = nil
@@ -4537,23 +4539,29 @@ _G.VEHMOD.ui.sec:Dropdown("Trigger", "Key", { "Key", "Right Mouse", "Space" }, f
     "What holds the flight on. Mouse buttons are the reliable choice: keyboards drop keys while W and shift are held, which is exactly the state you are in while driving. Pick Key to use the bind below instead.")
 _G.VEHMOD.ui.key = _G.VEHMOD.ui.sec:Keybind("Fly Key", "g", function(k) _G.VEHMOD.Key = k end,
     "Only used when Trigger is set to Key.")
-_G.VEHMOD.ui.sec:Toggle("Auto Right", true, function(v) _G.VEHMOD.AutoRight = v end,
+_G.VEHMOD.ui.sec:Toggle("Auto Flip", true, function(v) _G.VEHMOD.AutoRight = v end,
     "Lifts the vehicle when it rolls, which drops it back onto its wheels. Angular velocity cannot be written in this game, so a vertical shove is the only way to undo a flip.")
-_G.VEHMOD.ui.sec:Toggle("Protect Engine", true, function(v) _G.VEHMOD.EngineGuard = v end,
-    "Refuses trips the vehicle cannot survive, and lands early if the engine runs out mid-flight.")
 _G.VEHMOD.ui.info = _G.VEHMOD.ui.sec:Label("off")
 -- ---- ram ----
--- Drives the vehicle at a target. Two approaches, because they trade differently:
+-- Drives the vehicle along the ground at a target. There used to be three modes; Air
+-- and Ground are gone. Air climbed and dove and reliably did nothing, and Ground was
+-- this without the steering, so there was nothing left to choose between.
 --
---   Ground - shove the vehicle along the floor toward them, keeping whatever vertical
---            velocity it already had. No air time, so NO engine drain at all, which is
---            the whole advantage: the engine cost of a kill is zero.
---   Air    - same steering as the autopilot's cruise, going over obstacles instead of
---            through them. Costs about 2% engine per second airborne.
+-- What actually decides whether this works is the VEHICLE, not anything in here. The
+-- hitbox shape and ride height determine whether contact registers at all - the rubber
+-- dinghy is near perfect, other vehicles barely connect with identical settings. Two
+-- things were learned the hard way and are worth not re-deriving:
 --
+--   * Speed above roughly 150 studs/s does nothing at all. The chassis moves further
+--     per physics step than a person is wide, so it passes through them and no contact
+--     is ever resolved. Every failed ram was this.
+--   * Engine power is irrelevant. A vehicle with no fuel left still ran zombies over,
+--     so it is the velocity write that damages, not the throttle. The keys are held
+--     anyway because they turn the vehicle to face where it is being pushed.
+--
+-- No air time, so no engine drain: the only cost of a kill is the crash damage itself.
 -- Whitelisted players are never targeted, the same rule the aimbot and auto melee use.
 _G.VEHMOD.Ram        = false
-_G.VEHMOD.RamMode    = dropStr(_G.VEHMOD.RamMode, "Ground")
 _G.VEHMOD.RamPlayers = false
 _G.VEHMOD.RamZombies = true
 _G.VEHMOD.RamRange   = 250
@@ -4568,19 +4576,13 @@ _G.VEHMOD.RamSpeed   = 100
 _G.VEHMOD.RamTrigger = "Key"   -- forced, not carried over: a stale "Mouse 5" is unreadable
 _G.VEHMOD.RamKey     = _G.VEHMOD.RamKey or "r"
 _G.VEHMOD.RamState   = "off"
-_G.VEHMOD.RamHeight  = 90         -- how far above the target Air mode climbs before diving
-_G.VEHMOD.RamGrip    = 18         -- Ground mode: how hard lift is cancelled, studs/s
-_G.VEHMOD.RamNose    = 9          -- how far short of the target the chassis centre aims
-_G.VEHMOD.RamSweep   = 0.7        -- seconds per pass before reversing back through them
--- Damage comes from the car being DRIVEN, not from velocity written onto its chassis.
--- Dives, sweeps and ground slides all move the vehicle convincingly and do nothing to
--- anyone, because the game only counts a real engine-and-wheels impact. So this mode
--- holds W and steers with A/D exactly as a player does.
-_G.VEHMOD.RamMode    = dropStr(_G.VEHMOD.RamMode, "Drive")
+_G.VEHMOD.RamGrip    = 60         -- how hard lift is cancelled, studs/s
+-- Not exposed. The chassis centre aims this far short of the target so the FRONT hits
+-- rather than the target ending up parked under the middle of the vehicle.
+_G.VEHMOD.RamNose    = 9
 _G.VEHMOD.RamSteer   = 12         -- degrees of slack before it bothers steering
 _G.VEHMOD.ramKeysDown = {}
 _G.VEHMOD.DRIVEVK = { W = 0x57, A = 0x41, S = 0x53, D = 0x44 }
-
 _G.VEHMOD.holdKey = function(name, want)
     local VM = _G.VEHMOD
     local vk = VM.DRIVEVK[name]
@@ -4598,49 +4600,29 @@ end
 _G.VEHMOD.releaseDriving = function()
     for _, k in ipairs({ "W", "A", "S", "D" }) do _G.VEHMOD.holdKey(k, false) end
 end
-_G.VEHMOD.ramSweepAt = nil
-_G.VEHMOD.ramSweepDir = 1
-_G.VEHMOD.ramPhase   = nil
 _G.VEHMOD.ramZAt     = 0
 
 _G.VEHMOD.ui.ramSec = _G.VEHMOD.ui.sub:Section("Ram", "Full")
-_G.VEHMOD.ui.ramSec:Label("Drives the vehicle at whatever you are hunting. Ground")
-_G.VEHMOD.ui.ramSec:Label("mode costs no engine at all - it never leaves the floor -")
-_G.VEHMOD.ui.ramSec:Label("while Air goes over obstacles and spends the usual 2%/s.")
+_G.VEHMOD.ui.ramSec:Label("Drives the vehicle at whatever you are hunting, on the")
+_G.VEHMOD.ui.ramSec:Label("ground, so it costs no engine beyond the crash damage.")
+_G.VEHMOD.ui.ramSec:Label("How well it works depends far more on the VEHICLE than")
+_G.VEHMOD.ui.ramSec:Label("on any setting here - hitbox shape and height decide")
+_G.VEHMOD.ui.ramSec:Label("whether contact registers at all. The rubber dinghy is")
+_G.VEHMOD.ui.ramSec:Label("the best found so far. If a vehicle simply will not")
+_G.VEHMOD.ui.ramSec:Label("connect, change vehicle before changing sliders.")
 _G.VEHMOD.ui.ramSec:Label("Whitelisted players are never targeted.")
-_G.VEHMOD.ui.ramSec:Button("Print Ram Timing", function()
-    local t = _G.VEHMOD.ramT or {}
-    print("---- worst ram phase timings (ms) ----")
-    for _, k in ipairs({ "character", "vehicle lookup", "target search", "velocity write" }) do
-        print(string.format("   %-16s %.1f ms", k, t[k] or 0))
-    end
-    print("   (reset by toggling Ram off and on)")
-end, "Dumps the slowest each phase of the ram loop has ever been. Press this right after a stall - whichever number is large is the cause.")
 _G.VEHMOD.ui.ramSec:Toggle("Ram", false, function(v)
         _G.VEHMOD.Ram = v
         _G.VEHMOD.ramT = {}          -- fresh timings each time it is armed
     end,
     "Hold the trigger to steer the vehicle into the nearest target.")
-_G.VEHMOD.ui.ramSec:Dropdown("Mode", "Drive", { "Drive", "Ground", "Air" }, false,
-    function(v) _G.VEHMOD.RamMode = dropStr(v, "Drive") end,
-    "Drive actually drives the car - it holds W and steers with A/D, so the game sees a real vehicle under power, which is what does damage. Ground and Air shove the chassis with velocity instead: they move you well but the game does not treat that as being run over.")
-
-_G.VEHMOD.ui.ramSec:Slider("Steering Slack", 4, 40, _G.VEHMOD.RamSteer or 12, false,
-    function(v) _G.VEHMOD.RamSteer = tonumber(v) or 12 end,
-    "Drive mode only. How many degrees off aim it tolerates before it steers. Lower is tighter but weaves at speed.")
 _G.VEHMOD.ui.ramSec:Toggle("Target Zombies", true, function(v) _G.VEHMOD.RamZombies = v end)
 _G.VEHMOD.ui.ramSec:Toggle("Target Players", false, function(v) _G.VEHMOD.RamPlayers = v end,
     "Whitelisted players are skipped whatever this says.")
 _G.VEHMOD.ui.ramSec:Slider("Range", 250, 10, 30, 800, " studs", function(v) _G.VEHMOD.RamRange = v end,
     "How far away it will pick a target from.")
-_G.VEHMOD.ui.ramSec:Slider("Nose Offset", 9, 1, 0, 30, " studs", function(v) _G.VEHMOD.RamNose = v end,
-    "How far short of the target the chassis centre aims, so the FRONT hits rather than the target ending up under the middle of the vehicle. Roughly half your vehicle's length: bigger for a truck, smaller for a quad. Zero aims dead centre.")
-_G.VEHMOD.ui.ramSec:Slider("Ground Grip", 18, 5, 0, 200, " studs/s", function(v) _G.VEHMOD.RamGrip = v end,
-    "Ground mode only: how hard bumps are pushed back down, and the fastest it is allowed to drop. It no longer drives into the floor constantly, which was quietly wrecking the engine - it only cancels lift. Raise it if it starts skipping over rough ground, lower it if the engine still suffers.")
-_G.VEHMOD.ui.ramSec:Slider("Sweep Time", 0.7, 0.1, 0.2, 3, " s", function(v) _G.VEHMOD.RamSweep = v end,
-    "Air mode only: after the dive lands it drives through the target and reverses back, over and over, held onto the ground. This is how long each pass lasts before it reverses. Shorter saws at them in place; longer runs further past them each time.")
-_G.VEHMOD.ui.ramSec:Slider("Dive Height", 90, 5, 20, 400, " studs", function(v) _G.VEHMOD.RamHeight = v end,
-    "Air mode only: how far above the target it climbs before dropping on them. Higher hits harder and costs more engine, since the climb is time in the air.")
+_G.VEHMOD.ui.ramSec:Slider("Ground Grip", 60, 5, 0, 200, " studs/s", function(v) _G.VEHMOD.RamGrip = v end,
+    "How hard bumps are pushed back down, and the fastest it is allowed to drop. It only cancels lift rather than driving into the floor constantly, which was quietly wrecking the engine. Around 60 is what actually connects; lower it if the engine suffers.")
 _G.VEHMOD.ui.ramSec:Slider("Ram Speed", 100, 10, 40, 1200, " studs/s", function(v) _G.VEHMOD.RamSpeed = v end,
     "How hard it drives at them. Around 100 is the sweet spot and the default for good reason: above roughly 150 the vehicle covers more ground per physics step than a person is wide, so it passes straight through them without a collision ever being registered. Fast looks more violent and does nothing at all.")
 _G.VEHMOD.ui.ramSec:Dropdown("Trigger", "Key", { "Key", "Right Mouse", "Space" }, false,
@@ -4661,11 +4643,14 @@ _G.VEHMOD.ui.ramInfo = _G.VEHMOD.ui.ramSec:Label("off")
 _G.VEHMOD.ramTarget = function(from)
     local VM = _G.VEHMOD
     local best, bd
-    local function consider(part)
+    local bestIsPlayer = false
+    local function consider(part, isPlayer)
         local okp, p = pcall(function() return part.Position end)
         if not okp or not p then return end
         local okd, d = pcall(function() return (p - from).Magnitude end)
-        if okd and d <= VM.RamRange and (not bd or d < bd) then best, bd = part, d end
+        if okd and d <= VM.RamRange and (not bd or d < bd) then
+            best, bd, bestIsPlayer = part, d, isPlayer and true or false
+        end
     end
     -- A dead zombie's root can linger in the caches, and reads against it are slow
     -- rather than failing, so the list is rebuilt outright every few seconds.
@@ -4679,7 +4664,7 @@ _G.VEHMOD.ramTarget = function(from)
                 if pl.UserId ~= lp.UserId and marks[pl.UserId] ~= "whitelist" then
                     local okc, ch = pcall(function() return pl.Character end)
                     local r = (okc and ch) and ch:FindFirstChild("HumanoidRootPart") or nil
-                    if r then consider(r) end
+                    if r then consider(r, true) end
                 end
             end
         end
@@ -4719,6 +4704,9 @@ _G.VEHMOD.ramTarget = function(from)
             for _, r in ipairs(VM.ramZ) do consider(r) end
         end
     end
+    -- Remembered because players and zombies need to be treated differently: a zombie
+    -- dies to a clean pass, a player apparently does not.
+    VM.ramTgtPlayer = bestIsPlayer
     return best, bd
 end
 
@@ -4745,8 +4733,7 @@ task.spawn(function()
             end
             if not held then
                 VM.ramPart, VM.ramPickAt = nil, 0     -- fresh target on the next press
-                VM.ramPhase = nil                     -- and a fresh climb, not a stale dive
-                VM.ramSweepAt, VM.ramSweepDir = nil, 1
+                VM.ramAim = nil
                 VM.ramBase = nil                      -- and re-find the vehicle you are in
                 VM.releaseDriving()                   -- never leave the throttle stuck down
                 VM.RamState = "ready - hold " .. tostring(VM.RamTrigger)
@@ -4834,11 +4821,16 @@ task.spawn(function()
                         if dist > 0.5 then
                             flat = flat / dist
                             local vel
-                            if VM.RamMode == "Drive" then
-                                -- Drive it like a player: accelerator down, steer with
-                                -- A/D until the nose points at them. No velocity is
-                                -- written at all, because that is precisely what the
-                                -- game does not count as running someone over.
+                            do
+                                -- One mode. Air and Ground are gone: Air never connected
+                                -- reliably and cost engine to reach the target, and
+                                -- Ground was this minus the steering.
+                                --
+                                -- Velocity is what damages, not engine power - a vehicle
+                                -- with no fuel left still ran zombies over. The keys are
+                                -- held anyway because they cost nothing and help the
+                                -- vehicle point where it is being pushed, which is what
+                                -- puts the front into the target rather than the flank.
                                 local okc2, vcf = pcall(function() return base.CFrame end)
                                 if okc2 and vcf then
                                     local fwd = vcf.LookVector
@@ -4861,97 +4853,32 @@ task.spawn(function()
                                         local backing = angle > 140 and tdist < 25
                                         VM.holdKey("S", backing)
                                         VM.holdKey("W", not backing)
-                                        VM.RamState = string.format(
-                                            "driving, %.0f studs, %.0f%s off aim%s",
-                                            tdist, angle, "\194\176",
-                                            backing and " (reversing)" or "")
+                                        VM.ramAim = angle
                                     end
                                 end
-                            elseif VM.RamMode == "Air" then
-                                -- Two phases, not one. Driving at them while lifting a
-                                -- little just arrives flat and slow. Climb clear of them
-                                -- first, then come down ON them - the drop adds to the
-                                -- impact instead of fighting it.
-                                local above = bp.Y - tp.Y
-                                -- "sweep" has to be excluded here as well as "dive":
-                                -- once sweeping, the vehicle is by definition low, so a
-                                -- check that only skipped diving sent it straight back
-                                -- up - climb, dive, sweep, climb, which reads as the
-                                -- vehicle bouncing on the spot.
-                                if VM.ramPhase ~= "dive" and VM.ramPhase ~= "sweep"
-                                   and above < (VM.RamHeight or 90) then
-                                    VM.ramPhase = "climb"
-                                    -- straight up, with just enough lean to stay over them
-                                    local lean = flat * math.min(dist * 0.5, VM.RamSpeed * 0.35)
-                                    vel = lean + Vector3.new(0, VM.RamSpeed, 0)
-                                    VM.RamState = string.format("climbing %.0f/%.0f studs above target",
-                                        math.max(above, 0), VM.RamHeight or 90)
-                                elseif VM.ramPhase ~= "sweep" and above > 12 then
-                                    VM.ramPhase = "dive"
-                                    -- full 3D at them: mostly downward from up here
-                                    local d3 = tp - bp
-                                    local m3 = d3.Magnitude
-                                    if m3 > 0.5 then
-                                        vel = (d3 / m3) * VM.RamSpeed
-                                    end
-                                    VM.RamState = string.format("diving, %.0f studs to target", m3)
-                                else
-                                    -- Sweep. One dive is a single glancing contact, and
-                                    -- damage needs solid sustained contact with the
-                                    -- ground - so once down at their level, drive
-                                    -- THROUGH them and back again, held onto the floor,
-                                    -- rather than parking on top and doing nothing.
-                                    VM.ramPhase = "sweep"
-                                    local nowS = tick()
-                                    if not VM.ramSweepAt
-                                       or (nowS - VM.ramSweepAt) > (VM.RamSweep or 0.7) then
-                                        VM.ramSweepAt = nowS
-                                        VM.ramSweepDir = -(VM.ramSweepDir or -1)
-                                    end
-                                    local unit = (dist > 0.01) and (flat / dist)
-                                                 or Vector3.new(0, 0, 1)
-                                    local okv, cur = pcall(function()
-                                        return base.AssemblyLinearVelocity
-                                    end)
-                                    local down = -(VM.RamGrip or 45)
-                                    if okv and cur and cur.Y > 0 then down = down - cur.Y end
-                                    vel = unit * (VM.RamSpeed * (VM.ramSweepDir or 1))
-                                          + Vector3.new(0, down, 0)
-                                    VM.RamState = string.format("sweeping %s, %.0f studs out",
-                                        ((VM.ramSweepDir or 1) > 0) and "into" or "back through", dist)
-                                end
-                            else
-                                -- Hold it DOWN, do not just preserve what it had.
-                                -- Preserving vertical velocity meant every bump at 220
-                                -- studs/s launched it a little, and any time off the
-                                -- ground is engine drain plus a chance to roll. So:
-                                -- cancel whatever upward motion exists and add downforce
-                                -- on top, which pins it to the terrain instead of
-                                -- skipping across it.
-                                local okv, cur = pcall(function() return base.AssemblyLinearVelocity end)
-                                -- Only fight upward motion. Holding a constant downward
-                                -- speed means driving into the terrain every single tick,
-                                -- which is a continuous impact and eats the engine for
-                                -- nothing. Kill launches, otherwise let it fall naturally
-                                -- and just cap how hard it is allowed to land.
-                                local grip = VM.RamGrip or 18
+                                -- Grip: only fight upward motion. Holding a constant
+                                -- downward speed means driving into the terrain every
+                                -- tick, which is a continuous impact and eats the engine
+                                -- for nothing. Cancel launches, otherwise let it fall and
+                                -- just cap how hard it is allowed to land.
+                                local grip = VM.RamGrip or 60
                                 local down = -grip
+                                local okv, cur = pcall(function() return base.AssemblyLinearVelocity end)
                                 if okv and cur then
                                     if cur.Y > 0 then
-                                        down = -(cur.Y + grip)      -- a bump is lifting it
+                                        down = -(cur.Y + grip)         -- a bump is lifting it
                                     else
                                         down = math.max(cur.Y, -grip)  -- falling: don't add to it
                                     end
                                 end
                                 vel = flat * VM.RamSpeed + Vector3.new(0, down, 0)
+                                VM.RamState = string.format("ramming, %.0f studs out at %.0f studs/s%s",
+                                    dist, VM.RamSpeed,
+                                    VM.ramAim and string.format(", %.0f%s off aim", VM.ramAim, "\194\176") or "")
                             end
-                            -- Drive mode sets no velocity at all - it left the state
-                            -- text describing the steering, so do not stamp over it.
                             if vel then
                                 pcall(function() base.AssemblyLinearVelocity = vel end)
                                 mark("velocity write")
-                                VM.RamState = string.format("%s ram, %.0f studs out at %.0f studs/s",
-                                    tostring(VM.RamMode), dist, VM.RamSpeed)
                             end
                         else
                             VM.RamState = "on top of them"
