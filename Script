@@ -1,5 +1,6 @@
 -- ==================== AR2 Hub - Event ESP ====================
--- 16 events grouped by faction. Per-event readout: Amount + nearest site's roster.
+-- 17 events grouped by faction, plus an Unknown Event catch-all for unclaimed
+-- "Unique"/"Event" NPCs. Per-event readout: Amount + nearest site's roster.
 -- States: Unlooted (green) / Unknown (gray). Looted sites are WIPED, not shown.
 -- Distances match Matcha's ESP (studs / 2.75, rounded). Config is in metres.
 -- Site Probe: F8, plus an automatic sweep every 60s.
@@ -264,6 +265,14 @@ local E = {
     PoolSize        = 48,
     GraceSeconds    = 45,
     ConfirmScans    = 3,
+    -- Enemy models briefly EMPTY OUT (exist with no parts) - 3 of 107 were empty at
+    -- once, one an event NPC (2026-10-23). An empty model looked exactly like a dead
+    -- one, so a site you were running at got marked looted and vanished until you
+    -- were close enough for it to come back. Three guards against that:
+    LootConfirmScans = 6,     -- empty scans in a row before LOOTED (vs 3 for other states)
+    NpcMemory       = 60,     -- seconds an emptied model keeps its last known position
+    GoneGrace       = 15,     -- seconds a site must be missing before it is deleted
+    LastNpc         = {},     -- model Address -> {pos, t}
     RenotifyCooldown= 120,
     SiteTTL         = 900,
     LootedSuppress  = 300,    -- how long a wiped site stays suppressed
@@ -278,14 +287,15 @@ local E = {
 
     Order = {"SovietATV","SovietCamp","SovietTruck","PrisonBus","RogueHeliCrash","HeliCrash",
              "CasinoHeli","TransportPlane","OperatorCrash","MilitaryConvoy","PoliceBarricade",
-             "BankTruck","FBI","PartyBus","Funeral","PirateTreasure"},
+             "BankTruck","FBI","PartyBus","Funeral","PirateTreasure","Summoning",
+             "UnknownEvent"},   -- UnknownEvent MUST stay last: it takes what nothing else claims
 
     Groups = {
         {name = "Military", side = "Left",  cats = {"HeliCrash","RogueHeliCrash","TransportPlane","OperatorCrash","MilitaryConvoy"}},
         {name = "Soviet",   side = "Left",  cats = {"SovietATV","SovietCamp","SovietTruck"}},
         {name = "Law",      side = "Right", cats = {"PoliceBarricade","FBI"}},
         {name = "Civilian", side = "Right", cats = {"PrisonBus","BankTruck","PartyBus","Funeral","CasinoHeli"}},
-        {name = "Other",    side = "Right", cats = {"PirateTreasure"}},
+        {name = "Other",    side = "Right", cats = {"Summoning","PirateTreasure","UnknownEvent"}},
     },
 
     Categories = {
@@ -324,6 +334,16 @@ local E = {
         -- NPC only: PirateTreasure01 is reused for random world chests
         PirateTreasure  = {label="Pirate Treasure",
                            npcs={"pirate"}},
+        -- Seen live 2026-10-23: ~25 "... Event" NPCs (Servant Goat Skull / Mask,
+        -- Thrall, Abomination) plus an Exorcist around (-3900, -200), and a Demonic
+        -- Warden group near (900, 900). Structure SummoningCircle01.
+        Summoning       = {label="Summoning",
+                           structures={"summoningcircle"},
+                           npcs={"servant","thrall","abomination","demonic","exorcist"}},
+        -- Catch-all: any "Unique ..." or "... Event" NPC that no category above
+        -- claims. Labelled with its most common NPC, so a new event shows up as
+        -- "? Prisoner Boss AK47" instead of not at all.
+        UnknownEvent    = {label="Unknown Event", unknown=true},
     },
 }
 
@@ -369,7 +389,9 @@ local function anchor(o, d)
     d = d or 3
     if PART[o.ClassName] then
         local p = o.Position
-        if typeof(p) == "Vector3" then return o end
+        -- a part that has not streamed in reads EXACTLY (0,0,0); taking that made
+        -- phantom sites at the map origin (7 structures read that way, 2026-10-23)
+        if typeof(p) == "Vector3" and (p.X ~= 0 or p.Y ~= 0 or p.Z ~= 0) then return o end
     end
     if d <= 0 then return nil end
     for _, c in ipairs(o:GetChildren()) do
@@ -378,7 +400,25 @@ local function anchor(o, d)
     end
     return nil
 end
+-- An enemy's position, or its last known one if the model has emptied out. Keyed by
+-- the model's Address, which is stable for the life of the instance (instance
+-- wrappers themselves do not compare equal in Matcha, so they can't be keys).
+E.npcPos = function(z, now)
+    local okA, addr = pcall(function() return z.Address end)
+    local a = anchor(z)
+    if a then
+        local p = a.Position
+        if okA and addr then E.LastNpc[addr] = { pos = p, t = now } end
+        return p
+    end
+    local m = okA and addr and E.LastNpc[addr]
+    if m and (now - m.t) <= E.NpcMemory then return m.pos end
+    return nil
+end
+
+local unknownMatch   -- defined below, once npcMatch and sharedMatch exist
 local function npcMatch(ln, def)
+    if def.unknown then return unknownMatch(ln) end
     if def.npcAll then
         for _, w in ipairs(def.npcAll) do
             if not string.find(ln, w, 1, true) then return false end
@@ -401,6 +441,15 @@ local function sharedMatch(ln)
         if all then return true end
     end
     return false
+end
+unknownMatch = function(ln)
+    local tagged = string.sub(ln, 1, 7) == "unique " or string.sub(ln, -6) == " event"
+    if not tagged or sharedMatch(ln) then return false end
+    for _, def in pairs(E.Categories) do
+        -- every category, enabled or not: a disabled event's NPCs are not "unknown"
+        if not def.unknown and npcMatch(ln, def) then return false end
+    end
+    return true
 end
 local function structMatch(ln, def)
     if not def.structures then return false end
@@ -560,14 +609,13 @@ local function rebuildSites()
                            names = {}, everUnlooted = (raw == "unlooted")}
                     reg[key] = rec
                 end
-                rec.pos, rec.lastSeen = s.pos, now
+                rec.pos, rec.lastSeen, rec.goneSince = s.pos, now, nil
                 if s.npcN > 0 then
                     rec.names = s.names
                     rec.everUnlooted = true        -- proven populated
-                elseif raw == "looted" then
-                    rec.names = {}
-                    rec.everUnlooted = false
                 end
+                -- (an empty scan no longer clears the roster on the spot: it only goes
+                -- once LOOTED is confirmed, which wipes the whole record anyway)
                 seen[key] = true
 
                 if raw == "unlooted" then rec.unlootedStreak = (rec.unlootedStreak or 0) + 1
@@ -577,7 +625,9 @@ local function rebuildSites()
                     rec.state = "unknown"; rec.streak = 0
                 elseif raw ~= rec.state then
                     rec.streak += 1
-                    if rec.streak >= E.ConfirmScans then
+                    -- looted needs more evidence: it wipes the site for 5 minutes
+                    local need = (raw == "looted") and E.LootConfirmScans or E.ConfirmScans
+                    if rec.streak >= need then
                         local wasLooted = (rec.state == "looted")
                         rec.state = raw; rec.streak = 0
                         if raw == "unlooted" and wasLooted and rec.announced
@@ -613,20 +663,31 @@ local function rebuildSites()
                     if (now - rec.lastSeen) > E.SiteTTL then
                         reg[key] = nil                        -- stale memory
                     elseif dist <= E.LootTrustRange then
-                        reg[key] = nil                        -- gone while we watched
-                        if not hasStruct then
-                            E.Wiped[cat] = E.Wiped[cat] or {}
-                            table.insert(E.Wiped[cat], {pos = rec.pos, t = now})
+                        -- gone while we watched - but only after GoneGrace seconds of
+                        -- absence. One empty scan used to delete it on the spot.
+                        rec.goneSince = rec.goneSince or now
+                        if (now - rec.goneSince) > E.GoneGrace then
+                            reg[key] = nil
+                            if not hasStruct then
+                                E.Wiped[cat] = E.Wiped[cat] or {}
+                                table.insert(E.Wiped[cat], {pos = rec.pos, t = now})
+                            end
                         end
                     else
+                        rec.goneSince = nil
                         rec.state = rec.everUnlooted and "unlooted" or "unknown"
                     end
                 end
             end
 
             for _, rec in pairs(reg) do
+                local label = def.label
+                if def.unknown then
+                    local order = collapse(rec.names)
+                    if order[1] then label = "? " .. order[1] end
+                end
                 out[#out + 1] = {cat = cat, pos = rec.pos,
-                                 name = def.label, state = rec.state}
+                                 name = label, state = rec.state}
             end
             E.Primed[cat] = true
         end
@@ -650,29 +711,34 @@ task.spawn(function()
         local zom = workspace:FindFirstChild("Zombies")
         if zom then
             local fresh, shared = {}, {}
+            local now = tick()
             for _, z in ipairs(zom:GetChildren()) do
                 local nm = z.Name
                 local ln = string.lower(nm)
                 local claimed = false
                 for _, cat in ipairs(E.Order) do
                     if E.Enabled[cat] and npcMatch(ln, E.Categories[cat]) then
-                        local a = anchor(z)
-                        if a then
+                        local p = E.npcPos(z, now)
+                        if p then
                             fresh[cat] = fresh[cat] or {}
-                            table.insert(fresh[cat], { pos = a.Position, name = tidyName(nm) })
+                            table.insert(fresh[cat], { pos = p, name = tidyName(nm) })
                         end
                         claimed = true
                         break
                     end
                 end
                 if not claimed and sharedMatch(ln) then
-                    local a = anchor(z)
-                    if a then
-                        shared[#shared + 1] = { pos = a.Position, name = tidyName(nm) }
+                    local p = E.npcPos(z, now)
+                    if p then
+                        shared[#shared + 1] = { pos = p, name = tidyName(nm) }
                     end
                 end
             end
             E.NpcPts, E.SharedPts = fresh, shared
+            -- forget enemies not seen for twice the memory window
+            for addr, m in pairs(E.LastNpc) do
+                if (now - m.t) > E.NpcMemory * 2 then E.LastNpc[addr] = nil end
+            end
         end
 
         if tick() - lastEl > E.ElementInterval then
@@ -3162,6 +3228,7 @@ MP.Enabled  = false
 MP.Players  = (MP.Players ~= false)
 MP.Zombies  = MP.Zombies == true
 MP.Vehicles = MP.Vehicles == true
+MP.Events   = false   -- forced: the checkbox below always draws unchecked
 MP.Names    = (MP.Names ~= false)
 MP.Scale    = MP.Scale or 7.353e-5     -- px per stud, per px of DragBin width
 MP.POOL     = 60
@@ -3196,6 +3263,8 @@ MP.ui.sec:Toggle("Zombies", false, function(v) MP.Zombies = v end,
     "Uses the Zombies tab's cache, so enable Zombie ESP for this to have anything to draw.")
 MP.ui.sec:Toggle("Vehicles", false, function(v) MP.Vehicles = v end,
     "Uses the Vehicles tab's cache, so enable Vehicle ESP for this to have anything to draw.")
+MP.ui.sec:Toggle("Events", false, function(v) MP.Events = v end,
+    "Uses the Events tab's sites, so turn on the events you want there first. Larger dots: green = alive, grey = not seen populated yet.")
 MP.ui.sec:Toggle("Show Names", true, function(v) MP.Names = v end)
 MP.ui.sec:Toggle("Show My Own Dot", false, function(v) MP.Self = v end,
     "Draws a dot at YOUR position. It should sit exactly on your own map marker - if it does not, adjust the offsets below until it does. That calibrates the anchor.")
@@ -3235,6 +3304,7 @@ end
 -- the opposite state when the script loads.
 MP.MapOpen = false
 MP.mWas    = false
+MP.OPEN_OFF = 0x4AC    -- Map ScreenGui Enabled byte; see the render loop
 
 -- The map key is watched in its own loop at ~221 Hz (task.wait(1/1000)), not in
 -- the render loop. The render loop runs at roughly 20 Hz, and a short keypress
@@ -3279,7 +3349,7 @@ MP.resolve = function(now)
         if clip and drag and marker then
             -- The tiles give the DragBin width now that AbsoluteSize reads 0.
             local tiles = drag:FindFirstChild("Map")
-            return { clip = clip, drag = drag, marker = marker, center = center,
+            return { gui = gui, clip = clip, drag = drag, marker = marker, center = center,
                      tl = tiles and tiles:FindFirstChild("TopLeft"),
                      tr = tiles and tiles:FindFirstChild("TopRight") }
         end
@@ -3305,10 +3375,22 @@ task.spawn(function()
         if MP.Enabled then
             local now = tick()
             local refs = MP.resolve(now)
-            -- Geometry is NOT a signal: measured directly while the map was closed,
-            -- ClipBin still reports 769x695 and DragBin 1024x925. Nothing in the
-            -- tree distinguishes open from closed, so state comes purely from the
-            -- key watcher below (which polls fast enough not to miss a press).
+            -- Open/closed comes from MEMORY: no readable property changes when the map
+            -- opens, but the Map ScreenGui's byte at +0x4AC (its Enabled flag) is 1
+            -- while open and 0 while closed - it tracked all 8 transitions in a
+            -- recording on 2026-10-23. A Roblox update can move that offset, so any
+            -- read that is not exactly 0 or 1 falls back to the M-key count.
+            if refs and refs.gui and memory_read then
+                local okm, v = pcall(function()
+                    return memory_read("byte", refs.gui.Address + MP.OPEN_OFF)
+                end)
+                if okm and (v == 0 or v == 1) then
+                    MP.MapOpen = (v == 1)
+                    MP.OpenSrc = "memory"
+                else
+                    MP.OpenSrc = "M key"
+                end
+            end
             local open = MP.MapOpen and refs ~= nil
             MP.Open = open
             if open then
@@ -3347,7 +3429,7 @@ task.spawn(function()
                     local minX, minY = cr.X, cr.Y
                     local maxX, maxY = cr.X + cs.X, cr.Y + cs.Y
 
-                    local function plot(wpos, col, label)
+                    local function plot(wpos, col, label, radius)
                         if n >= MP.POOL then return end
                         local sx = cpx.X + (wpos.X - me.X) * scale
                         local sy = cpx.Y + (wpos.Z - me.Z) * scale
@@ -3356,6 +3438,7 @@ task.spawn(function()
                         n = n + 1
                         local o = pool[n]
                         o.dot.Position = Vector2.new(sx, sy)
+                        o.dot.Radius = radius or 3   -- reset every time: slots are reused
                         o.dot.Color = col
                         o.dot.Visible = true
                         if MP.Names and label then
@@ -3370,6 +3453,20 @@ task.spawn(function()
 
                     -- your own dot: a calibration aid. It must land on your marker.
                     if MP.Self then plot(me, C(120, 255, 160), "me") end
+
+                    -- Events first, so players and zombies can never use up the pool
+                    -- before them. Reuses the Events tab's site list, so only events
+                    -- toggled on there are drawn, in the same colours: green = alive,
+                    -- grey = never seen populated. Bigger dots than everything else.
+                    if MP.Events and _G.EventESP and _G.EventESP.Targets then
+                        local EV = _G.EventESP
+                        for _, t in ipairs(EV.Targets) do
+                            if EV.Enabled[t.cat] and t.pos then
+                                local col = (t.state == "unlooted") and MP.col.good or MP.col.unknown
+                                plot(t.pos, col, t.name, 5)
+                            end
+                        end
+                    end
 
                     if MP.Players and P then
                         local marks = _G.PLAYERMARK or {}
