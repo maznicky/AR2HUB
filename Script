@@ -3304,7 +3304,8 @@ end
 -- the opposite state when the script loads.
 MP.MapOpen = false
 MP.mWas    = false
-MP.OPEN_OFF = 0x4AC    -- Map ScreenGui Enabled byte; see the render loop
+MP.OPEN_OFF = 0x4AC    -- candidate open/closed byte; NOT reliable, see the render loop
+MP.UseMemory = false
 
 -- The map key is watched in its own loop at ~221 Hz (task.wait(1/1000)), not in
 -- the render loop. The render loop runs at roughly 20 Hz, and a short keypress
@@ -3376,16 +3377,21 @@ task.spawn(function()
             local now = tick()
             local refs = MP.resolve(now)
             -- Open/closed comes from MEMORY: no readable property changes when the map
-            -- opens, but the Map ScreenGui's byte at +0x4AC (its Enabled flag) is 1
-            -- while open and 0 while closed - it tracked all 8 transitions in a
-            -- recording on 2026-10-23. A Roblox update can move that offset, so any
-            -- read that is not exactly 0 or 1 falls back to the M-key count.
-            if refs and refs.gui and memory_read then
+            -- opens, but the Map ScreenGui's byte at +0x4AC flips with it - it tracked
+            -- all 8 transitions in a recording on 2026-10-23. Polarity: 0 = OPEN,
+            -- 1 = CLOSED, confirmed against a known-open and known-closed snapshot
+            -- (the first version had it backwards, so the dots only drew with the map
+            -- shut). A Roblox update can move the offset, so any read that is not
+            -- exactly 0 or 1 falls back to the M-key count.
+            -- DISABLED (MP.UseMemory = false): a later check found the byte reading 0
+            -- with the map closed, so it tracks something else (likely mouse/focus
+            -- state), not the map. Kept for a future investigation, off by default.
+            if MP.UseMemory and refs and refs.gui and memory_read then
                 local okm, v = pcall(function()
                     return memory_read("byte", refs.gui.Address + MP.OPEN_OFF)
                 end)
                 if okm and (v == 0 or v == 1) then
-                    MP.MapOpen = (v == 1)
+                    MP.MapOpen = (v == 0)
                     MP.OpenSrc = "memory"
                 else
                     MP.OpenSrc = "M key"
