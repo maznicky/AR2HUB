@@ -1162,7 +1162,6 @@ Lib:Category("Combat")
 local combattab = win:Tab("Combat", "crosshair")
 local aimsub = combattab:Sub("Aimbot", "crosshair")
 local gunsub = combattab:Sub("Gun Mods", "sliders")
-local melsub = combattab:Sub("Melee Mods", "sword")
 
 -- Aimbot sub
 local aimSec  = aimsub:Section("Aimbot", "Full")
@@ -1973,12 +1972,16 @@ end)
 
 -- ==================== Vehicle ESP (Visuals > Vehicles) ====================
 -- Vehicles replicate map-wide, same as zombies and players, so nothing streams
--- out and the list is complete. Every vehicle has a PrimaryPart, so the anchor
--- is a property read (0.05 ms) and no FindFirstChild is ever needed - measured
--- 1.84 ms for a full 39-vehicle cache rebuild and 1.78 ms for a render pass.
+-- out and the list is complete. Each vehicle is tracked by its Base part: since a game
+-- update, PrimaryPart reads back as an unreadable, parentless instance on every vehicle
+-- (0 of 66 gave a position, 2026-10-16), which left the ESP and Vehicle Mods with nothing.
 _G.VEHESP = _G.VEHESP or {}
 local VE = _G.VEHESP
 VE.Enabled   = false
+-- Start with an empty cache. It lives in _G, so a reload otherwise inherits the last
+-- generation's entries - built by older code and never rebuilt while the ESP is off, which is
+-- how a reload kept the dead PrimaryPart anchors and left Vehicle Mods blind.
+VE.Cache     = {}
 VE.MaxM      = VE.MaxM or 1000
 VE.Types     = VE.Types or {}   -- name -> true to show that type; default off
 VE.Cache     = VE.Cache or {}   -- reused across rebuilds, keyed by vehicle Id
@@ -2061,6 +2064,29 @@ local vehOtherSeen = false
 -- percentage and "?" - the resolved wheels and cached condition were thrown away
 -- each rebuild and had to be rediscovered by the staggered pass.
 local function vehRebuild(discovered)
+    -- The part a vehicle is tracked by: Base when its position reads (60 of 66 measured);
+    -- otherwise the first part that gives a position under Collision, Seats, Wheels or Body
+    -- (Tractor, Cargo Van, StepVan and Quad have a Base that would not read). A model that
+    -- comes back empty has not loaded in yet and is skipped until it does. Defined in here,
+    -- not at the top level, which already holds 197 of Luau's 200 locals.
+    local function vehAnchor(v)
+        local b = v:FindFirstChild("Base")
+        if b then
+            local ok, p = pcall(function() return b.Position end)
+            if ok and typeof(p) == "Vector3" then return b end
+        end
+        for _, sub in ipairs({ "Collision", "Seats", "Wheels", "Body" }) do
+            local m = v:FindFirstChild(sub)
+            if m then
+                local okd, ds = pcall(function() return m:GetDescendants() end)
+                for _, d in ipairs((okd and ds) or {}) do
+                    local ok, p = pcall(function() return d.Position end)
+                    if ok and typeof(p) == "Vector3" then return d end
+                end
+            end
+        end
+        return nil
+    end
     local vf = workspace:FindFirstChild("Vehicles")
     local out = {}
     local prev, prevByName = {}, {}
@@ -2079,8 +2105,8 @@ local function vehRebuild(discovered)
                 VE.Types[nm] = false    -- new types start off, like everything else
                 discovered[#discovered + 1] = nm
             end
-            local ok, pp = pcall(function() return v.PrimaryPart end)
-            if ok and pp then
+            local pp = vehAnchor(v)
+            if pp then
                 local oki, id = pcall(function() return v:GetAttribute("Id") end)
                 id = (oki and type(id) == "string" and id ~= "") and id or nil
                 local e = id and prev[id]
@@ -2814,708 +2840,6 @@ task.spawn(function()
 end)
 
 
--- ==================== Melee Mods (Combat tab) ====================
--- How melee is reachable, all verified live:
---   * The equipped weapon sits in Character.Equipped as a Model, and carries a
---     "Hitbox" Part whose Size IS the weapon's reach. Measured: Pocket Knife
---     2.93 studs, Hatchet 3.40 - so reach is read live and is automatically
---     per-weapon, with no table of hardcoded numbers to go stale.
---   * mouse1click / mouse1press / mouse1release all exist in Matcha, so a swing
---     is initiated the same way a player initiates one. The server sees an
---     ordinary attack rather than a forged remote, which is both safer and the
---     only route that does not need AR2's obfuscated Networking remotes.
---   * Hitbox has no Touched signal and no GetTouchingParts in Matcha, so "in
---     range" is computed geometrically from the hitbox position instead.
--- Cooldown is NOT readable from the weapon - it carries no attributes and no
--- config - so it is a slider. Set it slower than the real swing rate; clicking
--- faster than the game allows just wastes clicks, it does not swing faster.
-_G.MELEE = _G.MELEE or {}
-local ML = _G.MELEE
-ML.Enabled   = false
--- Forced, not carried over: dropStr(ML.KeyMode, "Hold") keeps whatever the previous
--- run left in _G, so a session that ended on "Always" came back as "Always" while the
--- dropdown drew "Hold". Same trap as the map's own-dot toggle. Always is a debugging
--- mode - left on by accident it dashes you at anything within chase range, walls
--- included - so it has to be chosen deliberately every time.
-ML.KeyMode   = "Hold"                      -- "Hold" | "Toggle" | "Always"
-ML.Armed     = ML.Armed == true            -- used by Toggle mode
-ML.Key       = ML.Key or "v"
-ML.Players   = (ML.Players ~= false)       -- on by default now
-ML.Zombies   = (ML.Zombies ~= false)
-ML.Cooldown  = ML.Cooldown or 0.6
-ML.FrontOnly = (ML.FrontOnly ~= false)     -- ignore targets behind you
-ML.KeepSprint = (ML.KeepSprint ~= false)   -- re-press shift after a swing
-ML.SprintDelay = 0.02                      -- measured as the value that works
-ML.KeyGrace  = ML.KeyGrace or 0.25         -- hold-mode latch, see melKeyHeld
-ML.Trigger   = "Key"                       -- forced, same reason  -- "Key" | "Mouse 4" | "Mouse 5" | "Right Mouse"
-ML.Predict   = (ML.Predict ~= false)       -- swing early so the hit lands on time
-ML.Windup    = ML.Windup or 0.15           -- swing start -> damage frame, seconds
-ML.Closing   = 0                           -- studs/sec the target is closing at
-ML.Weapon    = nil
-ML.Reach     = 0
--- chase: dash at the target so the swing lands as you arrive
-ML.Chase      = false
-ML.ChaseMax   = 15                         -- furthest gap worth dashing across
-ML.ChaseSpeed = ML.ChaseSpeed or 90        -- studs/sec during the chase burst
-ML.ChaseCD    = ML.ChaseCD or 1.2          -- seconds between chases
-ML.ChaseLead  = (ML.ChaseLead ~= false)    -- aim where the target will be
-ML.ChaseClose = ML.ChaseClose or 1.5       -- surface studs to close to
-ML.chaseUntil = 0
-ML.chaseLast  = 0
-ML.chaseVel   = nil
-ML.ChaseState = "off"
-ML.ChaseLeadStuds = 0
-
-local MEL_REFRESH = 0.4        -- how often to re-resolve the equipped weapon
-local MEL_LOOKAHEAD = 8        -- studs beyond reach still worth tracking, so a
-                               -- closing target is already being measured when
-                               -- the prediction needs its closing rate
--- Fixed allowance on the range check, in studs. It exists because the check
--- approximates a swept hitbox with a distance test, and it is not a user knob
--- because there is no intuitive way to describe it. 1 stud was measured as the
--- value that makes normal adjacency register.
-local MEL_PAD = 1.0
-local MEL_ARC_FRONT = 70       -- degrees counted as "in front of you"
-local MEL_ARC_ANY   = 180
-local melKeyHandle
-local melTrackPart, melTrackSurf, melTrackRate, melTrackAt = nil, 0, 0, 0
-local melMiss = 0              -- consecutive empty Equipped reads, see melResolve
-local melLastOk = nil          -- when the weapon last resolved cleanly
-
--- Trimmed UI. Cooldown, key grace, sprint keeping and swing prediction all still run
--- with the values proven during testing - only their sliders are gone, because they
--- were tuned once and never wanted again. The behaviour is unchanged; there is just
--- less to read past.
-local melSec  = melsub:Section("Auto Melee", "Full")
-local melInfo = melSec:Label("no melee equipped")
-local melTgt  = melsub:Section("Targets", "Full")
-
-melSec:Toggle("Auto Melee", false, function(v) ML.Enabled = v end,
-    "Swings automatically when something you have selected is inside the weapon's own reach and in front of you.")
-melSec:Dropdown("Key Mode", "Hold", {"Hold", "Toggle"}, false,
-    function(v) ML.KeyMode = dropStr(v, "Hold") end,
-    "Hold: only swings while you hold the trigger. Toggle: tap once for on, again for off.")
-melSec:Dropdown("Trigger", "Key", { "Key", "Right Mouse" }, false,
-    function(v) ML.Trigger = dropStr(v, "Key") end,
-    "What actually fires it. Mouse 4 and Mouse 5 are gone from this list: the executor reads them as never pressed, measured 0 of 86 samples while held. Keys can also drop while W and shift are held - V managed only 3% - so the hold latch bridges those gaps.")
-melKeyHandle = melSec:Keybind("Melee Key", "v", function(k) ML.Key = k end,
-    "Only used when Trigger is set to Key.")
-
-melTgt:Toggle("Target Players", true, function(v) ML.Players = v end,
-    "Whitelisted players are never swung at, whatever this says.")
-melTgt:Toggle("Target Zombies", true, function(v) ML.Zombies = v end)
-melTgt:Toggle("Only Hit What's In Front Of You", true, function(v) ML.FrontOnly = v end,
-    "On: ignores anything behind or beside you, because a real swing only reaches forward. Off: swings at anything close, even behind you.")
-local melPredInfo = melTgt:Label("closing: -")
-
--- ---- chase ----
--- Closes the gap with a velocity burst aimed at the target, then lets the existing
--- swing prediction time the hit. Nothing extra is needed to time it: the prediction
--- tracks the rate the DISTANCE is closing, which already includes your own dash, so
--- the swing goes in early by the windup and the damage frame lands as you arrive.
--- The one thing that needed handling is the horizon - at 90 studs/s the raw
--- prediction would swing about 13 studs out, which is only right if the dash is
--- still running when the damage lands, so the lookahead is capped to the burst's
--- remaining time in the loop below.
-local melChase = melsub:Section("Chase", "Full")
-melChase:Label("Dashes at whatever you are about to swing at, so the")
-melChase:Label("hit lands as you arrive. Same velocity mechanism as the")
-melChase:Label("Dash in Character, so the server sees it - the most")
-melChase:Label("visible thing this tab does.")
-melChase:Toggle("Dash To Target", false, function(v) ML.Chase = v end,
-    "Only fires while Auto Melee is active and something is in front of you, past your reach but inside the chase distance.")
-melChase:Slider("Chase Distance", 15, 5, 10, 120, " studs", function(v) ML.ChaseMax = v end,
-    "The furthest gap it will dash across. 15 keeps it to targets in the room with you - at 45 it fired at zombies 33 studs away, through walls, and never reached them. Bigger values cross more ground in one obvious burst.")
-melChase:Slider("Chase Speed", 90, 5, 30, 250, " studs/s", function(v) ML.ChaseSpeed = v end,
-    "How fast the burst travels. Faster closes sooner but overshoots more easily, and is more conspicuous.")
-melChase:Slider("Chase Cooldown", 1.2, 0.1, 0.2, 4, " s", function(v) ML.ChaseCD = v end,
-    "Gap between chases. Short gaps chain into something that looks like flying rather than lunging.")
-melChase:Toggle("Aim Where They Will Be", true, function(v) ML.ChaseLead = v end,
-    "Dashes at an interception point instead of at the target itself. Without this the burst lands where they were standing when it started, which a knife's small hitbox will miss entirely.")
-melChase:Slider("Get This Close", 1.5, 0.1, 0.3, 4, " studs", function(v) ML.ChaseClose = v end,
-    "How close to their body the dash aims to finish. Smaller is better for a short weapon, but too small and you shove into them and slide past.")
-local melChaseInfo = melChase:Label("off")
-
--- ---- keep sprint through a swing ----
--- Swinging drops you to a walk, but pressing shift again resumes running even
--- mid-swing, so the fix is to re-assert shift exactly as you would by hand.
--- Nothing needs detecting: the script knows when a swing happens. Humanoid
--- WalkSpeed and MoveDirection are both unsupported in Matcha and MoveState is
--- not on the character, so there is no readable "am I sprinting" state anyway.
--- Which keycode Roblox sees for shift is decided at runtime rather than guessed:
--- whichever of LSHIFT / generic SHIFT reads as held is the one re-asserted.
-local SHIFT_VKS = { 0xA0, 0x10 }
-local melSprintAt = 0
-local function melHeldShift()
-    for _, vk in ipairs(SHIFT_VKS) do
-        local ok, d = pcall(function() return iskeypressed(vk) end)
-        if ok and d then return vk end
-    end
-    return nil
-end
-local function melKeepSprint()
-    if not ML.KeepSprint then return end
-    local now = tick()
-    if (now - melSprintAt) < 0.15 then return end   -- our own click also trips the
-    melSprintAt = now                               -- manual watcher; debounce it
-    local vk = melHeldShift()
-    if not vk or not keypress or not keyrelease then return end
-    task.spawn(function()
-        task.wait(ML.SprintDelay)      -- let the swing's cancel land first
-        pcall(function() keyrelease(vk) end)
-        task.wait(0.03)
-        pcall(function() keypress(vk) end)
-    end)
-end
-
--- ---- key state, same dual approach as the aimbot ----
--- mouse4/mouse5 are here because they bypass the keyboard matrix entirely: see the
--- ghosting note on melKeyHeld below.
-local MEL_VK = { m1=0x01, m2=0x02, m3=0x04, m4=0x05, m5=0x06,
-                 mouse1=0x01, mouse2=0x02, mouse3=0x04, mouse4=0x05, mouse5=0x06,
-                 shift=0x10, ctrl=0x11, alt=0x12, space=0x20, tab=0x09 }
-local MEL_TRIG = { ["Mouse 4"] = 0x05, ["Mouse 5"] = 0x06, ["Right Mouse"] = 0x02 }
-local function melRawKeyDown()
-    -- A mouse button is read directly and never involves the keyboard's key matrix,
-    -- so it cannot be swallowed the way V is while W and shift are held.
-    local trig = MEL_TRIG[tostring(ML.Trigger or "Key")]
-    if trig then
-        if iskeypressed then
-            local ok, d = pcall(function() return iskeypressed(trig) end)
-            if ok and d then return true end
-        end
-        return false        -- explicit trigger chosen: do not fall through to the key
-    end
-    if melKeyHandle then
-        local ok, v = pcall(function() return melKeyHandle:IsActivated() end)
-        if ok and v then return true end
-    end
-    local k = string.lower(tostring(ML.Key or ""))
-    local vk = MEL_VK[k]
-    if not vk and #k == 1 then
-        local b = string.byte(string.upper(k))
-        if b >= 48 and b <= 90 then vk = b end
-    end
-    if vk and iskeypressed then
-        local ok, d = pcall(function() return iskeypressed(vk) end)
-        if ok and d then return true end
-    end
-    return false
-end
-
--- Hold: active while the key is down. Toggle: press once to arm, again to
--- disarm. Always: no key at all.
---
--- Hold mode LATCHES for a grace period rather than trusting each read, because a
--- keyboard cannot necessarily report the melee key at all while other keys are held.
--- Measured on a 5s hold: with W and Shift down (running), V registered on 2 of 20
--- samples, while Z, '3' and Space registered as phantoms despite not being touched -
--- classic matrix ghosting on a non-NKRO board. Auto Melee therefore looked broken
--- exactly when it mattered, since running is when you chase. The latch turns an
--- intermittent read into a steady hold; a mouse button avoids the problem entirely
--- because it never goes through the keyboard matrix.
-local melKeyWas = false
-local melKeyLast = 0
-local function melKeyHeld()
-    local mode = ML.KeyMode
-    if mode == "Always" then return true end
-    local down = melRawKeyDown()
-    if mode == "Toggle" then
-        if down and not melKeyWas then ML.Armed = not ML.Armed end
-        melKeyWas = down
-        return ML.Armed == true
-    end
-    melKeyWas = down
-    local now = tick()
-    if down then melKeyLast = now end
-    return (now - melKeyLast) < (ML.KeyGrace or 0.25)
-end
-
--- ---- equipped weapon, resolved on a timer because FindFirstChild is 0.71 ms ----
--- The hitbox is only ever READ. Writing its Size was tested and the server
--- ignores it entirely - hit detection is server-side - so there is nothing to
--- gain and a permanently wrong part size to be caught with.
-local melHb, melHbSize, melAt = nil, nil, 0
-
-local function melResolve(now)
-    if (now - melAt) < MEL_REFRESH then return end
-    melAt = now
-    local P = svcPlayers()
-    local lp = P and P.LocalPlayer
-    local ch = lp and lp.Character
-    local eqd = ch and ch:FindFirstChild("Equipped")
-    -- Re-resolve BY NAME first. GetChildren on Equipped returns an empty list on most
-    -- reads (measured: 1 child, then 0, then 0, knife equipped throughout), while
-    -- FindFirstChild has been reliable everywhere in this script. GetChildren is only
-    -- needed to discover the name in the first place, or after a weapon swap.
-    local w, hb
-    if ML.Weapon and eqd then
-        w = eqd:FindFirstChild(ML.Weapon)
-        hb = w and w:FindFirstChild("Hitbox") or nil
-    end
-    if not hb then
-        local kids = eqd and eqd:GetChildren() or nil
-        w = kids and kids[1] or nil
-        hb = w and w:FindFirstChild("Hitbox") or nil
-    end
-    if not hb and ch then
-        -- Last resort, and the only path that never touches Equipped:GetChildren.
-        -- After a reload there is no cached name to look up, so if that one call is
-        -- flaking the weapon can never be discovered at all - which is exactly how a
-        -- fresh load ended up permanently stuck on "no melee equipped".
-        local okd, desc = pcall(function() return ch:GetDescendants() end)
-        if okd and desc then
-            for _, d in ipairs(desc) do
-                if d.Name == "Hitbox" then
-                    local okp, par = pcall(function() return d.Parent end)
-                    if okp and par then
-                        local okg, gp = pcall(function() return par.Parent.Name end)
-                        if okg and gp == "Equipped" then
-                            w, hb = par, d
-                            break
-                        end
-                    end
-                end
-            end
-        end
-    end
-    if not hb then
-        -- Matcha's GetChildren on Equipped intermittently returns an EMPTY list.
-        -- Measured on the same folder half a second apart, with a Pocket Knife
-        -- equipped the whole time: 1 child, then 0, then 0. Treating that as "no
-        -- melee" wiped the weapon and gated off every swing and chase, which is
-        -- exactly the "no melee equipped" that made auto melee look dead.
-        --
-        -- An empty read is missing information, not proof. So the cached hitbox is
-        -- kept as long as it still reads AND still hangs under Equipped - that is
-        -- positive evidence the weapon is there, rather than an absence of evidence.
-        if melHb then
-            local oks, s = pcall(function() return melHb.Size end)
-            local okp, pn = pcall(function() return melHb.Parent.Parent.Name end)
-            -- The ancestor check only DISQUALIFIES: acting on it when it reads nil
-            -- would just reintroduce the same flake in a different place. It has to
-            -- succeed and disagree before the weapon is considered gone.
-            if okp and type(pn) == "string" and pn ~= "Equipped" then
-                melHb, melHbSize, ML.Weapon, ML.Reach = nil, nil, nil, 0
-                melMiss = 0
-                return
-            end
-            if oks and s then
-                melHbSize = s
-                ML.Reach = math.max(s.X, s.Y, s.Z)
-                melMiss = 0
-                return
-            end
-        end
-        -- Reach is a NUMBER, and a number cannot go stale the way an instance read
-        -- can. Once it is known, the weapon stays considered equipped until the reads
-        -- have been failing for a good while - the swing does not need the hitbox
-        -- instance at all, only its length and somewhere to measure from.
-        melMiss = (melMiss or 0) + 1
-        if melLastOk and (tick() - melLastOk) < 5 then return end
-        if melMiss >= 8 then
-            melHb, melHbSize, ML.Weapon, ML.Reach = nil, nil, nil, 0
-        end
-        return
-    end
-    melMiss = 0
-    melLastOk = tick()
-    ML.Weapon = w.Name
-    melHb = hb
-    local ok, sz = pcall(function() return hb.Size end)
-    melHbSize = ok and sz or nil
-    if melHbSize then
-        ML.Reach = math.max(melHbSize.X, melHbSize.Y, melHbSize.Z)
-    end
-end
-
--- ---- zombie root cache ----
--- FindFirstChild costs 0.71 ms in Matcha, so resolving roots for ~100 zombies
--- is a 70 ms stall. Doing that on every swing attempt would hitch visibly while
--- the key is held, so roots are resolved a few per tick and reused. The refs
--- stay valid; positions are still read fresh at check time.
-local melZ, melZQueue, melZOut, melZIdx, melZAt = {}, nil, nil, 1, 0
-local function melZombieStep(now)
-    if not melZQueue then
-        if (now - melZAt) < 2.0 then return end
-        local zf = workspace:FindFirstChild("Zombies")
-        melZQueue = zf and zf:GetChildren() or {}
-        melZOut, melZIdx = {}, 1
-    end
-    local done = 0
-    while melZIdx <= #melZQueue and done < math.max(1, math.floor(3 * (_G.AR2HUB_HEALTH or 1))) do
-        local z = melZQueue[melZIdx]
-        melZIdx = melZIdx + 1
-        done = done + 1
-        if z then
-            local r = z:FindFirstChild("HumanoidRootPart")
-            if r then melZOut[#melZOut + 1] = r end
-        end
-    end
-    if melZIdx > #melZQueue then
-        melZ = melZOut
-        melZQueue, melZOut, melZIdx = nil, nil, 1
-        melZAt = now
-    end
-end
-
--- ---- the loop ----
-task.spawn(function()
-    local lastSwing = 0
-    while _G.AR2HUB_GEN == GEN do
-        local now = tick()
-        -- Resolved every tick regardless of Auto Melee, so the readout shows the
-        -- weapon and its reach as soon as you hold one, and so Extend Hitbox can
-        -- be used on its own. melResolve puts the hitbox back to its original
-        -- size whenever Extend Hitbox is off, so no separate restore is needed.
-        melResolve(now)
-        if ML.Enabled then
-            if ML.Zombies then melZombieStep(now) end
-            -- evaluated ONCE per tick: in Toggle mode this edge-detects the key,
-            -- so calling it twice would flip the state twice on a single press
-            local active = melKeyHeld()
-            if ML.Reach <= 0 then
-                ML.State = "no melee equipped"
-            elseif not active then
-                -- name whatever actually fires it, not always the key: with Trigger set
-                -- to a mouse button, "waiting for V" is simply wrong
-                local trigName = (ML.Trigger and ML.Trigger ~= "Key")
-                                 and tostring(ML.Trigger) or string.upper(tostring(ML.Key))
-                ML.State = (ML.KeyMode == "Toggle") and ("off - tap " .. trigName)
-                           or ("waiting for " .. trigName)
-            elseif (now - lastSwing) < ML.Cooldown then
-                ML.State = "cooldown"
-            else
-                ML.State = "ready"      -- never leave it stale: a frozen state
-            end                         -- reads as a failing check that is not failing
-            -- The scan runs whenever a melee is active, not only when the swing is
-            -- off cooldown, because the chase has to keep closing between swings.
-            local canSwing = (now - lastSwing) >= ML.Cooldown
-            -- Gated on the reach VALUE, not the hitbox instance. The hitbox is the
-            -- better origin - it is where the swing comes from - but its reads flake,
-            -- and losing it should cost a little accuracy, not the whole feature.
-            if ML.Reach > 0 and active then
-                local okp, origin = false, nil
-                if melHb then okp, origin = pcall(function() return melHb.Position end) end
-                local usedRoot = false
-                if not okp or not origin then
-                    local okr2, P2 = pcall(function() return svcPlayers() end)
-                    local lp2 = (okr2 and P2) and P2.LocalPlayer or nil
-                    local ch2 = lp2 and lp2.Character
-                    local r2 = ch2 and ch2:FindFirstChild("HumanoidRootPart") or nil
-                    if r2 then
-                        okp, origin = pcall(function() return r2.Position end)
-                        usedRoot = okp and origin ~= nil
-                    end
-                end
-                local cam = workspace.CurrentCamera
-                local cf
-                if cam then
-                    local ok, v = pcall(function() return cam.CFrame end)
-                    if ok then cf = v end   -- NOT 'cam and pcall(...)': the 'and'
-                end                         -- truncates, leaving cf nil forever
-                if okp and origin and cf then
-                    local look = cf.LookVector
-                    -- The hitbox sits in your hand, slightly ahead of your centre, so
-                    -- measuring from the root part instead needs a little more slack.
-                    local limit = ML.Reach + MEL_PAD + (usedRoot and 0.6 or 0)
-                    local arcCos = math.cos(math.rad(
-                        ML.FrontOnly and MEL_ARC_FRONT or MEL_ARC_ANY))
-                    local hit = false
-
-                    -- Distance is measured to the target's SURFACE, not its centre.
-                    -- The hitbox is a swept box and Matcha exposes no overlap test
-                    -- (no Touched, no GetTouchingParts), so a hit is approximated
-                    -- as "the target's body is within reach". Measured while
-                    -- standing next to a zombie: 4.35 studs centre-to-centre with
-                    -- a 2.93 reach, so comparing centres refused every real hit.
-                    -- Nearest in-arc candidate, and its surface distance. The range
-                    -- test happens after, so prediction can be applied to it.
-                    local bestPart, bestSurf
-                    local chasePart, chaseSurf, chasePos
-                    local function consider(part)
-                        local ok, pos = pcall(function() return part.Position end)
-                        if not ok or not pos then return end
-                        local d = pos - origin
-                        local m = d.Magnitude
-                        if m <= 0 then return end
-                        -- must be in front, since a swing only covers the arc ahead
-                        if look:Dot(d * (1 / m)) < arcCos then return end
-                        local radius = 1.0
-                        local oks, sz = pcall(function() return part.Size end)
-                        if oks and sz then radius = math.max(sz.X, sz.Z) * 0.5 end
-                        local surf = m - radius
-                        -- chase candidates are tracked out to a much greater range
-                        -- than swing candidates, so record them before the cutoff
-                        if surf <= ML.ChaseMax and (not chaseSurf or surf < chaseSurf) then
-                            chasePart, chaseSurf, chasePos = part, surf, pos
-                        end
-                        if surf > limit + MEL_LOOKAHEAD then return end
-                        if not bestSurf or surf < bestSurf then
-                            bestPart, bestSurf = part, surf
-                        end
-                    end
-
-                    if ML.Zombies then
-                        for i = 1, #melZ do consider(melZ[i]) end
-                    end
-                    if ML.Players then
-                        local P = svcPlayers()
-                        local lp = P and P.LocalPlayer
-                        local lpId = lp and lp.UserId
-                        if P then
-                            for _, pl in ipairs(P:GetPlayers()) do
-                                -- whitelisted players are never swung at
-                                if pl.UserId ~= lpId and (_G.PLAYERMARK or {})[pl.UserId] ~= "whitelist" then
-                                    local okc2, pch = pcall(function() return pl.Character end)
-                                    local r = (okc2 and pch) and pch:FindFirstChild("HumanoidRootPart") or nil
-                                    if r then consider(r) end
-                                end
-                            end
-                        end
-                    end
-
-                    -- ---- swing prediction ----
-                    -- Damage lands at the far point of the swing, not when the
-                    -- swing starts, so committing only once the target is already
-                    -- inside reach means the hit arrives late - by then a closing
-                    -- target has walked past you, and a fleeing one is gone.
-                    -- Closing RATE is tracked rather than velocity, because the
-                    -- rate of change of distance already accounts for both your
-                    -- movement and theirs, and Velocity is unsupported in Matcha.
-                    local effective = bestSurf
-                    if bestPart and bestSurf then
-                        if melTrackPart ~= bestPart then
-                            melTrackPart, melTrackSurf, melTrackRate = bestPart, bestSurf, 0
-                            melTrackAt = now
-                        else
-                            local dt = now - melTrackAt
-                            if dt >= 0.03 then
-                                local raw = (bestSurf - melTrackSurf) / dt
-                                melTrackRate = melTrackRate * 0.5 + raw * 0.5
-                                melTrackSurf, melTrackAt = bestSurf, now
-                            end
-                        end
-                        ML.Closing = -melTrackRate
-                        if ML.Predict then
-                            -- Where it will be when the blade actually arrives. The
-                            -- horizon is capped to the chase burst's remaining time:
-                            -- the closing rate only holds while the dash is pushing,
-                            -- so predicting a full windup ahead of a 90 studs/s burst
-                            -- would swing ~13 studs early at thin air.
-                            local horizon = ML.Windup
-                            if now < ML.chaseUntil then
-                                horizon = math.min(horizon, ML.chaseUntil - now)
-                            end
-                            effective = bestSurf + melTrackRate * horizon
-                            if effective < 0 then effective = 0 end
-                        end
-                    end
-                    hit = (effective ~= nil) and (effective <= limit)
-
-                    -- ---- chase ----
-                    -- Track the chase target's velocity by differentiating its position.
-                    -- Velocity is unsupported in Matcha, and the swing's closing-rate
-                    -- tracker is a scalar, which cannot say WHERE to dash - only whether
-                    -- the gap is shrinking. A moving target therefore needs its own
-                    -- vector here, or the burst lands where the target used to be. With a
-                    -- knife's small hitbox, "used to be" is a clean miss.
-                    if chasePart and chasePos then
-                        if ML.chaseTrackPart ~= chasePart then
-                            ML.chaseTrackPart, ML.chaseTrackPos = chasePart, chasePos
-                            ML.chaseTrackAt, ML.chaseVel = now, Vector3.new(0, 0, 0)
-                        else
-                            local dt = now - (ML.chaseTrackAt or now)
-                            if dt >= 0.05 and ML.chaseTrackPos then
-                                local raw = (chasePos - ML.chaseTrackPos) * (1 / dt)
-                                local old = ML.chaseVel or Vector3.new(0, 0, 0)
-                                ML.chaseVel = old * 0.5 + raw * 0.5   -- same smoothing as the swing tracker
-                                ML.chaseTrackPos, ML.chaseTrackAt = chasePos, now
-                            end
-                        end
-                    end
-                    if ML.Chase then
-                        local stopAt = ML.ChaseClose or 1.5
-                        local prevTick = ML.chaseTickAt    -- read before overwriting, or
-                        ML.chaseTickAt = now               -- dt is always zero
-                        local hrp
-                        local okr, P = pcall(function() return svcPlayers() end)
-                        local lp = (okr and P) and P.LocalPlayer or nil
-                        local ch = lp and lp.Character
-                        if ch then hrp = ch:FindFirstChild("HumanoidRootPart") end
-                        -- How fast THEY are coming to you, along the line between you.
-                        -- ML.Closing cannot be used for this: it is the mutual rate, so
-                        -- your own dash inflates it, which tripped the hold-off below,
-                        -- which stopped the dash, which collapsed the rate again. The
-                        -- trace showed exactly that oscillation - hold off at 9 studs,
-                        -- drift back out to 11, re-dash, repeat.
-                        local theirApproach = 0
-                        local myPos
-                        if hrp then
-                            local okh, hp0 = pcall(function() return hrp.Position end)
-                            myPos = okh and hp0 or nil
-                        end
-                        if myPos and chasePos and ML.chaseVel then
-                            local toMe = Vector3.new(myPos.X - chasePos.X, 0, myPos.Z - chasePos.Z)
-                            local m = toMe.Magnitude
-                            if m > 0.01 then
-                                theirApproach = (ML.chaseVel.X * toMe.X + ML.chaseVel.Z * toMe.Z) / m
-                            end
-                        end
-                        if not hrp then
-                            ML.ChaseState = "no character"
-                        elseif not chasePart then
-                            ML.ChaseState = "nothing to chase"
-                        elseif chaseSurf and chaseSurf <= stopAt then
-                            -- Arrived. Stopping the velocity writes is not enough - the
-                            -- momentum carries you straight past, which is how you end
-                            -- up behind the target stabbing air. So brake once, killing
-                            -- the horizontal component and leaving gravity alone.
-                            if ML.chaseUntil > 0 then
-                                local okv, v = pcall(function() return hrp.AssemblyLinearVelocity end)
-                                if okv and v then
-                                    pcall(function()
-                                        hrp.AssemblyLinearVelocity = Vector3.new(0, v.Y, 0)
-                                    end)
-                                end
-                            end
-                            ML.chaseUntil = 0
-                            ML.ChaseState = "in reach"
-                        elseif theirApproach > 2
-                               and (chaseSurf - stopAt) / theirApproach < 0.35 then
-                            -- They are already running at you and will be in reach within
-                            -- the windup. Dashing into a target that is closing on you is
-                            -- what causes the meet-in-the-middle overshoot, so let them
-                            -- come and let the swing prediction do its job.
-                            ML.chaseUntil = 0
-                            ML.ChaseState = string.format("letting them close (%.0f studs, they run %.0f/s)",
-                                chaseSurf, theirApproach)
-                        else
-                            if now >= ML.chaseUntil and (now - ML.chaseLast) >= ML.ChaseCD then
-                                -- Deadline is only a safety cap now. The burst actually
-                                -- ends when the per-tick check below says the gap is gone,
-                                -- because a gap measured once is wrong the moment either
-                                -- of you moves.
-                                local travel = math.max(chaseSurf - stopAt, 0)
-                                local dur = travel / math.max(ML.ChaseSpeed, 1) + 0.1
-                                if dur > 0.6 then dur = 0.6 end
-                                ML.chaseUntil = now + dur
-                                ML.chaseLast = now
-                                ML.Chases = (ML.Chases or 0) + 1
-                            end
-                            if now < ML.chaseUntil then
-                                -- re-aimed every tick, so a target that moves mid-dash
-                                -- is still followed rather than dashed past
-                                local okp2, hp = pcall(function() return hrp.Position end)
-                                if okp2 and hp and chasePos then
-                                    -- Interception, not pursuit: solve for how long the
-                                    -- burst takes to reach the target, then aim where the
-                                    -- target will be by then. Two refinements are plenty
-                                    -- since this re-runs every tick and converges.
-                                    local aim = chasePos
-                                    local vel = ML.chaseVel
-                                    if ML.ChaseLead and vel and vel.Magnitude > 0.5 then
-                                        local t = math.max(chaseSurf, 0) / math.max(ML.ChaseSpeed, 1)
-                                        for _ = 1, 2 do
-                                            local pred = chasePos + vel * t
-                                            local flatd = Vector3.new(pred.X - hp.X, 0, pred.Z - hp.Z)
-                                            t = flatd.Magnitude / math.max(ML.ChaseSpeed, 1)
-                                            if t > 1.5 then t = 1.5 end
-                                        end
-                                        aim = chasePos + vel * t
-                                        ML.ChaseLeadStuds = (vel * t).Magnitude
-                                    else
-                                        ML.ChaseLeadStuds = 0
-                                    end
-                                    local dir = aim - hp
-                                    local flat = Vector3.new(dir.X, 0, dir.Z)
-                                    if flat.Magnitude > 0.01 then
-                                        flat = flat / flat.Magnitude
-                                        -- Speed is clamped to what the remaining gap can
-                                        -- absorb this tick. At 90 studs/s a tick covers
-                                        -- 2.7 studs, and the stop distance is 1.5, so a
-                                        -- full-speed final tick lands past the target no
-                                        -- matter how good the aim was.
-                                        local dt = now - (prevTick or (now - 0.03))
-                                        if dt < 0.02 then dt = 0.02 elseif dt > 0.1 then dt = 0.1 end
-                                        local remaining = math.max(chaseSurf - stopAt, 0)
-                                        local speed = ML.ChaseSpeed
-                                        if speed * dt > remaining then
-                                            speed = remaining / dt
-                                        end
-                                        pcall(function()
-                                            hrp.AssemblyLinearVelocity = flat * speed
-                                        end)
-                                        ML.ChaseState = string.format(
-                                            "closing %.0f studs, leading %.1f, at %.0f studs/s",
-                                            chaseSurf, ML.ChaseLeadStuds or 0, speed)
-                                    end
-                                end
-                            else
-                                ML.ChaseState = string.format("cooldown (%.0f studs away)", chaseSurf)
-                            end
-                        end
-                    else
-                        ML.chaseUntil = 0
-                        ML.ChaseState = "off"
-                    end
-
-                    if hit and canSwing and mouse1click then
-                        pcall(function() mouse1click() end)
-                        lastSwing = now
-                        -- counted here rather than sampled: the "swinging" state lasts
-                        -- one 0.03s tick, so any sampler slower than that undercounts it
-                        ML.Swings = (ML.Swings or 0) + 1
-                        ML.State = "swinging"
-                        melKeepSprint()
-                    elseif hit and not canSwing then
-                        ML.State = "cooldown"       -- in reach, waiting on the timer
-                    else
-                        ML.State = hit and "no mouse1click" or "nothing in reach"
-                    end
-                end
-            end
-        end
-        task.wait(0.03)
-    end
-end)
-
--- Your own clicks cancel sprint too, so watch the real mouse button as well.
--- Only acts while a melee is equipped, so it never interferes with shooting.
-task.spawn(function()
-    local was = false
-    while _G.AR2HUB_GEN == GEN do
-        if ML.KeepSprint and ML.Reach > 0 then
-            local ok, down = pcall(function() return iskeypressed(0x01) end)
-            down = (ok and down) and true or false
-            if down and not was then melKeepSprint() end
-            was = down
-        else
-            was = false
-        end
-        task.wait(0.03)
-    end
-end)
-
-task.spawn(function()
-    while _G.AR2HUB_GEN == GEN do
-        pcall(function()
-            if not ML.Weapon then
-                melInfo:SetText("no melee equipped")
-                melPredInfo:SetText("closing: -")
-            else
-                melInfo:SetText(string.format("%s - reach %.2f studs%s", ML.Weapon, ML.Reach,
-                    (ML.Enabled and ML.State) and ("  |  " .. ML.State) or ""))
-                melPredInfo:SetText(string.format("closing %.1f studs/s | swings %.2f early | %d swings, %d chases",
-                    ML.Closing or 0, math.max(0, (ML.Closing or 0) * ML.Windup),
-                    ML.Swings or 0, ML.Chases or 0))
-            end
-            melChaseInfo:SetText(ML.Chase and tostring(ML.ChaseState or "-") or "off")
-        end)
-        task.wait(0.4)
-    end
-end)
-
 -- ==================== Player Corpse ESP (Visuals > Players) ====================
 -- workspace.Corpses holds the dead. Infected corpses are named "Infected...";
 -- a player corpse carries the player's own username - verified when my own body
@@ -3695,12 +3019,6 @@ MV.LastDash = 0
 MV.LastDist = 0
 MV.VK = { m1=0x01, m2=0x02, shift=0x10, ctrl=0x11, alt=0x12, space=0x20, tab=0x09 }
 
-MV.JumpOn   = false
-MV.JumpPow  = MV.JumpPow or 50         -- upward studs/sec per extra jump
-MV.JumpGap  = MV.JumpGap or 0.25       -- min seconds between extra jumps
-MV.LastJump = 0
-MV.Jumps    = 0
-
 MV.ui = {}
 MV.ui.tab = win:Tab("Character", "users")
 MV.ui.sub = MV.ui.tab:Sub("Movement", "zap")
@@ -3717,20 +3035,6 @@ MV.ui.dashSec:Slider("Dash Duration", 0.24, 0.02, 0.06, 0.5, " s", function(v) M
 MV.ui.dashSec:Slider("Cooldown", 1.0, 0.1, 0.2, 3, " s", function(v) MV.CD = v end,
     "Gaps between bursts matter more than burst size for staying unremarkable.")
 MV.ui.dashInfo = MV.ui.dashSec:Label("off")
-
--- Infinite jump on the same proven mechanism as the dash: writes to
--- AssemblyLinearVelocity apply, so each extra jump is just an upward velocity while
--- Space is held. Nothing here calls Humanoid:ChangeState - that is not bound in
--- Matcha - so the server sees plain upward movement, same visibility as the dash.
-MV.ui.jumpSec = MV.ui.sub:Section("Infinite Jump", "Full")
-MV.ui.jumpSec:Label("Hold Space to keep jumping. Like Dash, this is real")
-MV.ui.jumpSec:Label("movement the server sees, so it is not a quiet feature.")
-MV.ui.jumpSec:Toggle("Infinite Jump", false, function(v) MV.JumpOn = v end)
-MV.ui.jumpSec:Slider("Jump Power", 50, 5, 20, 120, " studs/s", function(v) MV.JumpPow = v end,
-    "50 is roughly a normal jump. Higher goes further up and is more obvious.")
-MV.ui.jumpSec:Slider("Min Gap", 0.25, 0.05, 0.05, 1.0, " s", function(v) MV.JumpGap = v end,
-    "How long to wait between extra jumps. Very short gaps look like flying rather than jumping.")
-MV.ui.jumpInfo = MV.ui.jumpSec:Label("off")
 
 
 -- resolves the dash key the same way the aimbot and melee do: the lib handle
@@ -3817,36 +3121,6 @@ AR2SPAWN("dash", function()
     end
 end)
 
--- infinite jump: an upward velocity write each time Space is held past the gap
-AR2SPAWN("infinite jump", function()
-    while _G.AR2HUB_GEN == GEN do
-        if MV.JumpOn then
-            local held = false
-            if iskeypressed then
-                local ok, d = pcall(function() return iskeypressed(0x20) end)
-                held = ok and d or false
-            end
-            local now = tick()
-            if held and (now - MV.LastJump) >= MV.JumpGap then
-                local hrp = MV.root()
-                if hrp then
-                    local okv, v = pcall(function() return hrp.AssemblyLinearVelocity end)
-                    -- keep the horizontal component so jumping mid-run carries you
-                    local keep = (okv and v) and Vector3.new(v.X, 0, v.Z) or Vector3.new(0, 0, 0)
-                    local okw = pcall(function()
-                        hrp.AssemblyLinearVelocity = keep + Vector3.new(0, MV.JumpPow, 0)
-                    end)
-                    if okw then
-                        MV.LastJump = now
-                        MV.Jumps = MV.Jumps + 1
-                    end
-                end
-            end
-        end
-        task.wait(0.03)
-    end
-end)
-
 -- readouts
 task.spawn(function()
     while _G.AR2HUB_GEN == GEN do
@@ -3854,9 +3128,6 @@ task.spawn(function()
             MV.ui.dashInfo:SetText(MV.DashOn
                 and string.format("%s%s", MV.State,
                     (MV.LastDist > 0) and string.format("  |  last dash %.0f studs", MV.LastDist) or "")
-                or "off")
-            MV.ui.jumpInfo:SetText(MV.JumpOn
-                and string.format("armed  |  %d extra jump%s", MV.Jumps, (MV.Jumps == 1) and "" or "s")
                 or "off")
         end)
         task.wait(0.2)
@@ -4006,11 +3277,11 @@ MP.resolve = function(now)
         local marker = drag and drag:FindFirstChild("LocalMarker")
         local center = marker and marker:FindFirstChild("MarkerCenter")
         if clip and drag and marker then
-            -- LocalMarker's CENTRE is used as the anchor, not MarkerCenter:
-            -- MarkerCenter sits at the marker's top-left-ish corner, measured
-            -- 8.16 px right and 30.00 px above the marker's visual centre, and
-            -- that 30 px matches the vertical error seen in testing.
-            return { clip = clip, drag = drag, marker = marker, center = center }
+            -- The tiles give the DragBin width now that AbsoluteSize reads 0.
+            local tiles = drag:FindFirstChild("Map")
+            return { clip = clip, drag = drag, marker = marker, center = center,
+                     tl = tiles and tiles:FindFirstChild("TopLeft"),
+                     tr = tiles and tiles:FindFirstChild("TopRight") }
         end
         return nil
     end)
@@ -4041,17 +3312,31 @@ task.spawn(function()
             local open = MP.MapOpen and refs ~= nil
             MP.Open = open
             if open then
-                local okd, ds = pcall(function() return refs.drag.AbsoluteSize end)
-                -- anchor = centre of the local marker, plus the user's offsets
+                -- AbsoluteSize reads 0 on every GUI element in Matcha now (2026-10-23),
+                -- which collapsed every dot onto your marker and clipped them all away.
+                -- Everything here comes from AbsolutePosition instead:
+                --   DragBin width = 2 x the gap between the TopLeft and TopRight tiles
+                --   marker centre = MarkerCenter's X, and as far below the marker's top
+                --                   as MarkerCenter is right of its left edge
+                --   ClipBin       = centred on screen, 769:695 (measured when sizes read)
+                local okd, ds = pcall(function()
+                    local w = 2 * (refs.tr.AbsolutePosition.X - refs.tl.AbsolutePosition.X)
+                    if w <= 0 then w = 1024 end
+                    return Vector2.new(w, w)
+                end)
                 local okc, cpx = pcall(function()
                     local mp2 = refs.marker.AbsolutePosition
-                    local ms2 = refs.marker.AbsoluteSize
-                    local ox, oy = MP.offsetFor(refs.drag.AbsoluteSize.X)
-                    return Vector2.new(mp2.X + ms2.X / 2 + ox,
-                                       mp2.Y + ms2.Y / 2 + oy)
+                    local cx = refs.center and refs.center.AbsolutePosition.X or mp2.X
+                    local half = cx - mp2.X
+                    local ox, oy = MP.offsetFor((okd and ds) and ds.X or 1024)
+                    return Vector2.new(mp2.X + half + ox, mp2.Y + half + oy)
                 end)
                 local okr, cr = pcall(function() return refs.clip.AbsolutePosition end)
-                local oks, cs = pcall(function() return refs.clip.AbsoluteSize end)
+                local oks, cs = pcall(function()
+                    local vw = workspace.CurrentCamera.ViewportSize.X
+                    local w = vw - 2 * cr.X
+                    return Vector2.new(w, w * 695 / 769)
+                end)
                 local P = svcPlayers()
                 local lp = P and P.LocalPlayer
                 local hrp = lp and lp.Character and lp.Character:FindFirstChild("HumanoidRootPart")
@@ -4159,313 +3444,6 @@ task.spawn(function()
     end
 end)
 end
--- ==================== Ground Item ESP (Visuals > Loot) ====================
--- Items lying on the floor DO exist as world instances - I was wrong earlier when
--- I said they did not. They live at:
---   workspace.Map.Elements.ItemNodeBin.ItemNodeBin
---     .ItemNode    a Part at the item's world position
---     .Model       the item's visual model
--- My first sweep missed them because it only matched folders named "LootGroup",
--- and my folder diff excluded Map entirely. Dropping an item creates one of these.
---
--- NAMING is the hard part. The model's parts are only sometimes named after the
--- item (Lantern, Flashlight, FieldDressing); firearms and ammo packs use generic
--- part names (Base, SightMount, MeshPart). Two sources are combined:
---
--- Labels come from the model's own STRUCTURE: parts named Blade/HandGuard mean melee,
--- BarrelMount/Muzzle/Charging Handle mean a firearm, and a mesh with a real item name
--- (Lantern, Flashlight, Energy Drink Yellow) names itself. Anything else is "Item".
---
--- Items CANNOT be identified by name. The game's nearby-loot list holds the real
--- names, and three routes to them were tried and all failed:
---   * template lookup - of 2,287 LootModels only 721 have readable children and 339
---     readable sizes, with names coming back "Unreadable_name" and sizes 0,0,0
---   * list order - see the note on assign() below
---   * model fingerprint - also see assign(); the UI's copies are scaled
--- So categories are honest but coarse: Firearms and Melees are provable from
--- structure, a named mesh can imply Consumables or VehicleParts, and everything else
--- lands in Other. Ammo, Backpacks and Accessories mostly cannot be told apart.
--- Hybrid mode is NOT required for any of this.
-do
-_G.ITEMESP = _G.ITEMESP or {}
-_G.ITEMESP.Enabled = false
-_G.ITEMESP.MaxM    = 100        -- forced, must match the slider drawn below
-_G.ITEMESP.Names   = true
-_G.ITEMESP.Live    = _G.ITEMESP.Live or {}
-_G.ITEMESP.POOL    = 30
-_G.ITEMESP.At      = 0
-_G.ITEMESP.Named   = 0
-_G.ITEMESP.order = { "Firearms", "Ammo", "Backpacks", "Melees", "Accessories",
-                     "VehicleParts", "Consumables", "Other" }
-_G.ITEMESP.col = {
-    Firearms     = C(235,  80,  80),
-    Ammo         = C(245, 170,  70),
-    Backpacks    = C(120, 190, 255),
-    Melees       = C(255, 140, 200),
-    Accessories  = C(200, 200, 210),
-    VehicleParts = C(190, 190, 120),
-    Consumables  = C( 80, 230, 120),
-    Other        = C(245, 246, 250),
-}
-_G.ITEMESP.Cats = _G.ITEMESP.Cats or {}
-
-_G.ITEMESP.ui = {}
-_G.ITEMESP.ui.sub = vis:Sub("Loot", "box")
-_G.ITEMESP.ui.sec = _G.ITEMESP.ui.sub:Section("Ground Items", "Full")
-_G.ITEMESP.ui.sec:Label("Items lying on the floor, including anything dropped.")
-_G.ITEMESP.ui.sec:Label("Positions are exact. Labels are read off the item's model,")
-_G.ITEMESP.ui.sec:Label("so a gun reads 'Firearm' rather than naming the model -")
-_G.ITEMESP.ui.sec:Label("the game gives no way to tie a name to a specific item.")
-_G.ITEMESP.ui.sec:Toggle("Ground Item ESP", false, function(v) _G.ITEMESP.Enabled = v end)
-_G.ITEMESP.ui.sec:Toggle("Show Labels", true, function(v) _G.ITEMESP.Names = v end,
-    "Off leaves just the coloured dot.")
-_G.ITEMESP.ui.sec:Slider("Distance", 100, 5, 10, 300, " m", function(v) _G.ITEMESP.MaxM = v end,
-    "Nodes stay loaded to roughly 200 studs, so there is little to gain past that.")
-_G.ITEMESP.ui.info = _G.ITEMESP.ui.sec:Label("-")
-
-_G.ITEMESP.ui.catSec = _G.ITEMESP.ui.sub:Section("Categories", "Full")
-_G.ITEMESP.ui.catSec:Label("Firearms and Melees are read reliably from the model.")
-_G.ITEMESP.ui.catSec:Label("Some items name their own mesh, which sorts them too.")
-_G.ITEMESP.ui.catSec:Label("The rest land in Other - ammo, bags and clothing mostly")
-_G.ITEMESP.ui.catSec:Label("look identical from outside, so they cannot be split.")
-for _, cat in ipairs(_G.ITEMESP.order) do
-    if _G.ITEMESP.Cats[cat] == nil then _G.ITEMESP.Cats[cat] = true end
-    _G.ITEMESP.ui.catSec:Toggle(cat, true, function(v) _G.ITEMESP.Cats[cat] = v end)
-end
-
--- Category from the item's name where there is one, else from its shape. Ammo is
--- tested before Backpacks on purpose: "12 Gauge Ammo Pack 24rd" contains "pack".
-_G.ITEMESP.catWords = {
-    { "Ammo",         { "ammo", "speedloader", "magazine", "buckshot", "slug", " rd", "rd ", "round", "shell", "belt of" } },
-    { "Backpacks",    { "backpack", "rucksack", "duffel", "satchel", "bag", "pack" } },
-    { "VehicleParts", { "tire", "wheel", "fuel", "gasoline", "jerry", "battery", "spark", "repair", "engine", "oil", "canister" } },
-    { "Consumables",  { "drink", "water", "soda", "beans", "canned", "food", "mre", "snack", "energy",
-                        "booster", "bandage", "dressing", "morphine", "pill", "medical", "medkit",
-                        "syringe", "splint", "antibiotic", "ration", "candy", "chocolate" } },
-    { "Accessories",  { "hat", "cap", "helmet", "vest", "shirt", "pants", "jacket", "coat", "mask",
-                        "glasses", "goggles", "boots", "gloves", "belt", "armor", "armour", "plate",
-                        "uniform", "hoodie", "beanie", "bandana", "accessory" } },
-    { "Melees",       { "knife", "machete", "axe", "hatchet", "bat", "crowbar", "hammer", "shovel", "wrench", "sword" } },
-    { "Firearms",     { "rifle", "pistol", "shotgun", "smg", "carbine", "revolver", "sniper", "snubnose" } },
-}
-_G.ITEMESP.catOf = function(label, kind)
-    -- applies to any label, including the mesh-derived ones: a mesh called
-    -- "Energy Drink Yellow" sorts to Consumables the same as a real name would
-    if type(label) == "string" then
-        local low = string.lower(label)
-        for _, pair in ipairs(_G.ITEMESP.catWords) do
-            for _, w in ipairs(pair[2]) do
-                if string.find(low, w, 1, true) then return pair[1] end
-            end
-        end
-    end
-    -- shape only: these two are the ones structure can actually prove
-    if kind == "firearm" then return "Firearms" end
-    if kind == "melee" then return "Melees" end
-    return "Other"
-end
-
--- a few meshes are named differently from the item they belong to: a Common
--- Bandage's mesh is FieldDressing. Only affects the far-away guess, since up close
--- the UI list gives the real name.
-_G.ITEMESP.alias = {
-    FieldDressing = "Bandage",
-    ["Hunting Spray"] = "Scent Cover Spray",
-}
-
--- material and geometry names that are not item names
-_G.ITEMESP.junk = {}
-for _, w in ipairs({ "plastic", "metal", "glass", "wood", "rubber", "cloth", "fabric",
-                     "part", "union", "cylinder", "block", "wedge", "sphere", "mesh",
-                     "handle", "cap", "lid", "body", "top", "bottom", "middle",
-                     "color", "color2", "colour", "geometry", "primary", "secondary" }) do
-    _G.ITEMESP.junk[w] = true
-end
-
--- structural guess, used wherever the UI list cannot name something
-_G.ITEMESP.hintOf = function(m)
-    local has = {}
-    local ok, kids = pcall(function() return m:GetChildren() end)
-    if not ok or not kids then return "generic", "Item" end
-    for _, p in ipairs(kids) do has[p.Name] = true end
-    if has.Blade or has.HandGuard then return "melee", "Melee" end
-    if has.BarrelMount or has.SightMount or has.Muzzle or has["Charging Handle"] then
-        return "firearm", "Firearm"
-    end
-    if has.ActionConstant or (has.Action and has.Constant) then return "firearm", "Firearm" end
-    for _, p in ipairs(kids) do
-        local n = p.Name
-        -- a mesh with a real name is often the item itself, but plenty are named
-        -- after their material or their source file instead ("Plastic",
-        -- "Meshes/frames") and those read as nonsense on screen
-        if n ~= "Base" and n ~= "MeshPart" and n ~= "Model" and not string.match(n, "^%d+$")
-           and not string.match(n, "^Projection") and not string.match(n, "^SightLine")
-           and not string.find(n, "/") and not _G.ITEMESP.junk[string.lower(n)] then
-            return "named", _G.ITEMESP.alias[n] or n
-        end
-    end
-    return "generic", "Item"
-end
-
--- Finding the nodes means checking the name of every map element, and there can be
--- 2,500 of them. That read costs 0.05 ms when the client is healthy - a 130 ms scan,
--- fine on its own - but I first ran it once a second from inside the draw loop, and
--- alongside the other sweeps the contention inflated each read to 7 ms. One scan
--- then took 18 SECONDS and the whole script updated about twice a minute.
--- So: the scan is incremental with a hard per-tick budget, and only the cheap part
--- (distances and names, over the few nodes already found) runs frequently.
-_G.ITEMESP.PERTICK = 150        -- elements per tick, about 8 ms
-_G.ITEMESP.every   = 3.0        -- seconds between full rescans
-_G.ITEMESP.scanning = false
-_G.ITEMESP.cursor  = 1
-
-_G.ITEMESP.step = function(now)
-    local IT = _G.ITEMESP
-    local els = workspace.Map and workspace.Map:FindFirstChild("Elements")
-    if not els then return end
-    if not IT.scanning then
-        if (now - IT.At) < IT.every then return end
-        local okk, kids = pcall(function() return els:GetChildren() end)
-        if not okk or not kids then return end
-        IT.kids, IT.cursor, IT.buffer, IT.scanning = kids, 1, {}, true
-    end
-    -- scaled by scheduler health: see the note at the bottom of the file
-    local budget = math.floor(IT.PERTICK * (_G.AR2HUB_HEALTH or 1))
-    if budget < 5 then budget = 5 end
-    local done = 0
-    while IT.cursor <= #IT.kids and done < budget do
-        local e = IT.kids[IT.cursor]
-        IT.cursor = IT.cursor + 1
-        done = done + 1
-        local okn, nm = pcall(function() return e.Name end)
-        if okn and type(nm) == "string" and string.find(nm, "ItemNode") then
-            local okc, kids = pcall(function() return e:GetChildren() end)
-            if okc and kids then
-                for _, node in ipairs(kids) do
-                    local inode = node:FindFirstChild("ItemNode")
-                    local m = node:FindFirstChild("Model")
-                    if inode and m then
-                        local kind, label = IT.hintOf(m)
-                        IT.buffer[#IT.buffer + 1] =
-                            { part = inode, kind = kind, label = label, hint = label, d = 1e9 }
-                    end
-                end
-            end
-        end
-    end
-    if IT.cursor > #IT.kids then
-        IT.Live, IT.buffer, IT.scanning = IT.buffer, nil, false
-        IT.At = now
-        -- a fresh list carries no names yet, so name it on the very next tick
-        -- instead of showing hints until the once-a-second pass comes round
-        IT.AssignAt = 0
-    end
-end
-
--- Cheap pass over the nodes already found: refresh distances and categories.
---
--- There is deliberately NO exact naming here. The game's nearby-loot list has the
--- real names, but nothing ties an entry to a specific object in the world:
---   * BY ORDER - looked perfect (12 of 12) but the test was taken on a pile where
---     everything sat 4-6 studs away so the orderings coincided. In the field labels
---     swapped between items depending on which one you stood nearer.
---   * BY MODEL FINGERPRINT - the UI entry embeds a copy of the item's model, but its
---     parts are scaled to fit the inventory grid, so the sizes do not match the world
---     model. A gasoline can 7 studs away scored higher against the chemlight's entry
---     than against its own, and single-part items make it worse: one coincidental
---     size match is a 100% score.
--- Two wrong methods was enough. Labels now come only from the model's own structure,
--- which cannot claim something it does not know.
-_G.ITEMESP.assign = function(now, cp)
-    local IT = _G.ITEMESP
-    if (now - (IT.AssignAt or 0)) < 1.0 then return end
-    IT.AssignAt = now
-    local live = IT.Live
-    if not live or #live == 0 then IT.Named = 0 return end
-    for _, e in ipairs(live) do
-        e.label = e.hint
-        local okp, p = pcall(function() return e.part.Position end)
-        if okp and p then
-            local okd, dd = pcall(function() return (p - cp).Magnitude end)
-            e.d = okd and dd or 1e9
-        else
-            e.d = 1e9
-        end
-        e.cat = IT.catOf(e.label, e.kind)
-    end
-    IT.Named = 0
-end
-
-task.spawn(function()
-    local IT = _G.ITEMESP
-    local pool = {}
-    for i = 1, IT.POOL do
-        local dot = Drawing.new("Circle")
-        dot.Thickness = 1; dot.Filled = false; dot.NumSides = 8
-        dot.Radius = 3; dot.Visible = false
-        local nm = Drawing.new("Text")
-        nm.Size = STYLE.SubSize; nm.Center = true; nm.Outline = true; nm.Visible = false
-        pool[i] = { dot = dot, name = nm }
-    end
-    while _G.AR2HUB_GEN == GEN do
-        local n = 0
-        if IT.Enabled then
-            local cp = camPos()
-            if cp then
-                local now = tick()
-                IT.step(now)
-                IT.assign(now, cp)
-                local maxStuds = IT.MaxM * E.DistanceDivisor
-                for i = 1, #IT.Live do
-                    if n >= IT.POOL then break end
-                    local e = IT.Live[i]
-                    local cat = e.cat or "Other"
-                    local ok, pos = false, nil
-                    if IT.Cats[cat] then
-                        ok, pos = pcall(function() return e.part.Position end)
-                    end
-                    local okd, d = false, nil
-                    if ok and pos then
-                        okd, d = pcall(function() return (pos - cp).Magnitude end)
-                    end
-                    if okd and type(d) == "number" and d <= maxStuds then
-                        local pt, vis2 = toScreen(pos + Vector3.new(0, 0.5, 0))
-                        if vis2 then
-                            n = n + 1
-                            local o = pool[n]
-                            local col = IT.col[cat] or IT.col.Other
-                            o.dot.Position = pt; o.dot.Color = col; o.dot.Visible = true
-                            if IT.Names then
-                                o.name.Text = string.format("%s  %d%s", e.label, metres(d),
-                                    E.DistanceUnit)
-                                o.name.Position = Vector2.new(pt.X, pt.Y - 13)
-                                o.name.Color = col
-                                o.name.Visible = true
-                            else
-                                o.name.Visible = false
-                            end
-                        end
-                    end
-                end
-            end
-            pcall(function()
-                IT.Shown = n
-                IT.ui.info:SetText(string.format("%d on the ground%s | %d shown",
-                    #IT.Live, IT.scanning and " (scanning...)" or "", n))
-            end)
-        end
-        for i = n + 1, IT.POOL do
-            pool[i].dot.Visible = false
-            pool[i].name.Visible = false
-        end
-        task.wait(0.06)
-    end
-    for i = 1, IT.POOL do
-        pcall(function() pool[i].dot:Remove() end)
-        pcall(function() pool[i].name:Remove() end)
-    end
-end)
-end
 -- ==================== Vehicle Mods (Combat > Vehicle Mods) ====================
 -- Measured on an ambulance with the player sitting in it:
 --   * writing AssemblyLinearVelocity to the vehicle's Base part MOVED it 16.88 studs,
@@ -4497,7 +3475,9 @@ _G.VEHMOD.Ramp       = 0
 -- duration alone does not decide it - one 6 second flight died and another did not.
 -- Whatever the trigger is, it is server side and not readable here. The limit stays
 -- as an opt-out safety net rather than a rule, since it clearly is not one.
-_G.VEHMOD.FlyLimit   = true
+-- Manual Fly no longer applies a time limit (removed 2026-10-23); these remain only
+-- so nothing that still reads them breaks.
+_G.VEHMOD.FlyLimit   = false
 _G.VEHMOD.FlyMax     = 6                           -- seconds of continuous flight
 -- Flying drains ENGINE HEALTH, which is what actually destroys the vehicle. Traced on
 -- a Jeep: 0.224 0.209 0.203 0.186 0.175 0.164 0.148 0.142 0.136 0.131 0.120, then it
@@ -4542,358 +3522,6 @@ _G.VEHMOD.ui.key = _G.VEHMOD.ui.sec:Keybind("Fly Key", "g", function(k) _G.VEHMO
 _G.VEHMOD.ui.sec:Toggle("Auto Flip", true, function(v) _G.VEHMOD.AutoRight = v end,
     "Lifts the vehicle when it rolls, which drops it back onto its wheels. Angular velocity cannot be written in this game, so a vertical shove is the only way to undo a flip.")
 _G.VEHMOD.ui.info = _G.VEHMOD.ui.sec:Label("off")
--- ---- ram ----
--- Drives the vehicle along the ground at a target. There used to be three modes; Air
--- and Ground are gone. Air climbed and dove and reliably did nothing, and Ground was
--- this without the steering, so there was nothing left to choose between.
---
--- What actually decides whether this works is the VEHICLE, not anything in here. The
--- hitbox shape and ride height determine whether contact registers at all - the rubber
--- dinghy is near perfect, other vehicles barely connect with identical settings. Two
--- things were learned the hard way and are worth not re-deriving:
---
---   * Speed above roughly 150 studs/s does nothing at all. The chassis moves further
---     per physics step than a person is wide, so it passes through them and no contact
---     is ever resolved. Every failed ram was this.
---   * Engine power is irrelevant. A vehicle with no fuel left still ran zombies over,
---     so it is the velocity write that damages, not the throttle. The keys are held
---     anyway because they turn the vehicle to face where it is being pushed.
---
--- No air time, so no engine drain: the only cost of a kill is the crash damage itself.
--- Whitelisted players are never targeted, the same rule the aimbot and auto melee use.
-_G.VEHMOD.Ram        = false
-_G.VEHMOD.RamPlayers = false
-_G.VEHMOD.RamZombies = true
-_G.VEHMOD.RamRange   = 250
--- 100, not 220. Above roughly 150 studs/s the chassis moves further in one physics
--- step than a player is wide, so the contact is never resolved and nobody takes a
--- scratch. Every failed ram - the dives, the sweeps, the ground drags - was this.
-_G.VEHMOD.RamSpeed   = 100
--- NOT a mouse side button. Measured on this machine: iskeypressed reported Mouse 5 as
--- held on 0 of 86 samples while it was physically held down, and Mouse 4 the same.
--- Matcha cannot see those buttons, so a feature bound to one simply never runs - Ram
--- sat at "ready" through an entire test while its trigger was held the whole time.
-_G.VEHMOD.RamTrigger = "Key"   -- forced, not carried over: a stale "Mouse 5" is unreadable
-_G.VEHMOD.RamKey     = _G.VEHMOD.RamKey or "r"
-_G.VEHMOD.RamState   = "off"
-_G.VEHMOD.RamGrip    = 60         -- how hard lift is cancelled, studs/s
--- Not exposed. The chassis centre aims this far short of the target so the FRONT hits
--- rather than the target ending up parked under the middle of the vehicle.
-_G.VEHMOD.RamNose    = 9
-_G.VEHMOD.RamSteer   = 12         -- degrees of slack before it bothers steering
-_G.VEHMOD.ramKeysDown = {}
-_G.VEHMOD.DRIVEVK = { W = 0x57, A = 0x41, S = 0x53, D = 0x44 }
-_G.VEHMOD.holdKey = function(name, want)
-    local VM = _G.VEHMOD
-    local vk = VM.DRIVEVK[name]
-    if not vk then return end
-    local down = VM.ramKeysDown[name] == true
-    if want and not down then
-        if keypress then pcall(function() keypress(vk) end) end
-        VM.ramKeysDown[name] = true
-    elseif (not want) and down then
-        if keyrelease then pcall(function() keyrelease(vk) end) end
-        VM.ramKeysDown[name] = false
-    end
-end
-
-_G.VEHMOD.releaseDriving = function()
-    for _, k in ipairs({ "W", "A", "S", "D" }) do _G.VEHMOD.holdKey(k, false) end
-end
-_G.VEHMOD.ramZAt     = 0
-
-_G.VEHMOD.ui.ramSec = _G.VEHMOD.ui.sub:Section("Ram", "Full")
-_G.VEHMOD.ui.ramSec:Label("Drives the vehicle at whatever you are hunting, on the")
-_G.VEHMOD.ui.ramSec:Label("ground, so it costs no engine beyond the crash damage.")
-_G.VEHMOD.ui.ramSec:Label("How well it works depends far more on the VEHICLE than")
-_G.VEHMOD.ui.ramSec:Label("on any setting here - hitbox shape and height decide")
-_G.VEHMOD.ui.ramSec:Label("whether contact registers at all. The rubber dinghy is")
-_G.VEHMOD.ui.ramSec:Label("the best found so far. If a vehicle simply will not")
-_G.VEHMOD.ui.ramSec:Label("connect, change vehicle before changing sliders.")
-_G.VEHMOD.ui.ramSec:Label("Whitelisted players are never targeted.")
-_G.VEHMOD.ui.ramSec:Toggle("Ram", false, function(v)
-        _G.VEHMOD.Ram = v
-        _G.VEHMOD.ramT = {}          -- fresh timings each time it is armed
-    end,
-    "Hold the trigger to steer the vehicle into the nearest target.")
-_G.VEHMOD.ui.ramSec:Toggle("Target Zombies", true, function(v) _G.VEHMOD.RamZombies = v end)
-_G.VEHMOD.ui.ramSec:Toggle("Target Players", false, function(v) _G.VEHMOD.RamPlayers = v end,
-    "Whitelisted players are skipped whatever this says.")
-_G.VEHMOD.ui.ramSec:Slider("Range", 250, 10, 30, 800, " studs", function(v) _G.VEHMOD.RamRange = v end,
-    "How far away it will pick a target from.")
-_G.VEHMOD.ui.ramSec:Slider("Ground Grip", 60, 5, 0, 200, " studs/s", function(v) _G.VEHMOD.RamGrip = v end,
-    "How hard bumps are pushed back down, and the fastest it is allowed to drop. It only cancels lift rather than driving into the floor constantly, which was quietly wrecking the engine. Around 60 is what actually connects; lower it if the engine suffers.")
-_G.VEHMOD.ui.ramSec:Slider("Ram Speed", 100, 10, 40, 1200, " studs/s", function(v) _G.VEHMOD.RamSpeed = v end,
-    "How hard it drives at them. Around 100 is the sweet spot and the default for good reason: above roughly 150 the vehicle covers more ground per physics step than a person is wide, so it passes straight through them without a collision ever being registered. Fast looks more violent and does nothing at all.")
-_G.VEHMOD.ui.ramSec:Dropdown("Trigger", "Key", { "Key", "Right Mouse", "Space" }, false,
-    function(v) _G.VEHMOD.RamTrigger = dropStr(v, "Key") end,
-    "Mouse 4 and Mouse 5 are deliberately not offered: this executor cannot read them at all, measured at 0 of 86 samples while held, so anything bound to them never fires.")
-_G.VEHMOD.ui.ramKey = _G.VEHMOD.ui.ramSec:Keybind("Ram Key", "r", function(k) _G.VEHMOD.RamKey = k end,
-    "Used when Trigger is set to Key.")
-_G.VEHMOD.ui.ramInfo = _G.VEHMOD.ui.ramSec:Label("off")
-
--- Nearest thing worth hitting. Zombie roots come from the ESP cache when it is running
--- and from a throttled scan when it is not, because resolving ~80 roots costs about
--- 56 ms and must never sit on a per-tick path.
--- Returns the target PART, not a position, and is called on a timer rather than every
--- tick. Searching walks ~85 zombie roots reading a position from each: about 4 ms on a
--- healthy client, which is exactly the sort of cost that becomes hundreds of
--- milliseconds once the client is behind. Run at 20 Hz it froze the game every time
--- the ram key was pressed. Between searches the loop reads one position - the target's.
-_G.VEHMOD.ramTarget = function(from)
-    local VM = _G.VEHMOD
-    local best, bd
-    local bestIsPlayer = false
-    local function consider(part, isPlayer)
-        local okp, p = pcall(function() return part.Position end)
-        if not okp or not p then return end
-        local okd, d = pcall(function() return (p - from).Magnitude end)
-        if okd and d <= VM.RamRange and (not bd or d < bd) then
-            best, bd, bestIsPlayer = part, d, isPlayer and true or false
-        end
-    end
-    -- A dead zombie's root can linger in the caches, and reads against it are slow
-    -- rather than failing, so the list is rebuilt outright every few seconds.
-    if not VM.ramZAt or (tick() - VM.ramZAt) > 4 then VM.ramZ, VM.ramZQ = nil, nil end
-    if VM.RamPlayers then
-        local okr, P = pcall(function() return svcPlayers() end)
-        local lp = (okr and P) and P.LocalPlayer or nil
-        if okr and P and lp then
-            local marks = _G.PLAYERMARK or {}
-            for _, pl in ipairs(P:GetPlayers()) do
-                if pl.UserId ~= lp.UserId and marks[pl.UserId] ~= "whitelist" then
-                    local okc, ch = pcall(function() return pl.Character end)
-                    local r = (okc and ch) and ch:FindFirstChild("HumanoidRootPart") or nil
-                    if r then consider(r, true) end
-                end
-            end
-        end
-    end
-    if VM.RamZombies then
-        local live = _G.ZOMBESP and _G.ZOMBESP.Live
-        if live and #live > 0 then
-            for _, e in ipairs(live) do if e.part then consider(e.part) end end
-        else
-            -- Incremental, because resolving ~85 roots in one go is a 60 ms burst of
-            -- FindFirstChild at 0.71 ms each, and that burst is what stalls the client
-            -- the moment the ram key is pressed. A few per call spreads the same work
-            -- out and the list is complete within a second, which is soon enough.
-            VM.ramZ = VM.ramZ or {}
-            if not VM.ramZQ then
-                local now = tick()
-                if (now - (VM.ramZAt or 0)) > 2.0 then
-                    VM.ramZAt = now
-                    local zf = workspace:FindFirstChild("Zombies")
-                    VM.ramZQ = zf and zf:GetChildren() or {}
-                    VM.ramZI, VM.ramZOut = 1, {}
-                end
-            end
-            if VM.ramZQ then
-                local done = 0
-                while VM.ramZI <= #VM.ramZQ and done < 8 do
-                    local z = VM.ramZQ[VM.ramZI]
-                    VM.ramZI = VM.ramZI + 1
-                    done = done + 1
-                    local r = z and z:FindFirstChild("HumanoidRootPart")
-                    if r then VM.ramZOut[#VM.ramZOut + 1] = r end
-                end
-                if VM.ramZI > #VM.ramZQ then
-                    VM.ramZ, VM.ramZQ = VM.ramZOut, nil
-                end
-            end
-            for _, r in ipairs(VM.ramZ) do consider(r) end
-        end
-    end
-    -- Remembered because players and zombies need to be treated differently: a zombie
-    -- dies to a clean pass, a player apparently does not.
-    VM.ramTgtPlayer = bestIsPlayer
-    return best, bd
-end
-
-task.spawn(function()
-    local VM = _G.VEHMOD
-    while _G.AR2HUB_GEN == GEN do
-        if VM.Ram and not VM.APActive then
-            local held = false
-            local vk = VM.TRIG[tostring(VM.RamTrigger)]
-            if not vk and tostring(VM.RamTrigger) == "Key" then
-                if VM.ui.ramKey then
-                    local okh, v = pcall(function() return VM.ui.ramKey:IsActivated() end)
-                    if okh and v then held = true end
-                end
-                local k = string.lower(tostring(VM.RamKey or "r"))
-                if #k == 1 then
-                    local b = string.byte(string.upper(k))
-                    if b >= 48 and b <= 90 then vk = b end
-                end
-            end
-            if not held and vk and iskeypressed then
-                local ok, d = pcall(function() return iskeypressed(vk) end)
-                held = (ok and d) and true or false
-            end
-            if not held then
-                VM.ramPart, VM.ramPickAt = nil, 0     -- fresh target on the next press
-                VM.ramAim = nil
-                VM.ramBase = nil                      -- and re-find the vehicle you are in
-                VM.releaseDriving()                   -- never leave the throttle stuck down
-                VM.RamState = "ready - hold " .. tostring(VM.RamTrigger)
-            else
-                -- Self-timing, because four rounds of reasoning about this loop have
-                -- each been wrong. Every phase is measured and the worst is kept, so a
-                -- stall can be attributed instead of guessed at.
-                VM.ramT = VM.ramT or {}
-                local tPhase = tick()
-                local function mark(name)
-                    local ms = (tick() - tPhase) * 1000
-                    if ms > (VM.ramT[name] or 0) then VM.ramT[name] = ms end
-                    tPhase = tick()
-                end
-                local okr, P = pcall(function() return svcPlayers() end)
-                local lp = (okr and P) and P.LocalPlayer or nil
-                local ch = lp and lp.Character
-                local hrp = ch and ch:FindFirstChild("HumanoidRootPart") or nil
-                local myPos
-                if hrp then
-                    local okp, p = pcall(function() return hrp.Position end)
-                    myPos = okp and p or nil
-                end
-                mark("character")
-                -- Lock the vehicle for as long as the trigger is held, the way autopilot
-                -- does. baseNear measured 6.4 ms per call even on its supposedly cached
-                -- path - almost the cost of a full scan - and calling that every tick at
-                -- 20 Hz spent about an eighth of the client answering a question whose
-                -- answer does not change while you are sitting in the thing.
-                local base = VM.ramBase
-                if base then
-                    -- a destroyed part can still answer Position, so check it is still
-                    -- parented to something rather than trusting the read to fail
-                    local okv, p = pcall(function() return base.Position end)
-                    local okpar, par = pcall(function() return base.Parent end)
-                    if not okv or not p or not okpar or not par then
-                        base, VM.ramBase = nil, nil
-                    end
-                end
-                if not base and myPos then
-                    base = VM.baseNear(myPos, 0)
-                    VM.ramBase = base
-                end
-                mark("vehicle lookup")
-                if not base then
-                    VM.RamState = "no vehicle"
-                else
-                    local okb, bp = pcall(function() return base.Position end)
-                    -- re-pick on a timer; track the chosen one every tick
-                    local nowR = tick()
-                    if not VM.ramPart or (nowR - (VM.ramPickAt or 0)) > 0.35 then
-                        VM.ramPickAt = nowR
-                        VM.ramPart = myPos and VM.ramTarget(myPos) or nil
-                        mark("target search")
-                    end
-                    local tp
-                    if VM.ramPart then
-                        local okt, p = pcall(function() return VM.ramPart.Position end)
-                        if okt and p then tp = p else VM.ramPart = nil end
-                    end
-                    if not tp then
-                        VM.RamState = "nothing in range"
-                    elseif okb and bp then
-                        -- Aim the FRONT at them, not the middle. Everything here steers
-                        -- the chassis centre, so driving straight at a target parks it
-                        -- underneath the car - and the front is what actually does the
-                        -- damage. The vehicle cannot be rotated (angular velocity writes
-                        -- are rejected), so instead the centre is aimed at a point short
-                        -- of the target by half a car length, along the line of travel.
-                        -- Drive mode wants the true target, not the shortened one: it
-                        -- pushes the car forward under its own power, so the front
-                        -- reaches them first without any offset help.
-                        local trueTp = tp
-                        local dir = tp - bp
-                        local flat = Vector3.new(dir.X, 0, dir.Z)
-                        local dist = flat.Magnitude
-                        if dist > 0.01 then
-                            local nose = math.min(VM.RamNose or 9, dist * 0.8)
-                            local unit = flat / dist
-                            tp = tp - Vector3.new(unit.X, 0, unit.Z) * nose
-                            dir = tp - bp
-                            flat = Vector3.new(dir.X, 0, dir.Z)
-                            dist = flat.Magnitude
-                        end
-                        if dist > 0.5 then
-                            flat = flat / dist
-                            local vel
-                            do
-                                -- One mode. Air and Ground are gone: Air never connected
-                                -- reliably and cost engine to reach the target, and
-                                -- Ground was this minus the steering.
-                                --
-                                -- Velocity is what damages, not engine power - a vehicle
-                                -- with no fuel left still ran zombies over. The keys are
-                                -- held anyway because they cost nothing and help the
-                                -- vehicle point where it is being pushed, which is what
-                                -- puts the front into the target rather than the flank.
-                                local okc2, vcf = pcall(function() return base.CFrame end)
-                                if okc2 and vcf then
-                                    local fwd = vcf.LookVector
-                                    local f2 = Vector3.new(fwd.X, 0, fwd.Z)
-                                    local td = trueTp - bp
-                                    local to = Vector3.new(td.X, 0, td.Z)
-                                    local tdist = to.Magnitude
-                                    if f2.Magnitude > 0.01 and tdist > 0.01 then
-                                        f2 = f2 / f2.Magnitude
-                                        to = to / tdist
-                                        local dot = f2.X * to.X + f2.Z * to.Z
-                                        if dot > 1 then dot = 1 elseif dot < -1 then dot = -1 end
-                                        local angle = math.deg(math.acos(dot))
-                                        -- which way to turn: sign of the cross product
-                                        local cross = f2.X * to.Z - f2.Z * to.X
-                                        local slack = VM.RamSteer or 12
-                                        VM.holdKey("A", angle > slack and cross < 0)
-                                        VM.holdKey("D", angle > slack and cross > 0)
-                                        -- reverse out if it is facing away, otherwise go
-                                        local backing = angle > 140 and tdist < 25
-                                        VM.holdKey("S", backing)
-                                        VM.holdKey("W", not backing)
-                                        VM.ramAim = angle
-                                    end
-                                end
-                                -- Grip: only fight upward motion. Holding a constant
-                                -- downward speed means driving into the terrain every
-                                -- tick, which is a continuous impact and eats the engine
-                                -- for nothing. Cancel launches, otherwise let it fall and
-                                -- just cap how hard it is allowed to land.
-                                local grip = VM.RamGrip or 60
-                                local down = -grip
-                                local okv, cur = pcall(function() return base.AssemblyLinearVelocity end)
-                                if okv and cur then
-                                    if cur.Y > 0 then
-                                        down = -(cur.Y + grip)         -- a bump is lifting it
-                                    else
-                                        down = math.max(cur.Y, -grip)  -- falling: don't add to it
-                                    end
-                                end
-                                vel = flat * VM.RamSpeed + Vector3.new(0, down, 0)
-                                VM.RamState = string.format("ramming, %.0f studs out at %.0f studs/s%s",
-                                    dist, VM.RamSpeed,
-                                    VM.ramAim and string.format(", %.0f%s off aim", VM.ramAim, "\194\176") or "")
-                            end
-                            if vel then
-                                pcall(function() base.AssemblyLinearVelocity = vel end)
-                                mark("velocity write")
-                            end
-                        else
-                            VM.RamState = "on top of them"
-                        end
-                    end
-                end
-            end
-        else
-            if VM.ramKeysDown and next(VM.ramKeysDown) then VM.releaseDriving() end
-            VM.RamState = "off"
-        end
-        task.wait(0.05)
-    end
-end)
-
 -- ---- autopilot ----
 -- Flies the vehicle to a saved waypoint on its own: climb, cruise, descend, stop.
 --
@@ -5126,7 +3754,9 @@ _G.VEHMOD.baseNear = function(myPos, maxAge)
     end
     VM.nearAt = now
     local cache = _G.VEHESP and _G.VEHESP.Cache
-    if not cache or #cache == 0 then
+    -- The cache is only kept fresh while Vehicle ESP is on; otherwise it can be stale, so read
+    -- the Vehicles folder directly instead of trusting it.
+    if not cache or #cache == 0 or not (_G.VEHESP and _G.VEHESP.Enabled) then
         -- Fall back to reading the Vehicles folder directly. Using the ESP's cache is
         -- cheaper, but depending on it meant every Vehicle Mods feature silently did
         -- nothing whenever Vehicle ESP happened to be switched off - autopilot just sat
@@ -5163,7 +3793,8 @@ _G.VEHMOD.baseNear = function(myPos, maxAge)
         VM.nearBase, VM.nearWhy = nil, "no vehicle within reach"
         return nil, VM.nearWhy
     end
-    local model = best.part.Parent
+    -- the cache holds the vehicle model itself; the tracked part may sit inside Collision
+    local model = best.model or best.part.Parent
     local base = model and model:FindFirstChild("Base")
     VM.nearBase = base
     VM.nearWhy = base and best.name or "no Base part"
@@ -5380,7 +4011,7 @@ AR2SPAWN("vehicle drive", function()
                         VM.entry = nil
                         local mdl = base.Parent
                         for _, e in ipairs((_G.VEHESP and _G.VEHESP.Cache) or {}) do
-                            if e.part and e.part.Parent == mdl then VM.entry = e break end
+                            if e.model == mdl or (e.part and e.part.Parent == mdl) then VM.entry = e break end
                         end
                     end
                     VM.EngineNow = (VM.entry and VM.entry.parts) and VM.entry.parts.engine or nil
@@ -5644,33 +4275,13 @@ task.spawn(function()
                                 VM.entry = nil
                                 local mdl = base.Parent
                                 for _, e in ipairs((_G.VEHESP and _G.VEHESP.Cache) or {}) do
-                                    if e.part and e.part.Parent == mdl then VM.entry = e break end
+                                    if e.model == mdl or (e.part and e.part.Parent == mdl) then VM.entry = e break end
                                 end
                             end
+                            -- Shown in the status line only. Manual flight has no engine
+                            -- guard and no time limit (removed at the user's request,
+                            -- 2026-10-23): it flies until you let go, even on a dying engine.
                             VM.EngineNow = (VM.entry and VM.entry.parts) and VM.entry.parts.engine or nil
-                            if VM.EngineGuard and VM.EngineNow and VM.EngineNow < VM.EngineMin then
-                                VM.flyStart = nil
-                                VM.State = string.format("engine at %.0f%% - too low to fly",
-                                    VM.EngineNow * 100)
-                                task.wait(0.05)
-                                continue
-                            end
-                            if VM.FlyLimit then
-                                if nowF < VM.flyLock then
-                                    VM.flyStart = nil
-                                    VM.State = string.format("flight cooling down (%.1fs)", VM.flyLock - nowF)
-                                    task.wait(0.05)
-                                    continue
-                                end
-                                VM.flyStart = VM.flyStart or nowF
-                                if (nowF - VM.flyStart) > VM.FlyMax then
-                                    -- cut it before the thing that killed the last one
-                                    VM.flyLock, VM.flyStart = nowF + 1.5, nil
-                                    VM.State = "flight limit reached - cooling down"
-                                    task.wait(0.05)
-                                    continue
-                                end
-                            end
                             -- full 3D: look up and it climbs, which is the whole point
                             vel = lv * VM.FlySpeed
                         elseif upY < 0.90 then
@@ -5754,7 +4365,6 @@ task.spawn(function()
     while _G.AR2HUB_GEN == GEN do
         pcall(function()
             _G.VEHMOD.ui.info:SetText(tostring(_G.VEHMOD.State or "-"))
-            _G.VEHMOD.ui.ramInfo:SetText(tostring(_G.VEHMOD.RamState or "-"))
             local AP = _G.VEHMOD.AP
             local txt
             if not AP.target then
